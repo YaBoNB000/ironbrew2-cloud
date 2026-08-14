@@ -1,0 +1,110 @@
+# 云端混淆 —— 自动触发版
+# 触发方式:
+#   ① push 到 src/ 目录(上传/修改 src/*.lua)→ 自动混淆 src/ 下所有 .lua,强度 mid
+#   ② 手动 Run workflow(可选,指定单个文件 + 强度)
+# 产物:自动提交回仓库 out/ 目录(文件名为 <原名>_obf.lua),同时上传 Artifacts
+name: 云端混淆
+
+on:
+  push:
+    paths:
+      - 'src/**'
+  workflow_dispatch:
+    inputs:
+      source_file:
+        description: '要混淆的源码文件(仓库内路径,如 src/Main.lua;留空=混淆 src/ 全部)'
+        required: false
+        default: ''
+      strength:
+        description: '混淆强度'
+        required: true
+        default: 'high'
+        type: choice
+        options:
+          - low
+          - mid
+          - high
+
+jobs:
+  obfuscate:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 确认 .NET 与工具
+        run: |
+          dotnet --version
+          if (!(Test-Path "IronBrew2 CLI\bin\Release\net8.0\IronBrew2 CLI.dll")) {
+            throw "缺少 IronBrew2 CLI.dll —— 请确认 bin/Release/net8.0 已提交到仓库"
+          }
+          if (!(Test-Path "Lua\luac.exe") -or !(Test-Path "Lua\lua.exe")) {
+            throw "缺少 Lua\luac.exe 或 Lua\lua.exe —— 请确认已提交"
+          }
+
+      - name: 配置 Lua 工具环境
+        shell: pwsh
+        run: |
+          echo "${{ github.workspace }}\Lua" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "LUA_PATH=${{ github.workspace }}\Lua\Minifier\?.lua;;" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 确定要混淆的文件
+        id: targets
+        shell: pwsh
+        run: |
+          $manual = "${{ inputs.source_file }}".Trim()
+          if ($manual -ne "") {
+            if (!(Test-Path $manual)) { throw "找不到源码文件: $manual" }
+            $files = @($manual)
+          } else {
+            # push 触发:混淆 src/ 下所有 .lua
+            $files = git ls-files "src/*.lua"
+            if ($files.Count -eq 0 -or $files[0] -eq "") {
+              throw "src/ 目录下没有 .lua 文件"
+            }
+          }
+          Write-Output "目标文件: $($files -join ', ')"
+          $files | ForEach-Object { "file=$_" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8 }
+
+      - name: 逐个混淆
+        shell: pwsh
+        run: |
+          $strength = "${{ inputs.strength }}"
+          if ($strength -eq "") { $strength = "high" }
+          $files = @("${{ steps.targets.outputs.file }}".Split("`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+          if ($files.Count -eq 0) { throw "没有可混淆的文件" }
+          New-Item -ItemType Directory -Force "out" | Out-Null
+          foreach ($f in $files) {
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($f)
+            Write-Output "=== 混淆: $f (强度 $strength) ==="
+            dotnet "IronBrew2 CLI\bin\Release\net8.0\IronBrew2 CLI.dll" "$f" --strength $strength
+            if (!(Test-Path "out.lua")) { throw "混淆失败: $f 未生成 out.lua" }
+            $target = "out\" + $base + "_obf.lua"
+            Move-Item "out.lua" $target -Force
+            Write-Output "产物: $target ($((Get-Item $target).Length) 字节)"
+          }
+
+      - name: 产物提交回仓库(out/ 目录)
+        continue-on-error: true   # push 失败不阻塞 Artifacts 下载(产物仍可下载)
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add out/
+          if (git diff --cached --quiet) {
+            Write-Output "无新增产物,跳过提交"
+          } else {
+            git commit -m "云端混淆产物: ${{ github.run_number }}"
+            git push
+            Write-Output "已提交产物到 out/"
+          }
+
+      - name: 上传 Artifacts(双保险)
+        uses: actions/upload-artifact@v4
+        with:
+          name: obfuscated-${{ github.run_number }}
+          path: out/
+          if-no-files-found: error

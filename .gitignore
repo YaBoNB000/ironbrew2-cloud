@@ -1,0 +1,33 @@
+# 推送到 GitHub 前的排除清单
+# 保留:IronBrew2 CLI/bin/Release/net8.0/(混淆器本体)+ Lua/(lua.exe/luac.exe/Minifier)
+
+# --- 编译中间产物 ---
+obj/
+bin/Debug/
+*.pdb
+*.user
+.vs/
+
+# --- 测试/调试垃圾 ---
+temp/
+temp-cs/
+test/
+Tests/
+t_*.txt
+t_*.lua
+run_*.lua
+run_def*.lua
+
+# --- 混淆产物(别把旧产物推上去)---
+out*.lua
+out1.lua
+out2.lua
+out3.lua
+
+# --- 你的源码脚本(敏感,勿上传;放到 src/ 再手动 add)---
+Blox Fruit*.lua
+UI.lua
+UI_obf*.lua
+
+# --- 其他 ---
+*.log
