@@ -12,7 +12,7 @@ namespace IronBrew2_CLI
 		{
 			if (args.Length < 1)
 			{
-				Console.WriteLine("Usage: IronBrew2 CLI <input.lua> [--no-antidump] [--strength low|mid|high]");
+				Console.WriteLine("Usage: IronBrew2 CLI <input.lua> [--no-antidump] [--strength low|mid|high] [--watermark text]");
 				return 2;
 			}
 
@@ -26,6 +26,9 @@ namespace IronBrew2_CLI
 			{
 				if (args[i] == "--no-antidump")
 					settings.AntiDump = false;
+
+				else if (args[i] == "--watermark" && i + 1 < args.Length)
+					settings.Watermark = args[++i];
 
 				else if (args[i] == "--strength" && i + 1 < args.Length)
 				{

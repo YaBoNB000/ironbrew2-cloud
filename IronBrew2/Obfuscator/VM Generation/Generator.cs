@@ -134,6 +134,14 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			return sb.ToString();
 		}
 
+		// Lua 单引号字符串转义，用于可配置的 dump 诱饵水印。
+		private static string EscapeLuaString(string value) =>
+			(value ?? "")
+				.Replace("\\", "\\\\")
+				.Replace("'", "\\'")
+				.Replace("\r", "\\r")
+				.Replace("\n", "\\n");
+
 		// ==== base91 字节流编码(替换 LZW+base92)====
 		// 字节码已经流式 XOR 加密(高熵),LZW 压缩率为负;base91 约 1.23x,且 VM 端解码器更小。
 		private static char Base91Char(int v)
@@ -650,7 +658,8 @@ local ToNumber = tonumber;");
 				.Replace("CONST_FLOAT", _context.ConstantMapping[2].ToString())
 				.Replace("CONST_STRING", _context.ConstantMapping[3].ToString())
 				// 环境绑定：注入种子派生代码（读盐 → 跑探针 → Hash 派生 Xs）
-				.Replace("__IB2_SEED__", settings.EnvironmentLock ? _context.Binder.SeedDeriveLua : EnvBinder.PlainSeedLua));
+				.Replace("__IB2_SEED__", settings.EnvironmentLock ? _context.Binder.SeedDeriveLua : EnvBinder.PlainSeedLua)
+				.Replace("__IB2_WATERMARK__", EscapeLuaString(settings.Watermark)));
 			
 			for (int i = 0; i < (int) ChunkStep.StepCount; i++)
 			{

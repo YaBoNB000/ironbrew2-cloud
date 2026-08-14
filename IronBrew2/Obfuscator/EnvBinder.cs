@@ -49,7 +49,8 @@ namespace IronBrew2.Obfuscator
                 "table",      // typeof(setmetatable({}, {}))
             });
 
-            SeedDeriveLua = BuildSeedDeriveLua();
+            SeedDeriveLua = BuildSeedDeriveLua()
+                .Replace("__IB2_EXPECTED_FP__", ExpectedFingerprint.ToString());
         }
 
         /// <summary>
@@ -73,8 +74,9 @@ namespace IronBrew2.Obfuscator
 
         private string BuildSeedDeriveLua() => @"
 -- Environment lock: read salt -> run probe -> derive XOR seed.
--- The probe returns a deterministic value in a real Roblox env, and throws
--- (pcall -> 0) offline, so the seed only matches when running in Roblox.
+-- 诱饵水印：正常环境不打印；dump/decompile 工具会在代码或阻断错误里看到。
+local __ib2Watermark = '__IB2_WATERMARK__'
+-- The probe returns a deterministic value in a real Roblox env.
 local function __ib2Probe()
     local ok, r = pcall(function()
         local p = {}
@@ -89,8 +91,8 @@ local function __ib2Probe()
         end
         return h
     end)
-    if ok then return r end
-    return 0
+    if ok and r == __IB2_EXPECTED_FP__ then return r end
+    error(__ib2Watermark .. ' | dump blocked', 0)
 end
 -- seed = Hash(Salt .. '|' .. fingerprint). Matches C# side only in a real env.
 local __ib2SeedStr = tostring(__ib2Head) .. '|' .. tostring(__ib2Probe())

@@ -20,8 +20,11 @@ namespace IronBrew2.Obfuscator
 		public bool AggressiveDefense;
 		public bool Noise;
 		// 环境绑定：字节码 XOR 种子 = Hash(盐 | Roblox 环境指纹)。
-		// true(默认) = 离线/纯 Lua 环境解密出乱码；false = 兼容 plain Lua 测试。
+		// true(默认) = 离线/纯 Lua 环境触发带水印的阻断错误；false = 兼容 plain Lua 测试。
 		public bool EnvironmentLock;
+		// 离线 dump/decompile 环境会在解密前看到此诱饵文字，并在阻断错误中显示。
+		// 正常 Roblox 执行器环境不会打印它。
+		public string Watermark;
 		
 		public ObfuscationSettings()
 		{
@@ -44,6 +47,7 @@ namespace IronBrew2.Obfuscator
 			AggressiveDefense = false;
 			Noise = false;
 			EnvironmentLock = true;
+			Watermark = "Protected by IOI obf";
 		}
 	}
 }
