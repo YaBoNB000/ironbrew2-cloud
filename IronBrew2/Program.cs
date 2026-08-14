@@ -128,7 +128,8 @@ namespace IronBrew2
 				
 				Console.WriteLine("Compiling...");
 
-				var _t1src = new ConstantEncryption(settings, File.ReadAllText(t0, _fuckingLua)).EncryptStrings(); Console.WriteLine("DBG t1 len=" + _t1src.Length + " enc=" + _t1src.Contains("((function(b)") + " sEnc=" + settings.EncryptStrings); File.WriteAllText(t1, _t1src, _fuckingLua);
+				var t1Source = new ConstantEncryption(settings, File.ReadAllText(t0, _fuckingLua)).EncryptStrings();
+				File.WriteAllText(t1, t1Source, _fuckingLua);
 				proc = new Process
 				       {
 					       StartInfo =
@@ -167,10 +168,15 @@ namespace IronBrew2
 
 				if (settings.AntiDump)
 				{
-					// === 防 dump 主动防御块(先合并,guard 之后、主脚本之前执行)===
-					// 仅真实执行器环境运行(guard 放行后才执行到);字符串全 string.char 构造。
 					Instruction mainFirst = lChunk.Instructions.Count > 0 ? lChunk.Instructions[0] : null;
-					string defSrc = DefenseGenerator.GenerateSourceBlock();
+
+					// 激进防御会 hook 执行器 API 并依赖非标准 debug API。不同执行器的返回值并不一致，
+					// 误判后会触发冻结函数，表现为 nil 比较、卡死或内存暴涨。默认只保留兼容性更好的
+					// guard + EnvironmentLock；只有显式启用 AggressiveDefense 时才合并此块。
+					if (settings.AggressiveDefense)
+					{
+						// === 防 dump 主动防御块(先合并,guard 之后、主脚本之前执行)===
+						string defSrc = DefenseGenerator.GenerateSourceBlock();
 					string defLua = Path.Combine(path, "defense_src.lua");
 					string defOut = Path.Combine(path, "defense.luac");
 					File.WriteAllText(defLua, defSrc, _fuckingLua);
@@ -186,10 +192,14 @@ namespace IronBrew2
 							RedirectStandardOutput = true
 						}
 					};
-					proc.Start();
-					proc.WaitForExit();
+						proc.Start();
+						string defStdout = proc.StandardOutput.ReadToEnd();
+						string defStderr = proc.StandardError.ReadToEnd();
+						proc.WaitForExit();
+						if (proc.ExitCode != 0 || !File.Exists(defOut))
+							throw new Exception("AntiDump defense compilation failed: " + defStdout + defStderr);
 
-					if (File.Exists(defOut))
+						if (File.Exists(defOut))
 					{
 						Deserializer dd = new Deserializer(File.ReadAllBytes(defOut));
 						Chunk defense = dd.DecodeFile();
@@ -219,7 +229,8 @@ namespace IronBrew2
 						lChunk.UpdateMappings();
 
 						// guard 的"检测通过"跳转应落在防护块首指令(而非主脚本)
-						mainFirst = lChunk.Instructions.Count > 0 ? lChunk.Instructions[0] : null;
+							mainFirst = lChunk.Instructions.Count > 0 ? lChunk.Instructions[0] : null;
+						}
 					}
 
 					// P3: 反 dump 引导块编入 VM——不再以源码明文存在于产物。
@@ -240,10 +251,14 @@ namespace IronBrew2
 							RedirectStandardOutput = true
 						}
 					};
-					proc.Start();
-					proc.WaitForExit();
+						proc.Start();
+						string guardStdout = proc.StandardOutput.ReadToEnd();
+						string guardStderr = proc.StandardError.ReadToEnd();
+						proc.WaitForExit();
+						if (proc.ExitCode != 0 || !File.Exists(guardOut))
+							throw new Exception("AntiDump guard compilation failed: " + guardStdout + guardStderr);
 
-					if (File.Exists(guardOut))
+						if (File.Exists(guardOut))
 					{
 						Deserializer gd = new Deserializer(File.ReadAllBytes(guardOut));
 						Chunk guard = gd.DecodeFile();

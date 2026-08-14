@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -95,7 +95,10 @@ namespace IronBrew2.Obfuscator.Control_Flow
 				}
 			}
 			
-			TestFlip.DoInstructions(c, c.Instructions.ToList());
+			// TestFlip 会随机翻转比较条件并插入跳转。复杂脚本中该变换无法稳定保持
+			// Lua 5.1 的“比较后跳过下一条指令”语义，会造成错误分支、死循环以及
+			// VM 运行时对 nil 与 number 进行比较。为保证执行器兼容性，禁用此不安全变换。
+			// TestFlip.DoInstructions(c, c.Instructions.ToList());
 			
 			if (chunkHasCflow)
 				c.Instructions.Insert(0, new Instruction(c, Opcode.NewStack));
