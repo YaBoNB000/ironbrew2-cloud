@@ -171,6 +171,17 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 - `tests/verify_v3_payload.py`
 - `tests/run_linux_tests.sh`
 
+### 3.1 CI 与多平台构建
+
+`.github/workflows/ci.yml` 在 push、pull request 和手动触发时运行：
+
+- `ubuntu-24.04` 安装 .NET 8 与 PUC Lua 5.1，以 `IB2_RANDOM_RUNS=20` 执行完整 Linux 差分、CFG、lazy decode、篡改拒绝和泄漏检查套件；
+- 独立 Release publish 矩阵覆盖 `linux-x64`、`win-x64` 和 `osx-arm64`，分别使用当前 GitHub-hosted Linux、Windows 与 macOS runner；
+- build matrix 使用 framework-dependent publish 和 `ContinuousIntegrationBuild=true`，验证三个目标 RID 均能完成 Release 编译；
+- 按当前范围不上传 CI Artifact、不调整现有云端混淆产物策略，也不增加仓库内二进制工具校验。
+
+本地预检已完成 workflow YAML 解析、最终 Release build、Linux 完整套件的 1 次随机回归，以及三个 RID 的 framework-dependent cross-publish；真正的三种 hosted runner 结果需在提交推送后由 GitHub Actions 给出。
+
 ## 4. 仍存在的边界
 
 1. 这是客户端混淆，不是密码学保密。seed、fingerprint、VM、prototype banks 和校验逻辑最终都在攻击者可执行的客户端中。
@@ -181,6 +192,6 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 6. handler 拆分/合并/等价模板已经完成，但每次构建仍只生成一组 canonical handler；自动 dispatcher flattening 尚未完成。
 7. Mutation/SuperOperator 没有被本轮宣告为稳定；IR-native superoperator 及更大差分语料仍是后续工作，固定配置继续关闭它们。
 8. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持。
-9. 尚未接入 CI，也尚未完成大程序、性能、内存和体积基准。
+9. CI 已覆盖 Linux 完整语义回归和 Linux/Windows/macOS Release publish；尚未在 Windows/macOS 上运行 Lua 语义套件，也尚未完成大程序、性能、内存和体积基准。
 
-后续工作按 `HARDENING_PLAN.md` 的剩余 Phase 3–4 项继续：自动 dispatcher flattening、IR-native superoperator、性能基准及多平台 CI。
+后续工作按 `HARDENING_PLAN.md` 的剩余 Phase 3–4 项继续：自动 dispatcher flattening、IR-native superoperator，以及性能、内存和体积基准。

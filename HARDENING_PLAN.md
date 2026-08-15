@@ -72,8 +72,8 @@
 - [x] CLI、批处理和云端工作流统一为单一稳定配置：ControlFlow/DEFLATE 开启，执行器专用 gate 关闭。
 - [ ] 为固定配置建立真实性能和体积基准。
 - [x] 提供本地 Linux 语义差分、随机 seed 和篡改测试脚本。
-- [ ] 将测试接入 CI，并扩展到多平台构建。
-- [ ] 云端流程仅上传短期 Artifact，避免提交敏感源码/产物并校验二进制工具。
+- [x] 将 Linux Lua 5.1 完整回归接入 CI，并增加 Linux x64、Windows x64、macOS arm64 的 Release publish 构建矩阵。
+- 不实施（当前明确不需要）：云端仅上传短期 Artifact、敏感源码/产物策略和额外二进制工具校验。
 
 ## 明确不优先做
 

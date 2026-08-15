@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: '1'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+
+jobs:
+  linux-tests:
+    name: Linux / Lua 5.1 regression suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install Lua 5.1
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends lua5.1
+
+      - name: Run Linux differential and tamper tests
+        env:
+          IB2_RANDOM_RUNS: '20'
+          LUA: /usr/bin/lua5.1
+          LUAC: /usr/bin/luac5.1
+        run: ./tests/run_linux_tests.sh
+
+  platform-build:
+    name: Build / ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-24.04
+            rid: linux-x64
+          - name: Windows x64
+            os: windows-2025
+            rid: win-x64
+          - name: macOS arm64
+            os: macos-15
+            rid: osx-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish framework-dependent CLI
+        run: >-
+          dotnet publish "IronBrew2 CLI/IronBrew2 CLI.csproj"
+          --configuration Release
+          --runtime "${{ matrix.rid }}"
+          --self-contained false
+          --output "${{ runner.temp }}/ironbrew2-${{ matrix.rid }}"
+          --nologo
+          -p:ContinuousIntegrationBuild=true

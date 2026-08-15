@@ -21,3 +21,4 @@ The CLI has one supported configuration, equivalent to the former `mid` behavior
 - Implementation plan: [`HARDENING_PLAN.md`](HARDENING_PLAN.md)
 - Implementation/test report: [`HARDENING_REPORT.md`](HARDENING_REPORT.md)
 - Linux differential suite: [`tests/run_linux_tests.sh`](tests/run_linux_tests.sh)
+- CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the full Lua 5.1 suite on Linux and Release publish builds for Linux x64, Windows x64, and macOS arm64.
