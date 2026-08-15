@@ -1,4 +1,4 @@
--- IronBrew2 strict executor feature probe
+-- IronBrew2 strict executor feature probe (standard Lua 5.1-compatible syntax)
 -- Run this file by itself in the executor, not through the obfuscator.
 -- It reads capabilities, mutates/restores private probe upvalues, saves the report
 -- as IronBrew2_executor_probe.txt, verifies it with readfile when available, and copies
@@ -628,15 +628,39 @@ else
         .. ",error=" .. escape(ClipboardError)
 end
 
+-- Build a small transport report that does not depend on filesystem or clipboard support.
+-- Keep failed contracts, the exact failed snapshot entries, and detailed loadstring/newcclosure
+-- observations. This is intentionally much shorter than the full report so consoles with a
+-- small per-message character limit can still retain it.
+local CompactOutput = {
+    "IB2PROBE|meta|compact_report|INFO|format=failed-contracts-v1"
+}
+for index = 1, #Output do
+    local line = Output[index]
+    local isFailure = StringLibrary.find(line, "|FAIL|", 1, true) ~= nil
+    local keep = StringLibrary.find(line, "IB2PROBE|summary|executor|", 1, true) == 1
+        or StringLibrary.find(line, "IB2PROBE|summary|strict_contract|", 1, true) == 1
+        or (isFailure and (
+            StringLibrary.find(line, "IB2PROBE|contract|", 1, true) == 1
+            or StringLibrary.find(line, "IB2PROBE|snapshot|", 1, true) == 1
+            or StringLibrary.find(line, "IB2PROBE|core_snapshot|", 1, true) == 1
+            or StringLibrary.find(line, "IB2PROBE|debug_snapshot|", 1, true) == 1
+            or StringLibrary.find(line, "IB2PROBE|loadstring|", 1, true) == 1
+            or StringLibrary.find(line, "IB2PROBE|newcclosure|", 1, true) == 1
+        ))
+    if keep then
+        CompactOutput[#CompactOutput + 1] = line
+    end
+end
+local CompactReport = table.concat(CompactOutput, "\n")
+
 for index = 1, #Output do
     Print(Output[index])
 end
 Print(SaveLine)
 Print(VerifyLine)
 Print(ClipboardLine)
--- Repeat the compact result near the tail because some executor consoles retain only recent entries.
-Print(StrictSummaryLine)
--- Replay the complete report in one final print call. Some executor consoles retain only the
--- most recent log entry rather than the most recent lines, so per-line output disappears even
--- though the final workspace status remains visible. Keep this as the last output operation.
-Print(Report)
+Print("IB2PROBE|output|console_compact|OK|bytes=" .. #CompactReport
+    .. ",copy the complete final console entry")
+-- Keep this compact report as the final output operation.
+Print(CompactReport)
