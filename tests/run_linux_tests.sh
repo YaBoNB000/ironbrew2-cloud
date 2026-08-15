@@ -50,6 +50,17 @@ python3 tests/verify_v3_payload.py "$WORK/fixed.lua"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
 
+# Capability-gated Luau/executor probes must accept untouched native primitives,
+# preserve executor globals, and silently select the decoy route for either an
+# active debug hook or a primitive replaced by a Lua closure.
+"$LUA" tests/anti_debug_runner.lua capabilities "$WORK/fixed.lua" > "$WORK/anti-debug-capabilities.out"
+cmp "$WORK/baseline.out" "$WORK/anti-debug-capabilities.out"
+"$LUA" tests/anti_debug_runner.lua primitive-hook "$WORK/fixed.lua" > "$WORK/anti-debug-primitive.out"
+[[ ! -s "$WORK/anti-debug-primitive.out" ]]
+"$LUA" tests/anti_debug_runner.lua debug-hook "$WORK/fixed.lua" > "$WORK/anti-debug-hook.out"
+[[ ! -s "$WORK/anti-debug-hook.out" ]]
+echo "PASS capability-gated anti-debug probes and silent decoy routing"
+
 # semantic.lua contains no IB_MAX_CFLOW markers. Assert that its root prototype
 # was nevertheless selected and received a complete random route-state map.
 python3 - "$ROOT/temp/t2.lua" "$WORK/automatic-dispatch.lua" <<'PY'
@@ -184,10 +195,9 @@ mv out.lua "$WORK/closure-boundary.lua"
 cmp "$WORK/closure-boundary-baseline.out" "$WORK/closure-boundary.out"
 echo "PASS Closure pseudo instructions across flow blocks"
 
-# Verify the runtime keeps unexecuted basic blocks as opaque byte slices. The
-# production output is executed first. We then instrument the unminified VM
-# generated in temp/t2.lua, without changing product code, to count root blocks
-# whose encoded body has not yet been decoded when the protected program starts.
+# Verify AntiDump keeps block bodies opaque and materializes plaintext instructions
+# only in the invocation-local Flow cache. The root prototype's shared instruction
+# table must remain empty even while the first protected block is executing.
 "$LUA" tests/lazy_blocks.lua > "$WORK/lazy-baseline.out"
 rm -rf temp out.lua
 "$DOTNET" "$CLI" tests/lazy_blocks.lua > "$WORK/lazy-build.log"
@@ -211,6 +221,7 @@ if not match:
 root = match.group(2)
 probe = (
     "_G.__ib2_lazy_opaque=function() "
+    "assert(next(" + root + "[1])==nil,'decoded instructions escaped invocation-local cache');"
     "local n=0;local blocks=" + root + "[9];"
     "if blocks then for _,block in pairs(blocks) do "
     "if type(block[3])=='string' then n=n+1;end;end;end;"
@@ -222,7 +233,7 @@ PY
 "$LUAC" -p "$WORK/lazy-instrumented.lua"
 "$LUA" "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
 grep -Eq '^lazy-blocks:[1-9][0-9]*:executed-constant:37$' "$WORK/lazy-instrumented.out"
-echo "PASS unexecuted basic blocks remain opaque"
+echo "PASS ephemeral instruction cache and opaque block retention"
 
 # Exercise Lua 5.1's SETLIST C == 0 data word without checking in a huge table
 # constructor. A test-only luac wrapper patches the one-element fixture after
@@ -310,7 +321,7 @@ set -e
 grep -Fq 'invalid protected payload' "$WORK/tamper.stderr"
 echo "PASS tamper detection"
 
-if grep -aEq 'constants|nested|closure|A\\000B' "$WORK/fixed.lua"; then
+if grep -aEq "[\"'](constants|nested|closure)[\"']|A\\\\000B" "$WORK/fixed.lua"; then
     echo "A semantic string literal leaked into generated output." >&2
     exit 1
 fi

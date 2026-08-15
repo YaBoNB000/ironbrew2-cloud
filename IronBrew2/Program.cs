@@ -6,7 +6,6 @@ using System.Text;
 using IronBrew2.Bytecode_Library.Bytecode;
 using IronBrew2.Bytecode_Library.IR;
 using IronBrew2.Obfuscator;
-using IronBrew2.Obfuscator.AntiDump;
 using IronBrew2.Obfuscator.Control_Flow;
 using IronBrew2.Obfuscator.Encryption;
 using IronBrew2.Obfuscator.VM_Generation;
@@ -169,132 +168,9 @@ namespace IronBrew2
 					cf.DoChunks();
 				}
 
-				if (settings.AntiDump)
-				{
-					Instruction mainFirst = lChunk.Instructions.Count > 0 ? lChunk.Instructions[0] : null;
-
-					// 激进防御会 hook 执行器 API 并依赖非标准 debug API。不同执行器的返回值并不一致，
-					// 误判后会触发冻结函数，表现为 nil 比较、卡死或内存暴涨。默认只保留兼容性更好的
-					// guard + EnvironmentLock；只有显式启用 AggressiveDefense 时才合并此块。
-					if (settings.AggressiveDefense)
-					{
-						// === 防 dump 主动防御块(先合并,guard 之后、主脚本之前执行)===
-						string defSrc = DefenseGenerator.GenerateSourceBlock();
-					string defLua = Path.Combine(path, "defense_src.lua");
-					string defOut = Path.Combine(path, "defense.luac");
-					File.WriteAllText(defLua, defSrc, _fuckingLua);
-
-					proc = new Process
-					{
-						StartInfo =
-						{
-							FileName = luacPath,
-							Arguments = "-o \"" + defOut + "\" \"" + defLua + "\"",
-							UseShellExecute = false,
-							RedirectStandardError = true,
-							RedirectStandardOutput = true
-						}
-					};
-						proc.Start();
-						string defStdout = proc.StandardOutput.ReadToEnd();
-						string defStderr = proc.StandardError.ReadToEnd();
-						proc.WaitForExit();
-						if (proc.ExitCode != 0 || !File.Exists(defOut))
-							throw new Exception("AntiDump defense compilation failed: " + defStdout + defStderr);
-
-						if (File.Exists(defOut))
-					{
-						Deserializer dd = new Deserializer(File.ReadAllBytes(defOut));
-						Chunk defense = dd.DecodeFile();
-
-						// 去掉防护块末尾 RETURN(顺序执行到主脚本);内部 Jmp(若有)指向主脚本
-						if (defense.Instructions.Count > 0 && defense.Instructions[defense.Instructions.Count - 1].OpCode == Opcode.Return)
-						{
-							Instruction ret = defense.Instructions[defense.Instructions.Count - 1];
-							defense.Instructions.RemoveAt(defense.Instructions.Count - 1);
-							foreach (Instruction di in defense.Instructions)
-								if (di.RefOperands[0] == ret)
-									di.RefOperands[0] = mainFirst;
-						}
-
-						int off1 = lChunk.StackSize;
-						defense.Rebase(off1);
-
-						foreach (Constant dc in defense.Constants)
-							lChunk.Constants.Add(dc);
-						foreach (Chunk df in defense.Functions)
-							lChunk.Functions.Add(df);
-						foreach (Instruction di in defense.Instructions)
-							di.Chunk = lChunk;
-
-						lChunk.Instructions.InsertRange(0, defense.Instructions);
-						lChunk.StackSize = (byte) Math.Max(lChunk.StackSize, defense.StackSize);
-						lChunk.UpdateMappings();
-
-						// guard 的"检测通过"跳转应落在防护块首指令(而非主脚本)
-							mainFirst = lChunk.Instructions.Count > 0 ? lChunk.Instructions[0] : null;
-						}
-					}
-
-					// P3: 反 dump 引导块编入 VM——不再以源码明文存在于产物。
-					// 检测逻辑为"执行器特征"(getgenv 等纯全局读取),不依赖 Roblox API。
-					string guardSrc = AntiDumpGenerator.GenerateSourceBlock();
-					string guardLua = Path.Combine(path, "guard_src.lua");
-					string guardOut = Path.Combine(path, "guard.luac");
-					File.WriteAllText(guardLua, guardSrc, _fuckingLua);
-
-					proc = new Process
-					{
-						StartInfo =
-						{
-							FileName = luacPath,
-							Arguments = "-o \"" + guardOut + "\" \"" + guardLua + "\"",
-							UseShellExecute = false,
-							RedirectStandardError = true,
-							RedirectStandardOutput = true
-						}
-					};
-						proc.Start();
-						string guardStdout = proc.StandardOutput.ReadToEnd();
-						string guardStderr = proc.StandardError.ReadToEnd();
-						proc.WaitForExit();
-						if (proc.ExitCode != 0 || !File.Exists(guardOut))
-							throw new Exception("AntiDump guard compilation failed: " + guardStdout + guardStderr);
-
-						if (File.Exists(guardOut))
-					{
-						Deserializer gd = new Deserializer(File.ReadAllBytes(guardOut));
-						Chunk guard = gd.DecodeFile();
-
-						// 去掉 guard chunk 末尾的 RETURN:luac 编译 do...end 块会自动补 return。
-						// 同时把引用该 RETURN 的 Jmp(检测通过时的跳转)重定向到防护块/主脚本首指令,
-						// 否则 Jmp 目标悬空 → UpdateRegisters 抛 KeyNotFound
-						if (guard.Instructions.Count > 0 && guard.Instructions[guard.Instructions.Count - 1].OpCode == Opcode.Return)
-						{
-							Instruction ret = guard.Instructions[guard.Instructions.Count - 1];
-							guard.Instructions.RemoveAt(guard.Instructions.Count - 1);
-							foreach (Instruction gi in guard.Instructions)
-								if (gi.RefOperands[0] == ret)
-									gi.RefOperands[0] = mainFirst;
-						}
-
-						// 寄存器平移:guard 用到主脚本栈顶之上,避免寄存器冲突
-						int offset = lChunk.StackSize;
-						guard.Rebase(offset);
-
-						// 常量/子函数/指令合并进主 chunk(对象引用不变,UpdateMappings 后索引正确)
-						foreach (Constant gc in guard.Constants)
-							lChunk.Constants.Add(gc);
-						foreach (Chunk gf in guard.Functions)
-							lChunk.Functions.Add(gf);
-						foreach (Instruction gi in guard.Instructions)
-							gi.Chunk = lChunk;
-
-						lChunk.Instructions.InsertRange(0, guard.Instructions);
-						lChunk.StackSize = (byte) Math.Max(lChunk.StackSize, guard.StackSize);
-						lChunk.UpdateMappings();
-					}
-				}
+				// AntiDump is implemented inside the generated VM so its state is coupled
+				// to payload decoding and invocation-local instruction flow. No source chunk
+				// is prepended and no executor global is modified.
 
 				Console.WriteLine("Serializing...");
 				

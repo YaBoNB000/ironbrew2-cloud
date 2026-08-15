@@ -390,8 +390,9 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Inst;
 		local Enum;	
 
-		while true do
-			InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
+				while true do
+					__IB2_GUARD_CHECK__
+					InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
 			Inst		= GetInstruction(Chunk, InstrPoint, Flow);
 			Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 
@@ -436,8 +437,9 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Inst;
 		local Enum;	
 
-		repeat
-			InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
+				repeat
+					__IB2_GUARD_CHECK__
+					InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
 			Inst		= GetInstruction(Chunk, InstrPoint, Flow);
 			Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 
@@ -464,7 +466,6 @@ return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
 		public static string VMP2_LI = @"
-local PCall = pcall
 local function Wrap(Chunk, Upvalues, Env)
 	local Instr = Chunk[1];
 	local Proto = Chunk[2];
@@ -508,12 +509,12 @@ local function Wrap(Chunk, Upvalues, Env)
 			local Enum;	
 
 			while true do
+				__IB2_GUARD_CHECK__
 				InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
 				Inst		= GetInstruction(Chunk, InstrPoint, Flow);
 				Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 		
 		public static string VMP2_LI_R = @"
-local PCall = pcall
 local function Wrap(Chunk, Upvalues, Env)
 	local Instr = Chunk[1];
 	local Proto = Chunk[2];
@@ -557,6 +558,7 @@ local function Wrap(Chunk, Upvalues, Env)
 			local Enum;	
 
 			repeat
+				__IB2_GUARD_CHECK__
 				InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
 				Inst		= GetInstruction(Chunk, InstrPoint, Flow);
 				Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";

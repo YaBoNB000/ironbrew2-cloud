@@ -14,8 +14,9 @@ namespace IronBrew2_CLI
 
 		private static ObfuscationSettings CreateSettings(bool preserveLineInfo)
 		{
-			// Single supported profile: the former "mid" behavior. Keep unstable
-			// transformations and environment-specific guards disabled by default.
+			// Single supported profile. VM-integrated anti-debug/anti-dump defense is
+			// enabled; destructive executor hooks and the strict Roblox fingerprint gate
+			// remain disabled.
 			return new ObfuscationSettings
 			{
 				Mutate = false,
@@ -24,7 +25,7 @@ namespace IronBrew2_CLI
 				EncryptImportantStrings = false,
 				AggressiveDefense = false,
 				Noise = false,
-				AntiDump = false,
+				AntiDump = true,
 				EnvironmentLock = false,
 				ControlFlow = true,
 				BytecodeCompress = true,

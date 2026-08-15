@@ -4,9 +4,16 @@ using System.Text;
 
 namespace IronBrew2.Obfuscator.AntiDump
 {
+	/// <summary>
+	/// Generates capability-gated runtime integrity probes and side-effect-free VM noise.
+	/// The guard never mutates executor globals and never allocates an unbounded amount of
+	/// memory. A high-confidence signal is consumed by the generated VM as a silent decoy
+	/// route instead of exposing a distinct "blocked" error.
+	/// </summary>
 	public static class AntiDumpGenerator
 	{
 		private static readonly Random R = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
+
 		private static string RN(int min, int max)
 		{
 			const string cs = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -14,37 +21,104 @@ namespace IronBrew2.Obfuscator.AntiDump
 			char[] n = new char[len];
 			n[0] = cs[R.Next(cs.Length)];
 			for (int i = 1; i < len; i++)
-				n[i] = (R.Next(2) == 0) ? (char)('0' + R.Next(10)) : cs[R.Next(cs.Length)];
+				n[i] = R.Next(2) == 0 ? (char)('0' + R.Next(10)) : cs[R.Next(cs.Length)];
 			return new string(n);
 		}
 
-
-		public static string GenerateSourceBlock()
+		/// <summary>
+		/// Builds the guard that is embedded directly into the generated VM. Roblox/Luau
+		/// capabilities are optional: ordinary Lua remains a valid execution environment,
+		/// while iscclosure/islclosure and debug.gethook are used when the host exposes them.
+		/// </summary>
+		public static string GenerateRuntimeGuard(int probeInterval, uint decoySeed)
 		{
-			// 兼容模式 guard：不再生成递归/死循环/内存膨胀闭包。
-			// 这些闭包会增加 VM upvalue，并在不同执行器中导致寄存器错位、nil 比较或卡死。
-			// 检测失败时返回明确错误；EnvironmentLock 仍负责阻止离线解密。
-			var sb = new StringBuilder();
-			sb.Append("do\n");
-			sb.Append("local _ok=false;\n");
+			if (probeInterval < 16)
+				throw new ArgumentOutOfRangeException(nameof(probeInterval));
 
-			string[] exeApis = { "getgenv", "identifyexecutor", "getexecutorname", "isexecutorclosure", "getscriptbytecode", "syn" };
-			foreach (string api in exeApis)
-				sb.Append("if not _ok and " + api + " and type(" + api + ")==" + (api == "syn" ? "\"table\"" : "\"function\"") + " then _ok=true end\n");
+			return @"
+local Type = type;
+local PCall = pcall;
+local GuardString = string;
+local GuardTable = table;
+local GuardMath = math;
+local GuardDebug = debug;
+local GuardGetHook = GuardDebug and GuardDebug.gethook;
+local GuardEnvOK, GuardEnvironment = PCall(GetFEnv);
+if not GuardEnvOK or Type(GuardEnvironment) ~= 'table' then GuardEnvironment = nil; end;
+local GuardIsC = GuardEnvironment and GuardEnvironment.iscclosure;
+local GuardIsL = GuardEnvironment and GuardEnvironment.islclosure;
+if Type(GuardIsC) ~= 'function' then GuardIsC = nil; end;
+if Type(GuardIsL) ~= 'function' then GuardIsL = nil; end;
+local GuardCounter = 0;
+local GuardTripped = false;
 
-			sb.Append("if not _ok then error(\"unsupported executor environment\",0) end\n");
-			sb.Append("local _a,_b=pcall(string.byte,\"A\");if not(_a and _b==65)then error(\"environment integrity check failed\",0)end\n");
-			sb.Append("local _c,_d=pcall(string.char,65);if not(_c and _d==\"A\")then error(\"environment integrity check failed\",0)end\n");
-			sb.Append("local _e,_f=pcall(string.sub,\"abc\",1,2);if not(_e and _f==\"ab\")then error(\"environment integrity check failed\",0)end\n");
-			sb.Append("local _g,_h=pcall(table.concat,{\"a\",\"b\"});if not(_g and _h==\"ab\")then error(\"environment integrity check failed\",0)end\n");
-			sb.Append("end\n");
-			return sb.ToString();
+local function GuardProbe(Force)
+    GuardCounter = GuardCounter + 1;
+    if GuardTripped then return true; end;
+    if not Force and GuardCounter % __IB2_GUARD_INTERVAL__ ~= 0 then return false; end;
+
+    if string ~= GuardString or table ~= GuardTable or math ~= GuardMath
+        or pcall ~= PCall or type ~= Type
+        or GuardString.byte ~= Byte or GuardString.char ~= Char or GuardString.sub ~= Sub
+        or GuardTable.concat ~= Concat or GuardTable.insert ~= Insert then
+        GuardTripped = true;
+    end;
+
+    if not GuardTripped and GuardDebug then
+        if debug ~= GuardDebug or GuardDebug.gethook ~= GuardGetHook then
+            GuardTripped = true;
+        elseif GuardGetHook then
+            local GuardHookOK, GuardHook = PCall(GuardGetHook);
+            if GuardHookOK and GuardHook ~= nil then GuardTripped = true; end;
+        end;
+    end;
+
+    if not GuardTripped and GuardEnvironment then
+        if GuardIsC and GuardEnvironment.iscclosure ~= GuardIsC then GuardTripped = true; end;
+        if GuardIsL and GuardEnvironment.islclosure ~= GuardIsL then GuardTripped = true; end;
+    end;
+
+    if not GuardTripped and GuardIsC then
+        local GuardOK1, GuardC1 = PCall(GuardIsC, Byte);
+        local GuardOK2, GuardC2 = PCall(GuardIsC, Sub);
+        local GuardOK3, GuardC3 = PCall(GuardIsC, Concat);
+        local GuardOK4, GuardC4 = PCall(GuardIsC, PCall);
+        if not GuardOK1 or GuardC1 ~= true or not GuardOK2 or GuardC2 ~= true
+            or not GuardOK3 or GuardC3 ~= true or not GuardOK4 or GuardC4 ~= true then
+            GuardTripped = true;
+        end;
+    end;
+
+    if not GuardTripped and GuardIsL then
+        local GuardOK1, GuardL1 = PCall(GuardIsL, Byte);
+        local GuardOK2, GuardL2 = PCall(GuardIsL, Sub);
+        local GuardOK3, GuardL3 = PCall(GuardIsL, Concat);
+        if not GuardOK1 or GuardL1 ~= false or not GuardOK2 or GuardL2 ~= false
+            or not GuardOK3 or GuardL3 ~= false then
+            GuardTripped = true;
+        end;
+    end;
+    return GuardTripped;
+end;
+
+local function GuardDecoy(...)
+    local GuardValue = (__IB2_DECOY_SEED__ + Select('#', ...)) % 2147483647;
+    for GuardIndex = 1, 11 do
+        GuardValue = (GuardValue * 48271 + GuardIndex * 257) % 2147483647;
+    end;
+    if GuardValue == -1 then return GuardValue; end;
+    return nil;
+end;
+
+if GuardProbe(true) then return GuardDecoy; end;
+"
+				.Replace("__IB2_GUARD_INTERVAL__", probeInterval.ToString())
+				.Replace("__IB2_DECOY_SEED__", decoySeed.ToString());
 		}
 
 		public static string GenerateHandlerNoise()
 		{
-			// 注意:不能有 getfenv/_G 环境写入——执行器 hook getfenv/观察 _G 写入会记录这些噪音键,
-			// dump 出一堆 fenv["key"]=true。只用纯计算噪音(无外部副作用)。
+			// Pure computation only: no getfenv/_G writes and no executor API hooks.
 			var parts = new List<string>();
 			var exprs = new[] { "string.byte(\"A\")==65", "#{\"x\"}==1", "(-1<0)==true", "tostring(1)==\"1\"" };
 			parts.Add("local " + RN(4, 8) + "=(" + exprs[R.Next(4)] + ")");
@@ -55,7 +129,6 @@ namespace IronBrew2.Obfuscator.AntiDump
 
 		public static string GenerateLoopNoise()
 		{
-			// 纯计算噪音(无 getfenv/_G 环境写入,防执行器记录噪音键)
 			var mod = new[] { 7, 11, 13, 17, 19 }[R.Next(5)];
 			var sb = new StringBuilder();
 			sb.Append("\tif (InstrPoint%"); sb.Append(mod); sb.Append("==0) then\n");

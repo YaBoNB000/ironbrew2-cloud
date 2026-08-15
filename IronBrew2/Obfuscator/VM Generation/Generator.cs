@@ -660,8 +660,12 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier",
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
 				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
-				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock"
-			};
+					"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
+					"Type","GuardString","GuardTable","GuardMath","GuardDebug","GuardGetHook","GuardEnvOK","GuardEnvironment",
+					"GuardIsC","GuardIsL","GuardCounter","GuardTripped","GuardProbe","Force","GuardHookOK","GuardHook",
+					"GuardOK1","GuardOK2","GuardOK3","GuardOK4","GuardC1","GuardC2","GuardC3","GuardC4",
+					"GuardL1","GuardL2","GuardL3","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential"
+				};
 			string[] luaKws = {"and","break","do","else","elseif","end","false","for","function","if","in","local","nil","not","or","repeat","return","then","true","until","while"};
 			var idents = new Dictionary<string,string>();
 			var usedNames = new HashSet<string>();
@@ -812,9 +816,14 @@ local LDExp        = math.ldexp;
 local GetFEnv      = getfenv or function() return _G end;
 local Setmetatable = setmetatable;
 local Select       = select;
+local PCall        = pcall;
+local Type         = type;
 
 local Unpack = unpack or table.unpack;
 local ToNumber = tonumber;");
+
+			if (settings.AntiDump)
+				vm += T(AntiDumpGenerator.GenerateRuntimeGuard(37 + r.Next(36), (uint) r.Next(1, int.MaxValue)));
 
 			// 数据切片:base92 字符串拆成 2-6 小段,以 local <随机名>='段' 形式散布在产物各处,
 			// 最后统一拼接 —— 视觉上与代码交织,不再是一整块孤立的"数据区"
@@ -941,7 +950,7 @@ Consts = nil;");
 
 			vm += T("return Chunk;end;");
 
-			vm += T(@"
+			string blockRuntime = @"
 local function GetProto(Proto, Index)
     local Encoded = Proto[Index];
     if type(Encoded) == 'string' then
@@ -962,7 +971,7 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState)
         error('invalid protected payload', 0);
     end;
     ByteString, Pos = Block[3], 1;
-    local Instrs = Chunk[1];
+    __IB2_DECODE_TARGET__
     local ConstCache = Block[4];
     for Offset = 0, Block[2] - 1 do
         local Index = Block[1] + Offset;
@@ -997,9 +1006,7 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState)
         end;
     end;
     ByteString, Pos = SavedByteString, SavedPos;
-    Block[3], Block[4], Block[7] = nil, nil, nil;
-    Chunk[11] = Chunk[11] - 1;
-    if Chunk[11] == 0 then Chunk[9] = nil; end;
+    __IB2_DECODE_FINALIZE__
 end;
 
 local function GetInstruction(Chunk, Index, Flow)
@@ -1009,6 +1016,7 @@ local function GetInstruction(Chunk, Index, Flow)
 
     local LastIndex = Flow[1];
     local CurrentBlock = Flow[2];
+    __IB2_CACHE_SEQUENTIAL__
     local EntryState;
     if not CurrentBlock then
         if Index ~= 1 then error('invalid protected payload', 0); end;
@@ -1027,12 +1035,7 @@ local function GetInstruction(Chunk, Index, Flow)
     end;
     Flow[1], Flow[2], Flow[3] = Index, Block, EntryState;
 
-    local Inst = Chunk[1][Index];
-    if Inst then return Inst; end;
-    DecodeInstructionBlock(Chunk, Block, EntryState);
-    Inst = Chunk[1][Index];
-    if not Inst then error('invalid protected payload', 0); end;
-    return Inst;
+    __IB2_INSTRUCTION_LOOKUP__
 end;
 
 -- For selected prototypes InstrPoint is a random route token at every basic-
@@ -1058,9 +1061,37 @@ local function NextInstructionPoint(Chunk, Index, Flow)
         return RouteToken;
     end;
     return Index;
-end;");
+end;";
 
-			vm += T(settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2));
+			if (settings.AntiDump)
+			{
+				blockRuntime = blockRuntime
+					.Replace("__IB2_DECODE_TARGET__", "local Instrs = {};")
+					.Replace("__IB2_DECODE_FINALIZE__", "return Instrs;")
+					.Replace("__IB2_CACHE_SEQUENTIAL__", "local IsSequential = CurrentBlock ~= nil and CurrentBlock == Block and Index == LastIndex + 1;")
+					.Replace("__IB2_INSTRUCTION_LOOKUP__", @"local FlowCache = Flow[4];
+    if not IsSequential or not FlowCache or FlowCache[1] ~= Block or FlowCache[2] ~= EntryState then
+        local DecodedInstrs = DecodeInstructionBlock(Chunk, Block, EntryState);
+        FlowCache = {Block, EntryState, DecodedInstrs};
+        Flow[4] = FlowCache;
+    end;
+    local Inst = FlowCache[3][Index];
+    if not Inst then error('invalid protected payload', 0); end;
+    return Inst;");
+			}
+			else
+			{
+				blockRuntime = blockRuntime
+					.Replace("__IB2_DECODE_TARGET__", "local Instrs = Chunk[1];")
+					.Replace("__IB2_DECODE_FINALIZE__", "Block[3], Block[4], Block[7] = nil, nil, nil; Chunk[11] = Chunk[11] - 1; if Chunk[11] == 0 then Chunk[9] = nil; end;")
+					.Replace("__IB2_CACHE_SEQUENTIAL__", "")
+					.Replace("__IB2_INSTRUCTION_LOOKUP__", "local Inst = Chunk[1][Index]; if Inst then return Inst; end; DecodeInstructionBlock(Chunk, Block, EntryState); Inst = Chunk[1][Index]; if not Inst then error('invalid protected payload', 0); end; return Inst;");
+			}
+			vm += T(blockRuntime);
+
+			string loopRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2);
+			loopRuntime = loopRuntime.Replace("__IB2_GUARD_CHECK__", settings.AntiDump ? "if GuardProbe(false) then return GuardDecoy(); end;" : "");
+			vm += T(loopRuntime);
 
 			if (settings.Noise)
 				vm += T(AntiDumpGenerator.GenerateLoopNoise());
