@@ -26,7 +26,7 @@ namespace IronBrew2.Obfuscator.Encryption
 
 		public string Encrypt(byte[] bytes)
 		{
-			Random rnd = new Random();
+			Random rnd = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 			int variant = rnd.Next(0, 3);
 			List<byte> encrypted = new List<byte>();
 
@@ -114,7 +114,7 @@ namespace IronBrew2.Obfuscator.Encryption
 
 		public Decryptor(string name, int maxLen)
 		{
-			Random r = new Random();
+			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 
 			Name = name;
 			Table = Enumerable.Repeat(0, maxLen).Select(i => r.Next(0, 256)).ToArray();

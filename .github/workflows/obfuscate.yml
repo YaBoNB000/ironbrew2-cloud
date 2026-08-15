@@ -1,7 +1,7 @@
 # 云端混淆
 # 触发方式:
-#   ① push 到 src/ 目录 → 自动混淆 src/ 下所有已跟踪的 .lua，强度 high
-#   ② 手动 Run workflow → 可指定单个文件与强度
+#   ① push 到 src/ 目录 → 自动混淆 src/ 下所有已跟踪的 .lua
+#   ② 手动 Run workflow → 可指定单个文件
 # 产物会提交到 out/，并同时上传为 Artifact。
 name: 云端混淆
 
@@ -15,15 +15,6 @@ on:
         description: '源码路径（如 src/Main.lua；留空=混淆 src/ 全部）'
         required: false
         default: ''
-      strength:
-        description: '混淆强度'
-        required: true
-        default: 'high'
-        type: choice
-        options:
-          - low
-          - mid
-          - high
 
 # 允许 github-actions[bot] 把 out/ 产物提交回仓库。
 permissions:
@@ -78,19 +69,15 @@ jobs:
 
       - name: 逐个混淆
         shell: pwsh
-        env:
-          REQUESTED_STRENGTH: ${{ inputs.strength }}
         run: |
-          $strength = "$env:REQUESTED_STRENGTH".Trim()
-          if ($strength -eq "") { $strength = "high" }
           $files = @(Get-Content -LiteralPath ".ib2-targets.txt" | Where-Object { $_.Trim() -ne "" })
           if ($files.Count -eq 0) { throw "目标文件列表为空" }
           New-Item -ItemType Directory -Force "out" | Out-Null
           foreach ($f in $files) {
             $base = [System.IO.Path]::GetFileNameWithoutExtension($f)
-            Write-Output "=== 混淆: $f (强度 $strength) ==="
+            Write-Output "=== 混淆: $f ==="
             Remove-Item -LiteralPath "out.lua" -Force -ErrorAction SilentlyContinue
-            dotnet "IronBrew2 CLI\bin\Release\net8.0\IronBrew2 CLI.dll" "$f" --strength $strength
+            dotnet "IronBrew2 CLI\bin\Release\net8.0\IronBrew2 CLI.dll" "$f"
             if ($LASTEXITCODE -ne 0) { throw "混淆器执行失败: $f" }
             if (!(Test-Path -LiteralPath "out.lua" -PathType Leaf)) {
               throw "混淆失败: $f 未生成 out.lua"

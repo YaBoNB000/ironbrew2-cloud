@@ -7,7 +7,7 @@ namespace IronBrew2.Obfuscator.Opcodes
 {
 	public class OpMutated : VOpcode
 	{
-		public static Random rand = new Random();
+		public static Random rand = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 		
 		public VOpcode Mutated;
 		public int[] Registers;

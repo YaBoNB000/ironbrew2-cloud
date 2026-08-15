@@ -1,68 +1,46 @@
 # DEFLATE 字节码压缩实现说明
 
-## 做了什么
+## 当前实现
 
-把字节码压缩算法从 LZ77 升级为 **DEFLATE（RFC 1951，标准 zlib 格式）**。
+字节码正文使用 **DEFLATE（RFC 1951）**，不再使用旧 LZ77/LZW 数据流。
 
 | 端 | 实现 |
 |---|---|
-| C# 混淆器 | `System.IO.Compression.DeflateStream`（.NET 内置，零第三方依赖） |
-| Lua VM 端 | 手写 pure-Lua inflate 解压器（~130 行，支持 fixed/dynamic Huffman + stored block） |
+| C# 混淆器 | `System.IO.Compression.DeflateStream` |
+| Lua VM | pure-Lua inflate，支持 stored、fixed Huffman 和 dynamic Huffman block |
 
-数据流不变：**明文字节码 → DEFLATE 压缩 → 流式 XOR 加密 → base91**（压缩仍在加密前）。
+固定 CLI 配置始终开启压缩。当前数据流为：
 
-## 实测体积（数据段压缩率，同一次混淆 dump 对比）
+```text
+v2 prototype/常量/指令序列化
+→ DEFLATE
+→ seed 驱动的流式 XOR
+→ 9 字节 v2 头（head/salt + integrity tag + version/features）
+→ basE91
+```
 
-| 脚本 | 明文字节码 | DEFLATE 后 | 压缩率 |
-|---|---|---|---|
-| big（80 函数） | 23150 B | 6478 B | **0.28x** |
-| 多组随机/文本/重复用例 | — | — | 全部 round-trip 一致 |
+运行端按相反顺序处理，并在解密、inflate 和反序列化前验证版本、feature 位及 seed-bound integrity tag。版本必须为 2，当前只接受 feature 值 0 或 1，其中 bit 0 表示 DEFLATE。
 
-对比之前的 LZ77（0.45x），DEFLATE 数据段再省 ~38%。最终产物（high 档）实测比 LZ77 小约 2%。
+## 位序注意事项
 
-> 说明：最终产物收益是 2% 量级而非 38%，因为数据段只占总产物的一小部分
-> ——膨胀大头是 VM 的 opcode 解释器 handler 和 EncryptStrings 密文，它们不在
-> 数据段压缩范围内。数据段本身确实省了 38%。
+DEFLATE Huffman code 与 extra bits 的读取方向不同。VM inflate 实现保留独立位读取路径，fixed distance code 使用与 Huffman 表匹配的位序，extra bits 使用 LSB-first。错误处理统一为 `invalid protected payload`，避免继续解析损坏正文。
 
-## 调试中发现的 2 个关键 bug（都已修复并验证）
+## 体积边界
 
-1. **LZ4 offset 顺序**（LZ77 时代遗留，DEFLATE 无关）：已在上一轮修复。
+DEFLATE 对较大的重复字节码通常有效，但最终 Lua 产物还包含 VM、opcode handler、inflate 和 basE91 解码器，因此数据段压缩率不会直接等于最终文件缩减比例。固定配置暂不按输入大小自动关闭压缩；自适应压缩属于 `HARDENING_PLAN.md` 的后续基准工作。
 
-2. **DEFLATE distance code 位序**（本次核心 bug）：
-   DEFLATE 规范里 **Huffman 码是 MSB-first 打包，但 extra bits 是 LSB-first**。
-   我最初的实现里，fixed block 的 5 位 distance code 用了 LSB-first 的 `gb(5)` 读取，
-   导致 distance 解错。之前用随机/文本用例测试没暴露（那些数据恰好是 dynamic block，
-   distance 走 `dec(dtbl)` Huffman 解码），真实字节码触发 fixed block 才暴露。
-   修复：新增 `gbr(n)`（MSB-first 读位），fixed distance code 改用 `gbr(5)`。
+## 验证
 
-   修复后验证：2000+ 组随机数据 + 真实混淆字节码，全部 round-trip 一致。
+`tests/run_linux_tests.sh` 当前验证：
 
-## 功能验证（全部实测通过）
+- 固定压缩配置与原脚本输出一致；
+- 独立随机生成 10 次（可由 `IB2_RANDOM_RUNS` 调整）均一致；
+- signed 32-bit `bit.bxor` 模拟兼容；
+- payload 单字符篡改在 inflate 前确定性拒绝；
+- `luac -p` 语法检查通过。
 
-| 测试 | 结果 |
-|---|---|
-| low 档纯 Lua 运行 | ✅ 输出正确 |
-| high 档纯 Lua（环境绑定） | ✅ 拦截（乱码报错） |
-| high 档模拟执行器环境（bench/strheavy/big 三脚本） | ✅ 输出与原始逐字节一致 |
-| 反 dump loadstring hook（2 词拦截 / 正常放行 / 单词不拦） | ✅ 全部符合预期 |
-| inflate 解压正确性（5 次独立混淆 dump 对比） | ✅ 5/5 一致 |
+当前权威实现位置：
 
-## 改动文件
-
-| 文件 | 改动 |
-|---|---|
-| `IronBrew2/Bytecode Library/Bytecode/Lz77.cs` | **删除**（被 DEFLATE 取代） |
-| `IronBrew2/Bytecode Library/Bytecode/Serializer.cs` | LZ77 → `DeflateStream`（加 `using System.IO.Compression`） |
-| `IronBrew2/Obfuscator/VM Generation/VMStrings.cs` | `lz77d` → 手写 inflate（含 `gbr` MSB-first 读位） |
-
-其余（base91 + 流式 XOR + 环境绑定 + 反 dump + header flag）**完全不变**。
-
-## 与其他语言的关系
-
-- C# `DeflateStream` = Python `zlib` = Java `Deflater`，都是 DEFLATE/RFC 1951，
-  产物可以跨语言交叉验证（实现过程中用 Python zlib 验证了 Lua inflate 的正确性）。
-
-## 要 push 的文件
-
-重新编译的 DLL 在 `IronBrew2 CLI/bin/Release/net8.0/`，源码改动在
-`Serializer.cs`、`VMStrings.cs`（+ 删除 `Lz77.cs`），一起提交即可。
+- `IronBrew2/Bytecode Library/Bytecode/Serializer.cs`
+- `IronBrew2/Obfuscator/VM Generation/VMStrings.cs`
+- `IronBrew2/Obfuscator/VM Generation/Generator.cs`

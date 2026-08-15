@@ -1,4 +1,5 @@
 using System;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace IronBrew2.Obfuscator
@@ -32,9 +33,7 @@ namespace IronBrew2.Obfuscator
 
         public EnvBinder()
         {
-            var r = new Random();
-
-            Salt = (uint)(r.Next(1, int.MaxValue) ^ (r.Next(1, int.MaxValue) << 1));
+            Salt = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(sizeof(uint)), 0);
             if (Salt == 0)
                 Salt = 0x9E3779B9u;
 

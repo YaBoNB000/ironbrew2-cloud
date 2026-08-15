@@ -9,7 +9,7 @@ namespace IronBrew2.Obfuscator.Control_Flow.Types
 {
     public static class EQMutate
     {
-        public static Random      Random      = new Random();
+        public static Random      Random      = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
         public static CFGenerator CFGenerator = new CFGenerator();
 
         public static void DoInstructions(Chunk chunk, List<Instruction> instructions)

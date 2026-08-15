@@ -14,7 +14,7 @@ namespace IronBrew2.Obfuscator.Control_Flow.Types
 			instructions = instructions.ToList();
 			
 			CFGenerator generator = new CFGenerator();
-			Random r = new Random();
+			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 
 			for (int idx = instructions.Count - 1; idx >= 0; idx--)
 			{

@@ -1,26 +1,25 @@
-using System;
 using System.Collections.Generic;
+using System.Security.Cryptography;
 
 namespace IronBrew2.Extensions
 {
 	public static class IEnumerableExtensions
 	{
-		private static Random _rnd = new Random();
-		
+		/// <summary>Fisher-Yates shuffle backed by the operating system CSPRNG.</summary>
 		public static void Shuffle<T>(this IList<T> list)
 		{
-			for(var i=0; i < list.Count; i++)
-				list.Swap(i, _rnd.Next(i, list.Count));
+			for (int i = list.Count - 1; i > 0; i--)
+				list.Swap(i, RandomNumberGenerator.GetInt32(i + 1));
 		}
 
 		public static void Swap<T>(this IList<T> list, int i, int j)
 		{
-			var temp = list[i];
+			T temp = list[i];
 			list[i] = list[j];
 			list[j] = temp;
 		}
 
 		public static T Random<T>(this IList<T> list) =>
-			list[_rnd.Next(0, list.Count)];
+			list[RandomNumberGenerator.GetInt32(list.Count)];
 	}
 }

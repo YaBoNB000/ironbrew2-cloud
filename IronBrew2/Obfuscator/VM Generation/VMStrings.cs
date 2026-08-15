@@ -155,19 +155,28 @@ local function inflate(d)
 	return Concat(res);
 end;
 
--- Read the 4-byte header value (little-endian). With EnvironmentLock it is the
--- salt; otherwise it is the seed itself. The real XOR seed Xs is derived right
--- after this block by the Generator-injected code.
+-- v2 固定头：head/salt 4B | integrity 4B | version+flags 1B。
+-- 每个 prototype 的 K1/K2/K3 位于加密 body，不再泄露在明文头。
 local __ib2Head = Byte(ByteString, 1, 1)
          + Byte(ByteString, 2, 2) * 256
          + Byte(ByteString, 3, 3) * 65536
          + Byte(ByteString, 4, 4) * 16777216;
+local __ib2Tag = Byte(ByteString, 5, 5)
+         + Byte(ByteString, 6, 6) * 256
+         + Byte(ByteString, 7, 7) * 65536
+         + Byte(ByteString, 8, 8) * 16777216;
+local __ib2Flags = Byte(ByteString, 9, 9);
+local __ib2Features = __ib2Flags % 16;
+local __ib2Version = (__ib2Flags - __ib2Features) / 16;
+if __ib2Version ~= 2 or __ib2Features > 1 then error('invalid protected payload', 0); end;
 __IB2_SEED__
--- 指令流加密密钥 K1/K2(16 位),主循环按 InstrPoint 派生密钥逐条解密 opcode
-local K1 = Byte(ByteString, 5, 5) + Byte(ByteString, 6, 6) * 256;
-local K2 = Byte(ByteString, 7, 7) + Byte(ByteString, 8, 8) * 256;
--- 压缩标志(第 9 字节):1 = body 经 DEFLATE 压缩,0 = 明文
-local __ib2Flag = Byte(ByteString, 9, 9);
+
+-- 在解密前验证密文，检测损坏和直接 patch。客户端校验不是不可绕过的信任根。
+local __ib2Hash = (BitXOR(Xs, 2781028135) * 31 + __ib2Flags) % 4294967296;
+for __ib2i = 10, #ByteString do
+	__ib2Hash = (__ib2Hash * 31 + Byte(ByteString, __ib2i, __ib2i)) % 4294967296;
+end;
+if __ib2Hash ~= __ib2Tag then error('invalid protected payload', 0); end;
 
 -- 整体流式 XOR 解密(第 10 字节起) → body
 local __ib2Dec = {};
@@ -178,8 +187,7 @@ for __ib2i = 10, #ByteString do
 	__ib2Dec[__ib2i - 9] = Char(BitXOR(__ib2b, __ib2k));
 end
 ByteString = Concat(__ib2Dec);
--- DEFLATE 解压(若压缩) → 明文字节码
-if __ib2Flag ~= 0 then
+if __ib2Features ~= 0 then
 	ByteString = inflate(ByteString);
 end
 local Pos = 1;
@@ -224,22 +232,56 @@ local function gFloat()
 end;
 
 local gSizet = gBits32;
-local function gString(Len)
-    local Str;
-    if (not Len) then
-        Len = gSizet();
-        if (Len == 0) then
-            return '';
-        end;
-    end;
+local function gString(Len, Idx, K1, K2, K3)
+    if (not Len) then Len = gSizet(); end;
+    if (Len == 0) then return ''; end;
 
-    Str	= Sub(ByteString, Pos, Pos + Len - 1);
+    local Enc = Sub(ByteString, Pos, Pos + Len - 1);
     Pos = Pos + Len;
-    return Str;
+    local State = (K1 + K2 + K3 + Idx * 257) % 65536;
+    local Out = {};
+    for I = 1, Len do
+        Out[I] = Char(BitXOR(Byte(Enc, I, I), State % 256));
+        State = (State * 251 + K3 + Idx) % 65536;
+    end;
+    return Concat(Out);
+end;
+
+local function U32(V)
+    if V < 0 then return V + 4294967296; end;
+    return V;
+end;
+
+local function OpcodeKey(I, K1, K2, K3)
+    local V = (I * K1 + K2) % 65536;
+    return (V * ((I % 251) + 1) + K3) % 65536;
+end;
+
+local function FieldKey(I, Slot, K1, K2, K3)
+    return OpcodeKey(I + Slot * 257, K2, K3, K1);
+end;
+
+local function FieldKey32(I, Slot, K1, K2, K3)
+    return FieldKey(I, Slot, K1, K2, K3)
+        + FieldKey(I, Slot + 4, K1, K2, K3) * 65536;
 end;
 
 local gInt = gBits32;
 local function _R(...) return {...}, Select('#', ...) end
+
+-- 与 C# serializer 相同的 prototype-local Fisher-Yates。
+-- 不同 domain 分离字段 schema 与常量类型 tag。
+local function DerivePermutation(Count, K1, K2, K3, Domain)
+    local Values = {};
+    for I = 1, Count do Values[I] = I - 1; end;
+    local State = (K1 * 251 + K2 * 17 + K3 + Domain) % 65536;
+    for I = Count, 2, -1 do
+        State = (State * 251 + K3 + I * K1 + K2 + Domain) % 65536;
+        local J = (State % I) + 1;
+        Values[I], Values[J] = Values[J], Values[I];
+    end;
+    return Values;
+end;
 
 local function Deserialize()
     local Instrs = {};
@@ -252,20 +294,15 @@ local function Deserialize()
 		nil,
 		Lines
 	};
-	local ConstCount = gBits32()
-    local Consts = {}
-
-	for Idx=1, ConstCount do 
-		local Type =gBits8();
-		local Cons;
-	
-		if(Type==CONST_BOOL) then Cons = (gBits8() ~= 0);
-		elseif(Type==CONST_FLOAT) then Cons = gFloat();
-		elseif(Type==CONST_STRING) then Cons = gString();
-		end;
-		
-		Consts[Idx] = Cons;
-	end;
+    local K1 = gBits16();
+    local K2 = gBits16();
+    local K3 = gBits16();
+    Chunk[5], Chunk[6], Chunk[7] = K1, K2, K3;
+    local ConstTags = DerivePermutation(4, K1, K2, K3, 911);
+    local OpcodeBank = DerivePermutation(__IB2_OPCODE_COUNT__, K1, K2, K3, 1777);
+    Chunk[8] = OpcodeBank;
+    local Consts = {};
+    local InstrCount = 0;
 ";
 		
 		public static string VMP2 = @"
@@ -273,6 +310,10 @@ local function Wrap(Chunk, Upvalues, Env)
 	local Instr  = Chunk[1];
 	local Proto  = Chunk[2];
 	local Params = Chunk[3];
+	local K1 = Chunk[5];
+	local K2 = Chunk[6];
+	local K3 = Chunk[7];
+	local OpcodeBank = Chunk[8];
 
 	return function(...)
 		local Instr  = Instr; 
@@ -306,13 +347,17 @@ local function Wrap(Chunk, Upvalues, Env)
 
 		while true do
 			Inst		= Instr[InstrPoint];
-			Enum		= BitXOR(Inst[OP_ENUM], (InstrPoint * K1 + K2) % 65536);";
+			Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
 
 		public static string VMP2_R = @"
 local function Wrap(Chunk, Upvalues, Env)
 	local Instr  = Chunk[1];
 	local Proto  = Chunk[2];
 	local Params = Chunk[3];
+	local K1 = Chunk[5];
+	local K2 = Chunk[6];
+	local K3 = Chunk[7];
+	local OpcodeBank = Chunk[8];
 
 	return function(...)
 		local Instr  = Instr; 
@@ -346,14 +391,16 @@ local function Wrap(Chunk, Upvalues, Env)
 
 		repeat
 			Inst		= Instr[InstrPoint];
-			Enum		= BitXOR(Inst[OP_ENUM], (InstrPoint * K1 + K2) % 65536);";
+			Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
 
 		public static string VMP3 = @"
 			InstrPoint	= InstrPoint + 1;
 		end;
     end;
 end;	
-return Wrap(Deserialize(), {}, GetFEnv());
+local Root = Deserialize();
+ByteString = nil;
+return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
 		public static string VMP3_R = @"
@@ -361,7 +408,9 @@ end)()(...);
 		until false;
     end;
 end;	
-return Wrap(Deserialize(), {}, GetFEnv());
+local Root = Deserialize();
+ByteString = nil;
+return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
 		public static string VMP2_LI = @"
@@ -370,6 +419,10 @@ local function Wrap(Chunk, Upvalues, Env)
 	local Instr = Chunk[1];
 	local Proto = Chunk[2];
 	local Params = Chunk[3];
+	local K1 = Chunk[5];
+	local K2 = Chunk[6];
+	local K3 = Chunk[7];
+	local OpcodeBank = Chunk[8];
 
 	return function(...)
 		local InstrPoint = 1;
@@ -405,7 +458,7 @@ local function Wrap(Chunk, Upvalues, Env)
 
 			while true do
 				Inst		= Instr[InstrPoint];
-				Enum		= BitXOR(Inst[OP_ENUM], (InstrPoint * K1 + K2) % 65536);";
+				Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
 		
 		public static string VMP2_LI_R = @"
 local PCall = pcall
@@ -413,6 +466,10 @@ local function Wrap(Chunk, Upvalues, Env)
 	local Instr = Chunk[1];
 	local Proto = Chunk[2];
 	local Params = Chunk[3];
+	local K1 = Chunk[5];
+	local K2 = Chunk[6];
+	local K3 = Chunk[7];
+	local OpcodeBank = Chunk[8];
 
 	return function(...)
 		local InstrPoint = 1;
@@ -448,7 +505,7 @@ local function Wrap(Chunk, Upvalues, Env)
 
 			repeat
 				Inst		= Instr[InstrPoint];
-				Enum		= BitXOR(Inst[OP_ENUM], (InstrPoint * K1 + K2) % 65536);";
+				Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
 		
 		public static string VMP3_LI = @"
 				InstrPoint	= InstrPoint + 1;
@@ -457,14 +514,16 @@ local function Wrap(Chunk, Upvalues, Env)
 
 		local A, B = _R(PCall(Loop))
 		if not A[1] then
-			local line = Chunk[7][InstrPoint] or '?'
+			local line = Chunk[4][InstrPoint] or '?'
 			error('ERROR IN IRONBREW SCRIPT [LINE ' .. line .. ']:' .. A[2])
 		else
 			return Unpack(A, 2, B)
 		end;
 	end;
 end;	
-return Wrap(Deserialize(), {}, GetFEnv());
+local Root = Deserialize();
+ByteString = nil;
+return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
 		public static string VMP3_LI_R = @"
@@ -474,14 +533,16 @@ end)()(...);
 
 		local A, B = _R(PCall(Loop))
 		if not A[1] then
-			local line = Chunk[7][InstrPoint] or '?'
+			local line = Chunk[4][InstrPoint] or '?'
 			error('ERROR IN IRONBREW SCRIPT [LINE ' .. line .. ']:' .. A[2])
 		else
 			return Unpack(A, 2, B)
 		end;
 	end;
 end;	
-return Wrap(Deserialize(), {}, GetFEnv());
+local Root = Deserialize();
+ByteString = nil;
+return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
 	}

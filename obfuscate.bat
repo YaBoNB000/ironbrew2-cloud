@@ -6,11 +6,10 @@ cd /d "%~dp0"
 rem ============================================================
 rem  IronBrew2 Drag-and-Drop Obfuscator
 rem  Drop .lua / .txt / .lur files onto this bat to obfuscate.
-rem  Or: obfuscate.bat [low|mid|high] file1 file2 ...
+rem  Or: obfuscate.bat file1 file2 ...
 rem ============================================================
 
 set "CLI=IronBrew2 CLI\bin\Release\net8.0\IronBrew2 CLI.dll"
-set "DEFAULT_STRENGTH=high"
 
 rem Use the bundled Lua 5.1 tools (luac/lua/luasrcdiet) if present
 if exist "%~dp0Lua" set "PATH=%~dp0Lua;%PATH%"
@@ -44,26 +43,19 @@ if "%~1"=="" (
     echo   IronBrew2 Drag-and-Drop Obfuscator
     echo.
     echo   Usage 1: drop .lua / .txt / .lur files onto this bat
-    echo   Usage 2: obfuscate.bat [low^|mid^|high] file1 file2 ...
+    echo   Usage 2: obfuscate.bat file1 file2 ...
     echo.
-    echo   Default strength: %DEFAULT_STRENGTH%
-    echo   Note: low  = runnable in plain Lua
-    echo         mid/high = Roblox executor only
+    echo   A single stable configuration is used for every file.
     echo ============================================================
     echo.
     pause
     exit /b 0
 )
 
-set "ST=%DEFAULT_STRENGTH%"
 set /a N=0
 
 :next
 if "%~1"=="" goto finish
-
-if /i "%~1"=="low"  ( set "ST=low"  & shift & goto next )
-if /i "%~1"=="mid"  ( set "ST=mid"  & shift & goto next )
-if /i "%~1"=="high" ( set "ST=high" & shift & goto next )
 
 set "INP=%~1"
 set "EXT=%~x1"
@@ -86,12 +78,11 @@ set /a N+=1
 echo.
 echo ============================================================
 echo  [!N!] Obfuscating: !INP!
-echo        Strength: !ST!
 echo ============================================================
 
 if exist "out.lua" del /q "out.lua" >nul 2>&1
 
-dotnet "%CLI%" "!INP!" --strength !ST!
+dotnet "%CLI%" "!INP!"
 
 if errorlevel 1 (
     echo [FAILED] !INP! - obfuscator returned an error

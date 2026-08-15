@@ -189,7 +189,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 
 		public List<OpMutated> GenerateMutations(List<VOpcode> opcodes)
 		{
-			Random r = new Random();
+			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 			List<OpMutated> mutated = new List<OpMutated>();
 
 			foreach (VOpcode opc in opcodes)
@@ -259,7 +259,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 		public List<OpSuperOperator> GenerateSuperOperators(Chunk chunk, int maxSize, int minSize = 5)
 		{
 			List<OpSuperOperator> results = new List<OpSuperOperator>();
-			Random                r       = new Random();
+			Random                r       = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 
 			bool[] skip = new bool[chunk.Instructions.Count + 1];
 
@@ -440,9 +440,155 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				FoldAdditionalSuperOperators(_c, operators, ref folded);
 		}
 		
+		private static bool TrySkipLuaLongBracket(string code, int start, out int end)
+		{
+			end = start;
+			if (start >= code.Length || code[start] != '[')
+				return false;
+
+			int cursor = start + 1;
+			while (cursor < code.Length && code[cursor] == '=')
+				cursor++;
+			if (cursor >= code.Length || code[cursor] != '[')
+				return false;
+
+			string closing = "]" + new string('=', cursor - start - 1) + "]";
+			int closingStart = code.IndexOf(closing, cursor + 1, StringComparison.Ordinal);
+			end = closingStart < 0 ? code.Length - 1 : closingStart + closing.Length - 1;
+			return true;
+		}
+
+		/// <summary>
+		/// Splits a Lua handler only at top-level semicolons. Unlike the old noise
+		/// path's string.Split, this scanner preserves quoted/long strings, comments,
+		/// table/index expressions and nested function/if/loop blocks. It is
+		/// intentionally a small lexer rather than a regex-based source rewrite.
+		/// </summary>
+		private static List<string> SplitTopLevelLuaStatements(string code)
+		{
+			var statements = new List<string>();
+			int start = 0;
+			int parens = 0, braces = 0, brackets = 0;
+			int blocks = 0, pendingLoopDo = 0;
+
+			for (int i = 0; i < code.Length; i++)
+			{
+				char current = code[i];
+
+				if (current == '\'' || current == '"')
+				{
+					char quote = current;
+					for (i++; i < code.Length; i++)
+					{
+						if (code[i] == '\\')
+						{
+							i++;
+							continue;
+						}
+						if (code[i] == quote)
+							break;
+					}
+					continue;
+				}
+
+				if (current == '-' && i + 1 < code.Length && code[i + 1] == '-')
+				{
+					if (TrySkipLuaLongBracket(code, i + 2, out int commentEnd))
+					{
+						i = commentEnd;
+						continue;
+					}
+
+					int newline = code.IndexOf('\n', i + 2);
+					if (newline < 0)
+						break;
+					i = newline;
+					continue;
+				}
+
+				if (current == '[' && TrySkipLuaLongBracket(code, i, out int longStringEnd))
+				{
+					i = longStringEnd;
+					continue;
+				}
+
+				if (char.IsLetter(current) || current == '_')
+				{
+					int end = i + 1;
+					while (end < code.Length && (char.IsLetterOrDigit(code[end]) || code[end] == '_'))
+						end++;
+					string token = code.Substring(i, end - i);
+
+					switch (token)
+					{
+						case "function":
+						case "if":
+						case "repeat":
+							blocks++;
+							break;
+						case "for":
+						case "while":
+							blocks++;
+							pendingLoopDo++;
+							break;
+						case "do":
+							if (pendingLoopDo > 0)
+								pendingLoopDo--;
+							else
+								blocks++;
+							break;
+						case "end":
+							if (blocks > 0)
+								blocks--;
+							break;
+						case "until":
+							if (blocks > 0)
+								blocks--;
+							break;
+					}
+
+					i = end - 1;
+					continue;
+				}
+
+				switch (current)
+				{
+					case '(': parens++; break;
+					case ')': if (parens > 0) parens--; break;
+					case '{': braces++; break;
+					case '}': if (braces > 0) braces--; break;
+					case '[': brackets++; break;
+					case ']': if (brackets > 0) brackets--; break;
+					case ';' when parens == 0 && braces == 0 && brackets == 0 && blocks == 0:
+					{
+						string statement = code.Substring(start, i - start).Trim();
+						if (statement.Length > 0)
+							statements.Add(statement);
+						start = i + 1;
+						break;
+					}
+				}
+			}
+
+			string tail = code.Substring(start).Trim();
+			if (tail.Length > 0)
+				statements.Add(tail);
+			return statements;
+		}
+
+		private static string JoinLuaStatements(IEnumerable<string> statements) =>
+			string.Join("", statements.Select(statement => statement.Trim().TrimEnd(';') + ";"));
+
+		private static bool StartsWithLuaKeyword(string statement, string keyword)
+		{
+			string value = statement.TrimStart();
+			return value.StartsWith(keyword, StringComparison.Ordinal) &&
+			       (value.Length == keyword.Length || !(char.IsLetterOrDigit(value[keyword.Length]) || value[keyword.Length] == '_'));
+		}
+
 		public string GenerateVM(ObfuscationSettings settings)
 		{
-			Random r = new Random();
+			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 
 			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
 			                                 .Where(t => t.IsSubclassOf(typeof(VOpcode)))
@@ -496,6 +642,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			for (int i = 0; i < virtuals.Count; i++)
 				virtuals[i].VIndex = i;
 
+			_context.VirtualOpcodeCount = virtuals.Count;
+
 			string vm = "";
 
 			// ==== P1: 模板标识符随机化(每次混淆生成不同的 VM 结构名)====
@@ -505,7 +653,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"BitXOR","gBits32","gBits8","gBits16","gFloat","gSizet","gString","gInt","Byte","Char","Sub",
 				"gBit","Instrs","Functions","Lines","Consts","Instr","Proto","Params","Top","Vararg","Args",
 				"PCount","Lupvals","Stk","Inst","Enum","Chunk","decompress","Pos","Xs","Xd","_R","Env",
-				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2"
+				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2","K3","OpcodeKey","FieldKey","FieldKey32","U32",
+				"DerivePermutation","Count","Domain","Values","State","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank",
+				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root"
 			};
 			string[] luaKws = {"and","break","do","else","elseif","end","false","for","function","if","in","local","nil","not","or","repeat","return","then","true","until","while"};
 			var idents = new Dictionary<string,string>();
@@ -557,6 +707,47 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				code = code.Replace("OP_B", ScrambleNumber(3));
 				code = code.Replace("OP_C", ScrambleNumber(4));
 				return code;
+			}
+
+			// Handler 结构多态：先用词法 statement splitter 找到安全边界，再从
+			// 原始块、do scope、恒真 guard 和 prefix/suffix 嵌套四种等价模板中选择。
+			// prefix 位于外层，因此其 local 对 suffix 仍可见；不会反向移动语句。
+			string ApplyHandlerTemplate(string code)
+			{
+				List<string> statements = SplitTopLevelLuaStatements(code);
+				if (statements.Count == 0)
+					return code;
+
+				string joined = JoinLuaStatements(statements);
+				int variant = r.Next(4);
+				if (variant == 0)
+					return joined;
+				if (variant == 1)
+					return "do " + joined + " end;";
+				if (variant == 2)
+					return "if Enum==Enum then " + joined + " end;";
+
+				if (statements.Count > 1)
+				{
+					var splitCandidates = new List<int>();
+					for (int split = 1; split < statements.Count; split++)
+					{
+						bool terminalInPrefix = statements.Take(split).Any(statement =>
+							StartsWithLuaKeyword(statement, "return") || StartsWithLuaKeyword(statement, "break"));
+						if (!terminalInPrefix)
+							splitCandidates.Add(split);
+					}
+
+					if (splitCandidates.Count > 0)
+					{
+						int split = splitCandidates[r.Next(splitCandidates.Count)];
+						string prefix = JoinLuaStatements(statements.Take(split));
+						string suffix = JoinLuaStatements(statements.Skip(split));
+						return "do " + prefix + " do " + suffix + " end;end;";
+					}
+				}
+
+				return "do " + joined + " end;";
 			}
 
 			// ==== ① handler 内部平坦化:直线代码 → 状态机驱动 ====
@@ -654,67 +845,101 @@ local ToNumber = tonumber;");
 			ComputeConstants(_context.HeadChunk);
 
 			vm += T(VMStrings.VMP1
-				.Replace("CONST_BOOL", _context.ConstantMapping[1].ToString())
-				.Replace("CONST_FLOAT", _context.ConstantMapping[2].ToString())
-				.Replace("CONST_STRING", _context.ConstantMapping[3].ToString())
 				// 环境绑定：注入种子派生代码（读盐 → 跑探针 → Hash 派生 Xs）
 				.Replace("__IB2_SEED__", settings.EnvironmentLock ? _context.Binder.SeedDeriveLua : EnvBinder.PlainSeedLua)
-				.Replace("__IB2_WATERMARK__", EscapeLuaString(settings.Watermark)));
+				.Replace("__IB2_WATERMARK__", EscapeLuaString(settings.Watermark))
+				.Replace("__IB2_OPCODE_COUNT__", virtuals.Count.ToString()));
 			
-			for (int i = 0; i < (int) ChunkStep.StepCount; i++)
-			{
-				switch (_context.ChunkSteps[i])
-				{
-					case ChunkStep.ParameterCount:
-						vm += T("Chunk[3] = gBits8();");
-						break;
-					case ChunkStep.Instructions:
-						vm += T(
-							$@"for Idx=1,gBits32() do 
-									local Descriptor = gBits8();
-									if (gBit(Descriptor, 1, 1) == 0) then
-										local Type = gBit(Descriptor, 2, 3);
-										local Mask = gBit(Descriptor, 4, 6);
-										
-										local Inst=
-										{{
-											gBits16(),
-											gBits16(),
-											nil,
-											nil
-										}};
-	
-										if (Type == 0) then 
-											Inst[OP_B] = gBits16(); 
-											Inst[OP_C] = gBits16();
-										elseif(Type==1) then 
-											Inst[OP_B] = gBits32();
-										elseif(Type==2) then 
-											Inst[OP_B] = gBits32() - (2 ^ 16)
-										elseif(Type==3) then 
-											Inst[OP_B] = gBits32() - (2 ^ 16)
-											Inst[OP_C] = gBits16();
-										end;
-	
-										if (gBit(Mask, 1, 1) == 1) then Inst[OP_A] = Consts[Inst[OP_A]] end
-										if (gBit(Mask, 2, 2) == 1) then Inst[OP_B] = Consts[Inst[OP_B]] end
-										if (gBit(Mask, 3, 3) == 1) then Inst[OP_C] = Consts[Inst[OP_C]] end
-										
-										Instrs[Idx] = Inst;
-									end
-								end;");
-						break;
-					case ChunkStep.Functions:
-						vm += T("for Idx=1,gBits32() do Functions[Idx-1]=Deserialize();end;");
-						break;
-					case ChunkStep.LineInfo:
-						if (settings.PreserveLineInfo)
-							vm += T("for Idx=1,gBits32() do Lines[Idx]=gBits32();end;");
-						break;
-				}
-			}
+			// 每个 prototype 根据自身 K1/K2/K3 派生独立字段顺序。
+			// 常量可能排在指令之后，因此先保存 constant mask，字段全部恢复后再解析引用。
+			vm += T(@"local Schema = DerivePermutation(5, K1, K2, K3, 113);
+for StepIndex = 1, 5 do
+    local Step = Schema[StepIndex];
+    if (Step == 0) then
+        Chunk[3] = gBits8();
+    elseif (Step == 1) then
+        for Idx = 1, gBits32() do
+            local Type = gBits8();
+            local Cons;
+            if (Type == ConstTags[1]) then Cons = nil;
+            elseif (Type == ConstTags[2]) then Cons = (gBits8() ~= 0);
+            elseif (Type == ConstTags[3]) then Cons = gFloat();
+            elseif (Type == ConstTags[4]) then Cons = gString(nil, Idx, K1, K2, K3);
+            end;
+            Consts[Idx] = Cons;
+        end;
+    elseif (Step == 2) then
+        InstrCount = gBits32();
+        for Idx = 1, InstrCount do
+            local Descriptor = gBits8();
+            if (gBit(Descriptor, 1, 1) == 0) then
+                local Type = gBit(Descriptor, 2, 3);
+                local Mask = gBit(Descriptor, 4, 6);
+                local Inst =
+                {
+                    gBits16(),
+                    BitXOR(gBits16(), FieldKey(Idx, 1, K1, K2, K3)),
+                    nil,
+                    nil,
+                    Mask
+                };
+
+                if (Type == 0) then
+                    Inst[OP_B] = BitXOR(gBits16(), FieldKey(Idx, 2, K1, K2, K3));
+                    Inst[OP_C] = BitXOR(gBits16(), FieldKey(Idx, 3, K1, K2, K3));
+                elseif (Type == 1) then
+                    Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Idx, 2, K1, K2, K3)));
+                elseif (Type == 2) then
+                    Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Idx, 2, K1, K2, K3))) - (2 ^ 16);
+                elseif (Type == 3) then
+                    Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Idx, 2, K1, K2, K3))) - (2 ^ 16);
+                    Inst[OP_C] = BitXOR(gBits16(), FieldKey(Idx, 3, K1, K2, K3));
+                end;
+                Instrs[Idx] = Inst;
+            end;
+        end;
+    elseif (Step == 3) then
+        for Idx = 1, gBits32() do
+            local Length = gBits32();
+            Functions[Idx - 1] = Sub(ByteString, Pos, Pos + Length - 1);
+            Pos = Pos + Length;
+        end;");
+
+			if (settings.PreserveLineInfo)
+				vm += T(@"    elseif (Step == 4) then
+        for Idx = 1, gBits32() do Lines[Idx] = gBits32(); end;");
+
+			vm += T(@"    end;
+end;
+
+for Idx = 1, InstrCount do
+    local Inst = Instrs[Idx];
+    if Inst then
+        local Mask = Inst[5];
+        if (gBit(Mask, 1, 1) == 1) then Inst[OP_A] = Consts[Inst[OP_A]]; end;
+        if (gBit(Mask, 2, 2) == 1) then Inst[OP_B] = Consts[Inst[OP_B]]; end;
+        if (gBit(Mask, 3, 3) == 1) then Inst[OP_C] = Consts[Inst[OP_C]]; end;
+        Inst[5] = nil;
+    end;
+end;
+-- Drop the prototype-local decode cache; only operands that reference constants survive.
+Consts = nil;");
 
 			vm += T("return Chunk;end;");
+
+			vm += T(@"
+local function GetProto(Proto, Index)
+    local Encoded = Proto[Index];
+    if type(Encoded) == 'string' then
+        local SavedByteString, SavedPos = ByteString, Pos;
+        ByteString, Pos = Encoded, 1;
+        local Decoded = Deserialize();
+        ByteString, Pos = SavedByteString, SavedPos;
+        Proto[Index] = Decoded;
+        return Decoded;
+    end;
+    return Encoded;
+end;");
 
 			vm += T(settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2));
 
@@ -746,6 +971,16 @@ local ToNumber = tonumber;");
 			}
 			
 			ComputeInstrs(_context.HeadChunk);
+
+			string BuildHandler(int opcodeIndex)
+			{
+				string code = ApplyHandlerTemplate(virtuals[opcodeIndex].GetObfuscated(_context));
+				code = T(code);
+				code = ScrambleOps(code);
+				if (settings.Noise)
+					code = FlattenCode(code);
+				return code;
+			}
 			
 			string GetStr(List<int> opcodes)
 			{
@@ -753,45 +988,43 @@ local ToNumber = tonumber;");
 				
 				if (opcodes.Count == 1)
 				{
-					string code = T(virtuals[opcodes[0]].GetObfuscated(_context));
-					code = ScrambleOps(code);
-					if (settings.Noise)
-						code = FlattenCode(code);
-					str += code;
+					str += BuildHandler(opcodes[0]);
 					if (settings.Noise)
 						str += AntiDumpGenerator.GenerateHandlerNoise();
 				}
 
 				else if (opcodes.Count == 2) 
 				{
-					string h0 = T(virtuals[opcodes[0]].GetObfuscated(_context));
-					string h1 = T(virtuals[opcodes[1]].GetObfuscated(_context));
-					h0 = ScrambleOps(h0);
-					h1 = ScrambleOps(h1);
+					// A leaf deliberately owns two canonical handlers. This is dispatch
+					// structure polymorphism only: it does not fuse bytecode instructions
+					// and therefore is not a Phase 3 superoperator.
+					string h0 = BuildHandler(opcodes[0]);
+					string h1 = BuildHandler(opcodes[1]);
 					if (settings.Noise)
 					{
-						h0 = FlattenCode(h0);
-						h1 = FlattenCode(h1);
+						h0 += AntiDumpGenerator.GenerateHandlerNoise();
+						h1 += AntiDumpGenerator.GenerateHandlerNoise();
 					}
-					if (r.Next(2) == 0)
+
+					string enumName = T("Enum");
+					string v0 = ScrambleNumber(virtuals[opcodes[0]].VIndex);
+					string v1 = ScrambleNumber(virtuals[opcodes[1]].VIndex);
+					switch (r.Next(4))
 					{
-						str += T("if Enum > ") + ScrambleNumber(virtuals[opcodes[0]].VIndex) + " then " + h1;
-						if (settings.Noise)
-							str += AntiDumpGenerator.GenerateHandlerNoise();
-						str += "else " + h0;
-						if (settings.Noise)
-							str += AntiDumpGenerator.GenerateHandlerNoise();
-						str += "end;";
-					}
-					else
-					{
-						str += T("if Enum == ") + ScrambleNumber(virtuals[opcodes[0]].VIndex) + " then " + h0;
-						if (settings.Noise)
-							str += AntiDumpGenerator.GenerateHandlerNoise();
-						str += "else " + h1;
-						if (settings.Noise)
-							str += AntiDumpGenerator.GenerateHandlerNoise();
-						str += "end;";
+						case 0:
+							str += "if " + enumName + " > " + v0 + " then " + h1 + "else " + h0 + "end;";
+							break;
+						case 1:
+							str += "if " + enumName + " == " + v0 + " then " + h0 + "else " + h1 + "end;";
+							break;
+						case 2:
+							str += "if " + enumName + " ~= " + v0 + " then " + h1 + "else " + h0 + "end;";
+							break;
+						default:
+							// Must start with "if": recursive parents concatenate "else" +
+							// the right child into a valid Lua "elseif" chain.
+							str += "if " + enumName + " == " + enumName + " then if " + enumName + " == " + v1 + " then " + h1 + "else " + h0 + "end;end;";
+							break;
 					}
 				}
 				else

@@ -1,73 +1,43 @@
-# 反 dump 代码 VM 化 + 体积优化 — 完成总结
+# 反 dump 与体积优化说明
 
-## 需求回顾
+> 本文件原先记录旧版多档位实现，现已按单一固定配置同步。完整的当前实现与验证结果请以 [`HARDENING_REPORT.md`](HARDENING_REPORT.md) 为准。
 
-1. 反 dump 代码**必须在 VM 里**（不能是明文源码）—— 已还原为「编译成字节码 → 合并进主 chunk → 整体 XOR 加密进 blob」
-2. **最大化压缩** —— 两处优化
-3. **保证功能** —— 全部实测通过
+## 当前固定配置
 
-## 改了什么（3 处）
+所有 CLI、Windows 拖放脚本和 GitHub Actions 调用都使用同一配置：
 
-### ① 还原为 VM 内执行（Program.cs）
-撤销了上一版「源码前置」的做法，恢复原来的「defense + guard 编译成字节码 → 合并进主 chunk → 由 VM 解释执行」。
-产物中反 dump 代码以**加密 blob 形式**存在，无任何明文源码（已 grep 验证）。
+- ControlFlow：开启
+- 字节码 DEFLATE：开启
+- v2 payload、prototype-local 字段 schema / 常量 tag / opcode bank、字段编码和完整性检查：开启
+- 子 prototype 按 `OP_CLOSURE` 首次访问延迟恢复：开启
+- handler 安全分段/等价模板与双 handler dispatch leaf 结构多态：开启
+- AntiDump、EnvironmentLock、AggressiveDefense、Noise：关闭
+- Mutation、SuperOperator、源码字符串转换：关闭
 
-### ② 防御块字符串改为明文源码字面量（DefenseGenerator.cs）
-原来每个 API 名都写成 `string.char(103,101,116,...)`，**每个字符 = 一个数字常量**，
-导致 7KB 源码编译成 17KB 字节码（还触发大量 >255 常量的 opcode 变体，拖入额外 handler）。
+此选择以 Lua 5.1 语义正确性和兼容性为优先。AntiDump 与环境探针代码仍保留为库级实验能力，但不属于固定 CLI 行为。
 
-关键认知：防御块编译成字节码后，字符串常量会被 Serializer 的**流式 XOR 整体加密**进 blob，
-产物中本来就是密文。所以源码侧用明文 `"getscriptbytecode"` 完全安全。
+## 已保留的体积优化
 
-→ defense 字节码 17KB → 11.4KB，且不再触发大量额外 opcode 变体。
+1. 字节码正文在加密前使用 DEFLATE，生成结果再以 basE91 表示。
+2. 加密后的高熵数据不再重复套用收益为负的 LZW。
+3. VM 模板只包含实际需要的 opcode handler。
+4. 字符串常量由 serializer 的外层 payload 加密和 prototype/常量索引相关内层编码保护，不启用容易放大体积且影响闭包语义的源码级解密函数。
+5. 父 prototype 只保留子 prototype 的长度分帧 opaque slice；子指令和常量在 closure 首次创建时恢复，root 解密 body 随后释放。
+6. handler 通过词法扫描器在顶层 statement 边界安全分段，随机使用 raw、`do`、恒真 guard 和 prefix/suffix 嵌套模板；双 handler dispatch leaf 也使用多种等价选择结构，但不融合指令或冒充 superoperator。
 
-### ③ 数据段编码 LZW+base92 → base91（Generator.cs）
-字节码经流式 XOR 加密后是高熵数据，LZW 压缩率为负（越压越大），再 base92 又 +30%。
-换成 **base91 字节流编码**（标准 basE91 算法），膨胀率 1.23x，且 VM 端解码器更小（去掉 LZW 解压器）。
+## 当前安全边界
 
-Python 端 2000 组随机数据 round-trip 全过，实机混淆后运行结果与原始脚本完全一致。
+- v2 完整性检查可以确定性拒绝正文损坏和简单篡改，但校验算法随客户端交付，不是服务端信任根。
+- AntiDump 或环境 fingerprint 都不能让离线客户端机制变成“不可逆”。
+- 后续体积优化应通过语义差分、性能和产物大小基准评估，而不是增加无意义编码层或默认启用高误判 API hook。
 
-## 效果
+## 验证
 
-| 脚本 | 优化前 | 优化后 | 缩减 |
-|---|---|---|---|
-| 小脚本(118B) high | 130 KB | **59.2 KB** | **-54%** |
-| 大脚本(10KB) high | 562 KB 级别 | **555 KB** | 反dump开销 119KB→17.5KB |
+Linux 自动测试入口：
 
-**反 dump 固定开销**（核心指标）：
-- 小脚本：119KB → **48KB**（defense 用了小脚本没有的 ~90 个 opcode，需额外 handler）
-- 大脚本：119KB → **17.5KB**（大脚本已覆盖所有 opcode，defense 几乎不增加 handler）
+```bash
+DOTNET=/path/to/dotnet LUA=/path/to/lua5.1 LUAC=/path/to/luac5.1 \
+  tests/run_linux_tests.sh
+```
 
-> 大脚本总膨胀率高的主因是 **EncryptStrings**：每个字符串都变成独立的解密函数 + 密文 blob，
-> 60 个函数 × 若干字符串 = 数百个额外子函数。这是「字符串加密强度」与「体积」的权衡，与反 dump 无关。
-
-## 功能验证（全部实测）
-
-| 测试 | 结果 |
-|---|---|
-| high 纯 Lua 运行 | ✅ 环境绑定先拦截（种子错 → 字节码乱码） |
-| high 模拟执行器+Roblox | ✅ 输出与原始脚本完全一致 |
-| loadstring hook 拦截（2 个 dump 词） | ✅ 返回 nil（拦截） |
-| loadstring 正常脚本 | ✅ 放行 |
-| low 纯 Lua | ✅ 正常运行 |
-| 大脚本(60函数) round-trip | ✅ 输出 `done 37820 610` 与原始一致 |
-| 产物无明文反dump代码 | ✅ grep 验证 0 命中 |
-
-## 改动文件
-
-| 文件 | 改动 |
-|---|---|
-| `IronBrew2/Program.cs` | 还原为 VM 内合并执行（保留 EnvironmentLock 构造函数调用） |
-| `IronBrew2/Obfuscator/AntiDump/DefenseGenerator.cs` | 字符串 string.char → 明文源码字面量 |
-| `IronBrew2/Obfuscator/VM Generation/Generator.cs` | 新增 base91 编码器 + 替换 LZW 调用点 + 替换 VM 模板解压器 |
-
-## 可选的进一步压缩（未做，需权衡安全性）
-
-1. **关 Noise**（`settings.Noise=false`）：还能再省 ~18KB（59→41KB），但失去 handler 混淆噪声。
-2. **降低 EncryptStrings 强度**：大脚本体积的主要来源，可加 `--no-encrypt-strings` 开关。
-3. **handler 去重**：mutation/super-operator 产生大量语义重复的 handler，可合并。
-
-## 注意
-
-- 重新编译的 DLL 已更新到 `IronBrew2 CLI/bin/Release/net8.0/`，提交时需一并 push（GitHub Actions 直接运行仓库里的 DLL 不重编）。
-- 产物在纯 Lua 里报错是正常的（环境绑定 + 反 dump），必须在 Roblox 执行器里测试。
+当前测试覆盖固定配置语义差分、20 次 handler/dispatch/schema/tag/opcode 随机生成、closure/upvalue、vararg、多返回值、line info、有符号 32 位 bit、payload 篡改和明文字符串扫描。

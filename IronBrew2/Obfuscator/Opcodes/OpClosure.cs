@@ -14,7 +14,7 @@ namespace IronBrew2.Obfuscator.Opcodes
 			context.InstructionMapping.TryGetValue(Opcode.Move, out var i1);
 
 			return
-				"local NewProto=Proto[Inst[OP_B]];local NewUvals;local Indexes={};NewUvals=Setmetatable({},{__index=function(_,Key)local Val=Indexes[Key];return Val[1][Val[2]];end,__newindex=function(_,Key,Value)local Val=Indexes[Key] Val[1][Val[2]]=Value;end;});for Idx=1,Inst[OP_C] do InstrPoint=InstrPoint+1;local Mvm=Instr[InstrPoint];if BitXOR(Mvm[OP_ENUM],(InstrPoint*K1+K2)%65536)==OP_MOVE then Indexes[Idx-1]={Stk,Mvm[OP_B]};else Indexes[Idx-1]={Upvalues,Mvm[OP_B]};end;Lupvals[#Lupvals+1]=Indexes;end;Stk[Inst[OP_A]]=Wrap(NewProto,NewUvals,Env);"
+				"local NewProto=GetProto(Proto,Inst[OP_B]);local NewUvals;local Indexes={};NewUvals=Setmetatable({},{__index=function(_,Key)local Val=Indexes[Key];return Val[1][Val[2]];end,__newindex=function(_,Key,Value)local Val=Indexes[Key] Val[1][Val[2]]=Value;end;});for Idx=1,Inst[OP_C] do InstrPoint=InstrPoint+1;local Mvm=Instr[InstrPoint];if OpcodeBank[BitXOR(Mvm[OP_ENUM],OpcodeKey(InstrPoint,K1,K2,K3))+1]==OP_MOVE then Indexes[Idx-1]={Stk,Mvm[OP_B]};else Indexes[Idx-1]={Upvalues,Mvm[OP_B]};end;Lupvals[#Lupvals+1]=Indexes;end;Stk[Inst[OP_A]]=Wrap(NewProto,NewUvals,Env);"
 				.Replace("OP_MOVE", i1?.VIndex.ToString() ?? "-1");
 		}
 
@@ -31,6 +31,6 @@ namespace IronBrew2.Obfuscator.Opcodes
 			instruction.OpCode == Opcode.Closure && instruction.Chunk.Functions[instruction.B].UpvalueCount == 0;
 
 		public override string GetObfuscated(ObfuscationContext context) =>
-			"Stk[Inst[OP_A]]=Wrap(Proto[Inst[OP_B]],nil,Env);";
+			"Stk[Inst[OP_A]]=Wrap(GetProto(Proto,Inst[OP_B]),nil,Env);";
 	}
 }

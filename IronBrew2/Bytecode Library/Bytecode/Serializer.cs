@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using IronBrew2.Bytecode_Library.IR;
 using IronBrew2.Obfuscator;
@@ -11,11 +12,12 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 {
 	public class Serializer
 	{
-		private ObfuscationContext _context;
-		private ObfuscationSettings _settings;
-		private Random _r = new Random();
-		private int _k1 = 1, _k2 = 1;
-		private Encoding _fuckingLua = Encoding.GetEncoding(28591);
+		private const byte FormatVersion = 2;
+		private const uint IntegrityDomain = 0xA5C31F27u;
+
+		private readonly ObfuscationContext _context;
+		private readonly ObfuscationSettings _settings;
+		private readonly Encoding _luaEncoding = Encoding.GetEncoding(28591);
 
 		public Serializer(ObfuscationContext context, ObfuscationSettings settings)
 		{
@@ -24,193 +26,261 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		}
 
 		/// <summary>
-		/// 顶层序列化:明文 body → LZ77 压缩(加密前) → 流式 XOR 加密 → 拼 8 字节明文头(盐 + K1/K2)。
-		/// VM 端:base91 解码 → 读盐派生种子 → 读 K1/K2 → 整体 XOR 解密 → LZ77 解压 → 解析。
+		/// v2 顶层格式（固定 9 字节头）：
+		///   head/salt 4B | integrity tag 4B | version+flags 1B | encrypted body
+		/// K1/K2/K3 不再出现在明文头，而是每个 prototype 独立生成并放入加密正文。
 		/// </summary>
 		public byte[] SerializeLChunk(Chunk chunk)
 		{
-			// 指令流 opcode 加密密钥(VM 端主循环按 InstrPoint 逐条解密)
-			_k1 = _r.Next(1, 65536);
-			_k2 = _r.Next(1, 65536);
-
-			// 1. 明文序列化 body(opcode 用 K1/K2 逐条加密,其余明文)
 			byte[] plain = SerializeBody(chunk);
-
-			// 2. 压缩(DEFLATE/RFC1951) —— 必须在加密前,加密后高熵无法压缩
 			byte[] payload = _settings.BytecodeCompress ? Deflate(plain) : plain;
 
-			// 3. 流式 XOR 加密
 			uint state = _context.XorSeed;
-			byte[] enc = new byte[payload.Length];
+			byte[] encrypted = new byte[payload.Length];
 			for (int i = 0; i < payload.Length; i++)
 			{
-				enc[i] = (byte)(payload[i] ^ (byte)(state >> 24));
-				state = state * 1664525u + 1013904223u;
+				encrypted[i] = (byte)(payload[i] ^ (byte)(state >> 24));
+				state = unchecked(state * 1664525u + 1013904223u);
 			}
 
-			// 4. 拼头(盐 4B + K1 2B + K2 2B + 压缩标志 1B,明文)+ 加密 body
-			var outList = new List<byte>(enc.Length + 9);
 			uint head = _settings.EnvironmentLock ? _context.Binder.Salt : _context.XorSeed;
-			outList.Add((byte)head);
-			outList.Add((byte)(head >> 8));
-			outList.Add((byte)(head >> 16));
-			outList.Add((byte)(head >> 24));
-			outList.Add((byte)_k1);
-			outList.Add((byte)(_k1 >> 8));
-			outList.Add((byte)_k2);
-			outList.Add((byte)(_k2 >> 8));
-			// 压缩标志:1 = body 经 LZ77 压缩(VM 端需先解压),0 = 明文 body
-			outList.Add((byte)(_settings.BytecodeCompress ? 1 : 0));
-			outList.AddRange(enc);
-			return outList.ToArray();
+			byte flags = (byte)((FormatVersion << 4) | (_settings.BytecodeCompress ? 1 : 0));
+			// Bind both the format/feature byte and encrypted body. This is tamper/corruption
+			// detection, not a client-side cryptographic trust root.
+			uint integrity = ComputeIntegrity(encrypted, _context.XorSeed, flags);
+
+			var output = new List<byte>(encrypted.Length + 9);
+			WriteUInt32(output, head);
+			WriteUInt32(output, integrity);
+			output.Add(flags);
+			output.AddRange(encrypted);
+			return output.ToArray();
 		}
 
-		/// <summary>raw DEFLATE 压缩(RFC 1951,与 .NET DeflateStream / Python zlib / Java Deflater 兼容)。</summary>
+		private static uint ComputeIntegrity(byte[] encrypted, uint seed, byte flags)
+		{
+			uint hash = unchecked((seed ^ IntegrityDomain) * 31u + flags);
+			foreach (byte value in encrypted)
+				hash = unchecked(hash * 31u + value);
+			return hash;
+		}
+
+		private static ushort NextKey16() =>
+			(ushort)RandomNumberGenerator.GetInt32(1, 65536);
+
+		private static ushort OpcodeMask(int pc, ushort k1, ushort k2, ushort k3)
+		{
+			long linear = ((long)pc * k1 + k2) % 65536L;
+			return (ushort)((linear * ((pc % 251) + 1L) + k3) % 65536L);
+		}
+
+		private static ushort OperandMask16(int pc, ushort k1, ushort k2, ushort k3, int slot) =>
+			OpcodeMask(pc + slot * 257, k2, k3, k1);
+
+		private static uint OperandMask32(int pc, ushort k1, ushort k2, ushort k3, int slot) =>
+			(uint)(OperandMask16(pc, k1, k2, k3, slot) |
+			       (OperandMask16(pc, k1, k2, k3, slot + 4) << 16));
+
+		/// <summary>
+		/// Derives a prototype-local permutation from that prototype's independent keys.
+		/// Domains keep schema order and constant tags from sharing the same permutation.
+		/// The Lua deserializer implements the exact same Fisher-Yates schedule.
+		/// </summary>
+		private static int[] DerivePermutation(int count, ushort k1, ushort k2, ushort k3, uint domain)
+		{
+			int[] values = Enumerable.Range(0, count).ToArray();
+			uint state = ((uint)k1 * 251u + (uint)k2 * 17u + k3 + domain) & 0xFFFFu;
+			for (int i = count; i >= 2; i--)
+			{
+				state = (state * 251u + k3 + (uint)i * k1 + k2 + domain) & 0xFFFFu;
+				int j = (int)(state % (uint)i);
+				(values[i - 1], values[j]) = (values[j], values[i - 1]);
+			}
+			return values;
+		}
+
+		private static void WriteUInt16(List<byte> output, ushort value)
+		{
+			output.Add((byte)value);
+			output.Add((byte)(value >> 8));
+		}
+
+		private static void WriteUInt32(List<byte> output, uint value)
+		{
+			output.Add((byte)value);
+			output.Add((byte)(value >> 8));
+			output.Add((byte)(value >> 16));
+			output.Add((byte)(value >> 24));
+		}
+
+		/// <summary>raw DEFLATE（RFC 1951）。</summary>
 		private static byte[] Deflate(byte[] data)
 		{
-			using (var ms = new MemoryStream())
-			using (var ds = new DeflateStream(ms, CompressionLevel.Optimal, true))
-			{
-				ds.Write(data, 0, data.Length);
-				ds.Flush();
-				ds.Close();
-				return ms.ToArray();
-			}
+			using var stream = new MemoryStream();
+			using (var deflate = new DeflateStream(stream, CompressionLevel.Optimal, true))
+				deflate.Write(data, 0, data.Length);
+			return stream.ToArray();
 		}
 
-		/// <summary>明文序列化(不含头、不 XOR),供 DEFLATE 压缩使用;递归子函数也走明文。</summary>
 		private byte[] SerializeBody(Chunk chunk)
 		{
-			List<byte> bytes = new List<byte>();
+			var bytes = new List<byte>();
+			ushort k1 = NextKey16();
+			ushort k2 = NextKey16();
+			ushort k3 = NextKey16();
 
-			void WriteByte(byte b) =>
-				bytes.Add(b);
+			if (_context.VirtualOpcodeCount <= 0 || _context.VirtualOpcodeCount > ushort.MaxValue)
+				throw new InvalidOperationException("Invalid virtual opcode count.");
 
-			void Write(byte[] b, bool checkEndian = true)
+			// Bank[local index] = canonical VIndex. The serialized opcode is the inverse
+			// lookup, so each prototype keeps a different opcode numbering until dispatch.
+			int[] opcodeBank = DerivePermutation(_context.VirtualOpcodeCount, k1, k2, k3, 1777u);
+			int[] opcodeToLocal = new int[opcodeBank.Length];
+			for (int localIndex = 0; localIndex < opcodeBank.Length; localIndex++)
+				opcodeToLocal[opcodeBank[localIndex]] = localIndex;
+
+			void WriteByte(byte value) => bytes.Add(value);
+			void WriteUInt16Local(ushort value) => WriteUInt16(bytes, value);
+			void WriteUInt32Local(uint value) => WriteUInt32(bytes, value);
+
+			void WriteRaw(byte[] value, bool checkEndian = true)
 			{
 				if (!BitConverter.IsLittleEndian && checkEndian)
-					b = b.Reverse().ToArray();
-
-				foreach (byte x in b)
-					bytes.Add(x);
+					value = value.Reverse().ToArray();
+				bytes.AddRange(value);
 			}
 
-			void WriteInt32(int i) =>
-				Write(BitConverter.GetBytes(i));
+			void WriteNumber(double value) => WriteRaw(BitConverter.GetBytes(value));
+			void WriteBool(bool value) => WriteByte(value ? (byte)1 : (byte)0);
 
-			void WriteInt16(short i) =>
-				Write(BitConverter.GetBytes(i));
-
-			void WriteNumber(double d) =>
-				Write(BitConverter.GetBytes(d));
-
-			void WriteString(string s)
+			void WriteProtectedString(string value, int constantIndex)
 			{
-				byte[] sBytes = _fuckingLua.GetBytes(s);
+				byte[] raw = _luaEncoding.GetBytes(value);
+				WriteUInt32Local((uint)raw.Length);
 
-				WriteInt32(sBytes.Length);
-				Write(sBytes, false);
+				int oneBasedIndex = constantIndex + 1;
+				uint state = (uint)((k1 + k2 + k3 + oneBasedIndex * 257L) % 65536L);
+				foreach (byte item in raw)
+				{
+					WriteByte((byte)(item ^ (state & 0xFF)));
+					state = (state * 251u + k3 + (uint)oneBasedIndex) & 0xFFFFu;
+				}
 			}
 
-			void WriteBool(bool b) =>
-				Write(BitConverter.GetBytes(b));
-
-			void SerializeInstruction(Instruction inst, int instIndex)
+			void SerializeInstruction(Instruction instruction, int zeroBasedIndex)
 			{
-				if (inst.InstructionType == InstructionType.Data)
+				if (instruction.InstructionType == InstructionType.Data)
 				{
 					WriteByte(1);
 					return;
 				}
-				inst.UpdateRegisters();
 
-				var cData = inst.CustomData;
-				int opCode = (int)inst.OpCode;
-
-				if (cData != null)
+				instruction.UpdateRegisters();
+				int opcode = (int)instruction.OpCode;
+				if (instruction.CustomData != null)
 				{
-					var virtualOpcode = cData.Opcode;
-
-					opCode = cData.WrittenOpcode?.VIndex ?? virtualOpcode.VIndex;
-					virtualOpcode?.Mutate(inst);
+					var virtualOpcode = instruction.CustomData.Opcode;
+					opcode = instruction.CustomData.WrittenOpcode?.VIndex ?? virtualOpcode.VIndex;
+					virtualOpcode?.Mutate(instruction);
 				}
 
-				int t = (int)inst.InstructionType;
-				int m = (int)inst.ConstantMask;
-				WriteByte((byte)((t << 1) | (m << 3)));
-				// 指令流运行时加密:opcode 按指令序号派生密钥异或(内存中无完整明文指令流,
-				// VM 端主循环用 InstrPoint 逐条解密;序号用 instIndex+1 与 VM 的 InstrPoint(1-based)对齐)
-				opCode ^= (int)(((long) (instIndex + 1) * _k1 + _k2) % 65536);
-				WriteInt16((short)opCode);
-				WriteInt16((short)inst.A);
+				opcode = opcodeToLocal[opcode];
 
-				int b = inst.B;
-				int c = inst.C;
+				int pc = zeroBasedIndex + 1;
+				int type = (int)instruction.InstructionType;
+				int constantMask = (int)instruction.ConstantMask;
+				WriteByte((byte)((type << 1) | (constantMask << 3)));
 
-				switch (inst.InstructionType)
+				ushort storedOpcode = (ushort)((ushort)opcode ^ OpcodeMask(pc, k1, k2, k3));
+				ushort storedA = (ushort)((ushort)instruction.A ^ OperandMask16(pc, k1, k2, k3, 1));
+				WriteUInt16Local(storedOpcode);
+				WriteUInt16Local(storedA);
+
+				int b = instruction.B;
+				int c = instruction.C;
+				switch (instruction.InstructionType)
 				{
 					case InstructionType.AsBx:
-						b += 1 << 16;
-						WriteInt32(b);
+						WriteUInt32Local(unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2));
 						break;
 					case InstructionType.AsBxC:
-						b += 1 << 16;
-						WriteInt32(b);
-						WriteInt16((short)c);
+						WriteUInt32Local(unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2));
+						WriteUInt16Local((ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3)));
 						break;
 					case InstructionType.ABC:
-						WriteInt16((short)b);
-						WriteInt16((short)c);
+						WriteUInt16Local((ushort)((ushort)b ^ OperandMask16(pc, k1, k2, k3, 2)));
+						WriteUInt16Local((ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3)));
 						break;
 					case InstructionType.ABx:
-						WriteInt32(b);
+						WriteUInt32Local(unchecked((uint)b) ^ OperandMask32(pc, k1, k2, k3, 2));
 						break;
 				}
 			}
 
 			chunk.UpdateMappings();
 
-			WriteInt32(chunk.Constants.Count);
-			foreach (Constant c in chunk.Constants)
+			// 每 prototype 独立密钥位于外层加密正文中，不再泄露在固定头部。
+			WriteUInt16Local(k1);
+			WriteUInt16Local(k2);
+			WriteUInt16Local(k3);
+
+			// Schema 与常量 tag 都由当前 prototype 的独立 keys 派生，并使用不同 domain。
+			// 因此父子 prototype 不再共享一个全局 ChunkSteps 或简单 tag rotation。
+			int[] schema = DerivePermutation((int)ChunkStep.StepCount, k1, k2, k3, 113u);
+			int[] constantTags = DerivePermutation(4, k1, k2, k3, 911u);
+
+			void SerializeConstants()
 			{
-				WriteByte((byte)_context.ConstantMapping[(int)c.Type]);
-				switch (c.Type)
+				WriteUInt32Local((uint)chunk.Constants.Count);
+				for (int constantIndex = 0; constantIndex < chunk.Constants.Count; constantIndex++)
 				{
-					case ConstantType.Boolean:
-						WriteBool(c.Data);
-						break;
-					case ConstantType.Number:
-						WriteNumber(c.Data);
-						break;
-					case ConstantType.String:
-						WriteString(c.Data);
-						break;
+					Constant constant = chunk.Constants[constantIndex];
+					WriteByte((byte)constantTags[(int)constant.Type]);
+					switch (constant.Type)
+					{
+						case ConstantType.Boolean:
+							WriteBool(constant.Data);
+							break;
+						case ConstantType.Number:
+							WriteNumber(constant.Data);
+							break;
+						case ConstantType.String:
+							WriteProtectedString(constant.Data, constantIndex);
+							break;
+					}
 				}
 			}
 
-			for (int i = 0; i < (int) ChunkStep.StepCount; i++)
+			foreach (int stepValue in schema)
 			{
-				switch (_context.ChunkSteps[i])
+				switch ((ChunkStep)stepValue)
 				{
 					case ChunkStep.ParameterCount:
 						WriteByte(chunk.ParameterCount);
 						break;
+					case ChunkStep.StringTable:
+						SerializeConstants();
+						break;
 					case ChunkStep.Instructions:
-						WriteInt32(chunk.Instructions.Count);
-
-						for (int instIdx = 0; instIdx < chunk.Instructions.Count; instIdx++)
-							SerializeInstruction(chunk.Instructions[instIdx], instIdx);
+						WriteUInt32Local((uint)chunk.Instructions.Count);
+						for (int instructionIndex = 0; instructionIndex < chunk.Instructions.Count; instructionIndex++)
+							SerializeInstruction(chunk.Instructions[instructionIndex], instructionIndex);
 						break;
 					case ChunkStep.Functions:
-						WriteInt32(chunk.Functions.Count);
-						foreach (Chunk c in chunk.Functions)
-							Write(SerializeBody(c));
-
+						WriteUInt32Local((uint)chunk.Functions.Count);
+						foreach (Chunk child in chunk.Functions)
+						{
+							// Length framing lets the VM retain child prototypes as opaque byte
+							// slices and deserialize each one only when OP_CLOSURE first needs it.
+							byte[] childBody = SerializeBody(child);
+							WriteUInt32Local((uint)childBody.Length);
+							bytes.AddRange(childBody);
+						}
 						break;
 					case ChunkStep.LineInfo when _settings.PreserveLineInfo:
-						WriteInt32(chunk.Instructions.Count);
-						foreach (var instr in chunk.Instructions)
-							WriteInt32(instr.Line);
+						WriteUInt32Local((uint)chunk.Instructions.Count);
+						foreach (Instruction instruction in chunk.Instructions)
+							WriteUInt32Local(unchecked((uint)instruction.Line));
 						break;
 				}
 			}

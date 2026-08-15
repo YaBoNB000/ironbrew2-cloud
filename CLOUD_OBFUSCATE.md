@@ -33,7 +33,7 @@ git push -u origin main
 1. **上传源码**:手机浏览器打开 GitHub 仓库 → `Add file` → `Upload files` → 把你的 `.lua` 源码拖进去(建议放 `src/` 文件夹)
 2. **触发混淆**:仓库页 → **Actions** 选项卡 → 左侧 **云端混淆** → **Run workflow**
    - `source_file`:填源码路径,如 `src/Main.lua`
-   - `strength`:强度(low / mid / high)
+   - 所有任务使用同一套稳定配置，不再选择强度
    - 点绿色 **Run workflow**
 3. **等 1~3 分钟**:Actions 页面看进度,出现绿色 ✓ 即完成
 4. **下载产物**:点进该次运行 → 底部 **Artifacts** → 下载 `obfuscated-xxx`(zip,里面就是 `out.lua` 混淆产物)
@@ -62,12 +62,12 @@ A:GitHub 会把单个文件打包成 zip,解压即得 `out.lua`。
 **Q:私有仓库 2000 分钟用完了?**
 A:一个月后自动恢复;或把仓库改公共(无限,但源码公开)。
 
-**Q:混淆产物带防 dump,纯 Lua 测试会卡死?**
-A:正常——产物在真实 Roblox 执行器里运行即可。
+**Q:混淆产物能否在纯 Lua 5.1 测试?**
+A:可以。固定配置不启用执行器专用 AntiDump 或环境锁，并由自动差分测试验证 Lua 5.1 兼容性。
 
 ## 其他免费备选(不想用 GitHub 时)
 
 - **已有云服务器**:装好 .NET 8 + Lua 5.1 后,手机 SSH(Termux/JuiceSSH)登录执行:
-  `dotnet "IronBrew2 CLI\bin\Release\net8.0\IronBrew2 CLI.dll" 源码.lua --strength mid`
+  `dotnet "IronBrew2 CLI\bin\Release\net8.0\IronBrew2 CLI.dll" 源码.lua`
   产物 `out.lua` 同目录,手机文件管理器/下载。
 - **免费 VPS**:甲骨文云(Oracle Cloud)永久免费实例,装环境后同上。

@@ -7,7 +7,7 @@ namespace IronBrew2.Obfuscator.Control_Flow
 {
 	public class CFGenerator
 	{
-		public Random Random = new Random();
+		public Random Random = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 
 		public Instruction NextJMP(Chunk lc, Instruction Reference) =>
 			new Instruction(lc, Opcode.Jmp, Reference);

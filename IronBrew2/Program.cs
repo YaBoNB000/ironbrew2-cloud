@@ -15,7 +15,6 @@ namespace IronBrew2
 {
 	public static class IB2
 	{
-		public static Random Random = new Random();
 		private static Encoding _fuckingLua = Encoding.GetEncoding(28591);
 
 		public static string FindTool(params string[] candidates)
@@ -111,6 +110,10 @@ namespace IronBrew2
 					       }
 				       };
 
+				// LuaSrcDiet loads sibling modules with require(). Make module resolution
+				// independent of the caller's current working directory.
+				proc.StartInfo.Environment["LUA_PATH"] =
+					Path.Combine(Path.GetDirectoryName(luasrcdiet) ?? ".", "?.lua") + ";;";
 				proc.OutputDataReceived += (sender, args) => { err += args.Data; };
 				proc.ErrorDataReceived  += (sender, args) => { err += args.Data; };
 
@@ -328,11 +331,13 @@ namespace IronBrew2
 					       }
 				       };
 
+				proc.StartInfo.Environment["LUA_PATH"] =
+					Path.Combine(Path.GetDirectoryName(luasrcdiet) ?? ".", "?.lua") + ";;";
 				proc.Start();
 				proc.WaitForExit();
 
-				if (!File.Exists(t3))
-					return false;
+				if (proc.ExitCode != 0 || !File.Exists(t3))
+					throw new Exception("LuaSrcDiet final minification failed.");
 				
 				File.WriteAllText(Path.Combine(path, "out.lua"), File.ReadAllText(t3, _fuckingLua).Replace("\n", " "), _fuckingLua);
 				

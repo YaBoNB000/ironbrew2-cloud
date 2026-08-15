@@ -14,7 +14,7 @@ namespace IronBrew2.Obfuscator.AntiDump
 	/// </summary>
 	public static class DefenseGenerator
 	{
-		private static readonly Random R = new Random();
+		private static readonly Random R = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 
 		private static string RN(int min, int max)
 		{
