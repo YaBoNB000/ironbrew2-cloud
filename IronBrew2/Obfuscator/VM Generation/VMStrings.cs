@@ -463,6 +463,25 @@ local function DerivePermutation(Count, K1, K2, K3, Domain)
     return Values;
 end;
 
+-- Block-local column role permutation. Values[physical page] is the zero-based
+-- logical descriptor/opcode/A/B/C role stored in that framed page.
+local function DeriveBlockPermutation(Count, EntryState, K1, K2, K3, Domain)
+    local Values = {};
+    for I = 1, Count do Values[I] = I - 1; end;
+    local Low = EntryState % 65536;
+    local High = (EntryState - Low) / 65536;
+    local State = (Low * 251 + High * 17 + K1 * 13 + K2 * 7 + K3 + Domain) % 65536;
+    for I = Count, 2, -1 do
+        State = (State * 251 + K3 + I * (K1 + Low) + K2 + High + Domain) % 65536;
+        local J = (State % I) + 1;
+        Values[I], Values[J] = Values[J], Values[I];
+    end;
+    local Identity = true;
+    for I = 1, Count do if Values[I] ~= I - 1 then Identity = false; break; end; end;
+    if Identity and Count > 1 then Values[1], Values[2] = Values[2], Values[1]; end;
+    return Values;
+end;
+
 local function Deserialize()
     local PrototypeLength = #ByteString;
     local Instrs = {};

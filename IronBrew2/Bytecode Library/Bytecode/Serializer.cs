@@ -31,6 +31,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private const uint ConstantIntegrityDomain = 0xD13C5E79u;
 		private const uint ConstantMaskDomain = 0x4B8F21A3u;
 		private const uint PrototypeIntegrityDomain = 0xE9274D6Bu;
+		private const uint BlockColumnDomain = 3253u;
 
 		private sealed class EntropyRecord
 		{
@@ -375,6 +376,36 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return values;
 		}
 
+		/// <summary>
+		/// Derives a block-local physical page order for the five logical IR columns:
+		/// descriptor, opcode, A, B and C. EntryState makes the order independent per
+		/// block; forcing a final swap avoids ever emitting the canonical identity order.
+		/// Values[physical page] is the logical column stored in that page.
+		/// </summary>
+		private static int[] DeriveBlockPermutation(int count, uint entryState,
+			ushort k1, ushort k2, ushort k3, uint domain)
+		{
+			int[] values = Enumerable.Range(0, count).ToArray();
+			uint low = entryState & 0xFFFFu;
+			uint high = entryState >> 16;
+			uint state = (low * 251u + high * 17u + (uint)k1 * 13u +
+			              (uint)k2 * 7u + k3 + domain) & 0xFFFFu;
+			for (int i = count; i >= 2; i--)
+			{
+				state = (state * 251u + k3 + (uint)i * (k1 + low) +
+				         k2 + high + domain) & 0xFFFFu;
+				int j = (int)(state % (uint)i);
+				(values[i - 1], values[j]) = (values[j], values[i - 1]);
+			}
+
+			bool identity = true;
+			for (int index = 0; index < count; index++)
+				identity &= values[index] == index;
+			if (identity && count > 1)
+				(values[0], values[1]) = (values[1], values[0]);
+			return values;
+		}
+
 		private static void WriteUInt16(List<byte> output, ushort value)
 		{
 			output.Add((byte)value);
@@ -428,13 +459,21 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			void WriteUInt16Local(ushort value) => WriteUInt16(output, value);
 			void WriteUInt32Local(uint value) => WriteUInt32(output, value);
 
-			void SerializeInstruction(Instruction instruction, int zeroBasedIndex, uint entryState)
+			void SerializeInstruction(Instruction instruction, int zeroBasedIndex, uint entryState,
+				IReadOnlyList<List<byte>> columns)
 			{
+				// Logical columns are descriptor/opcode/A/B/C. They are accumulated
+				// independently, then emitted in a block-local physical permutation.
+				List<byte> descriptors = columns[0];
+				List<byte> opcodes = columns[1];
+				List<byte> operandsA = columns[2];
+				List<byte> operandsB = columns[3];
+				List<byte> operandsC = columns[4];
 				int pc = zeroBasedIndex + 1;
 				byte descriptorMask = (byte)BlockFieldMask(entryState, pc, 7, k1, k2, k3);
 				if (instruction.InstructionType == InstructionType.Data)
 				{
-					WriteByte((byte)(1 ^ descriptorMask));
+					descriptors.Add((byte)(1 ^ descriptorMask));
 					return;
 				}
 
@@ -449,14 +488,14 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 				int type = (int)instruction.InstructionType;
 				int constantMask = (int)instruction.ConstantMask;
-				WriteByte((byte)(((type << 1) | (constantMask << 3)) ^ descriptorMask));
+				descriptors.Add((byte)(((type << 1) | (constantMask << 3)) ^ descriptorMask));
 
 				ushort storedOpcode = (ushort)((ushort)opcode ^ OpcodeMask(pc, k1, k2, k3) ^
 				                               BlockFieldMask(entryState, pc, 0, k1, k2, k3));
 				ushort storedA = (ushort)((ushort)instruction.A ^ OperandMask16(pc, k1, k2, k3, 1) ^
 				                          BlockFieldMask(entryState, pc, 1, k1, k2, k3));
-				WriteUInt16Local(storedOpcode);
-				WriteUInt16Local(storedA);
+				WriteUInt16(opcodes, storedOpcode);
+				WriteUInt16(operandsA, storedA);
 
 				uint BlockMask32(int slot) =>
 					(uint)(BlockFieldMask(entryState, pc, slot, k1, k2, k3) |
@@ -467,21 +506,21 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				switch (instruction.InstructionType)
 				{
 					case InstructionType.AsBx:
-						WriteUInt32Local(unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
+						WriteUInt32(operandsB, unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
 						break;
 					case InstructionType.AsBxC:
-						WriteUInt32Local(unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
-						WriteUInt16Local((ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3) ^
+						WriteUInt32(operandsB, unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
+						WriteUInt16(operandsC, (ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3) ^
 						                              BlockFieldMask(entryState, pc, 3, k1, k2, k3)));
 						break;
 					case InstructionType.ABC:
-						WriteUInt16Local((ushort)((ushort)b ^ OperandMask16(pc, k1, k2, k3, 2) ^
+						WriteUInt16(operandsB, (ushort)((ushort)b ^ OperandMask16(pc, k1, k2, k3, 2) ^
 						                              BlockFieldMask(entryState, pc, 2, k1, k2, k3)));
-						WriteUInt16Local((ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3) ^
+						WriteUInt16(operandsC, (ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3) ^
 						                              BlockFieldMask(entryState, pc, 3, k1, k2, k3)));
 						break;
 					case InstructionType.ABx:
-						WriteUInt32Local(unchecked((uint)b) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
+						WriteUInt32(operandsB, unchecked((uint)b) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
 						break;
 				}
 			}
@@ -628,12 +667,20 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							int start = block.Start;
 							int count = block.Count;
 							uint entryState = blockStates[block];
-							var blockBody = new List<byte>();
-							List<byte> savedOutput = output;
-							output = blockBody;
+							var columns = Enumerable.Range(0, 5).Select(_ => new List<byte>()).ToArray();
 							for (int offset = 0; offset < count; offset++)
-								SerializeInstruction(chunk.Instructions[start + offset], start + offset, entryState);
-							output = savedOutput;
+								SerializeInstruction(chunk.Instructions[start + offset], start + offset, entryState, columns);
+
+							// Each logical field stream is independently length-framed. The physical
+							// page order is derived from this block's state plus prototype keys, so the
+							// decoder must recover a different descriptor/opcode/A/B/C role mapping per block.
+							var blockBody = new List<byte>();
+							int[] columnOrder = DeriveBlockPermutation(5, entryState, k1, k2, k3, BlockColumnDomain);
+							foreach (int logicalColumn in columnOrder)
+							{
+								WriteUInt32(blockBody, (uint)columns[logicalColumn].Count);
+								blockBody.AddRange(columns[logicalColumn]);
+							}
 
 							// Keep only capsule references in each block. The manifest authenticates
 							// every referenced capsule together with route and successor metadata.

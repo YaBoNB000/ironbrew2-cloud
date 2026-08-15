@@ -73,9 +73,10 @@ done
 echo "PASS entropy record modification, deletion and reordering rejection after outer-tag recomputation"
 
 # Rebuild every outer/envelope layer around deliberately damaged v4 internals.
-# Each case leaves exactly the named prototype, complete block-manifest, or
-# capsule-integrity layer as the first rejecting boundary.
-for payload_case in prototype-tag block-manifest capsule-integrity; do
+# Each case leaves exactly the named prototype, complete block-manifest,
+# authenticated column parser/consumption, or capsule-integrity layer as the
+# first rejecting boundary.
+for payload_case in prototype-tag block-manifest column-framing column-consumption capsule-integrity; do
     payload_file="$WORK/payload-$payload_case.lua"
     "$LUAC" -p "$payload_file"
     set +e
@@ -85,7 +86,7 @@ for payload_case in prototype-tag block-manifest capsule-integrity; do
     [[ $payload_code -ne 0 ]]
     grep -Fq 'invalid protected payload' "$WORK/payload-$payload_case.stderr"
 done
-echo "PASS v4 prototype, complete block-manifest and constant-capsule tamper rejection"
+echo "PASS v4 prototype, block-manifest, column framing/consumption and constant-capsule tamper rejection"
 
 # Capability-gated Luau/executor probes must accept untouched native primitives,
 # preserve executor globals, and silently select the decoy route for active hooks,
@@ -127,8 +128,11 @@ if leaked:
 envelope_leak = re.search(r"\b(?:Payload|Envelope)[A-Z][A-Za-z0-9_]*", source + "\n" + final_source)
 if envelope_leak:
     raise SystemExit("stable entropy-envelope identifier leaked: " + envelope_leak.group(0))
+column_leak = re.search(r"\b(?:DeriveBlockPermutation|Column(?:Order|Positions|Read8|Read16|Read32|Data|Position))\b", source + "\n" + final_source)
+if column_leak:
+    raise SystemExit("stable columnar-IR identifier leaked: " + column_leak.group(0))
 PY
-echo "PASS guard and entropy-envelope runtime identifiers are randomized"
+echo "PASS guard, entropy-envelope and columnar-IR runtime identifiers are randomized"
 
 # semantic.lua contains no IB_MAX_CFLOW markers. Assert that its root prototype
 # was nevertheless selected and received a complete random route-state map.

@@ -23,6 +23,7 @@ ENVELOPE_MASK_DOMAIN = 0x3A75C9EF
 CONSTANT_INTEGRITY_DOMAIN = 0xD13C5E79
 CONSTANT_MASK_DOMAIN = 0x4B8F21A3
 PROTOTYPE_INTEGRITY_DOMAIN = 0xE9274D6B
+BLOCK_COLUMN_DOMAIN = 3253
 ENTROPY_KIND = 0xA7
 DATA_KIND = 0x5C
 ENTROPY_MIN = 64 * 1024
@@ -70,6 +71,9 @@ class Block:
     body_start: int
     body_end: int
     entry_state: int
+    column_order: list[int] = field(default_factory=list)
+    column_spans: dict[int, tuple[int, int]] = field(default_factory=dict)
+    descriptors: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -280,6 +284,98 @@ def derive_permutation(count: int, k1: int, k2: int, k3: int, domain: int) -> li
     return values
 
 
+def derive_block_permutation(
+    count: int, entry_state: int, k1: int, k2: int, k3: int, domain: int
+) -> list[int]:
+    """Mirror the serializer/runtime's block-local physical-to-logical page map."""
+    values = list(range(count))
+    low = entry_state & 0xFFFF
+    high = entry_state >> 16
+    state = (low * 251 + high * 17 + k1 * 13 + k2 * 7 + k3 + domain) & 0xFFFF
+    for size in range(count, 1, -1):
+        state = (state * 251 + k3 + size * (k1 + low) + k2 + high + domain) & 0xFFFF
+        target = state % size
+        values[size - 1], values[target] = values[target], values[size - 1]
+    if values == list(range(count)) and count > 1:
+        values[0], values[1] = values[1], values[0]
+    return values
+
+
+def block_field_mask(entry_state: int, pc: int, slot: int, prototype: Prototype) -> int:
+    low = entry_state & 0xFFFF
+    high = entry_state >> 16
+    return (
+        low * ((pc + slot * 29) % 251 + 1)
+        + high * 17
+        + prototype.k1 * 13
+        + prototype.k2 * 7
+        + prototype.k3
+        + slot * 911
+    ) & 0xFFFF
+
+
+def validate_columnar_block(data: bytes, prototype: Prototype, block: Block) -> None:
+    """Validate framing, role derivation and exact logical-column consumption."""
+    order = derive_block_permutation(
+        5, block.entry_state, prototype.k1, prototype.k2, prototype.k3, BLOCK_COLUMN_DOMAIN
+    )
+    if sorted(order) != list(range(5)) or order == list(range(5)):
+        raise ValueError("invalid or identity block column-role permutation")
+
+    cursor = Cursor(data, block.body_start, block.body_end)
+    columns: dict[int, bytes] = {}
+    spans: dict[int, tuple[int, int]] = {}
+    for role in order:
+        frame_start = cursor.position
+        length = cursor.u32()
+        if role in columns:
+            raise ValueError("duplicate logical block column role")
+        columns[role] = cursor.take(length)
+        spans[role] = (frame_start, cursor.position)
+    if cursor.position != block.body_end or set(columns) != set(range(5)):
+        raise ValueError("block column pages were not consumed exactly")
+
+    descriptor_column = columns[0]
+    if len(descriptor_column) != block.count:
+        raise ValueError("descriptor column length does not match block instruction count")
+    descriptors = [
+        encoded ^ (block_field_mask(block.entry_state, block.start_pc + offset, 7, prototype) & 0xFF)
+        for offset, encoded in enumerate(descriptor_column)
+    ]
+
+    non_data = 0
+    expected_b = 0
+    expected_c = 0
+    for descriptor in descriptors:
+        if descriptor & 1:
+            if descriptor != 1:
+                raise ValueError("invalid data-word descriptor in columnar block")
+            continue
+        if descriptor >= 64:
+            raise ValueError("invalid high bits in instruction descriptor")
+        instruction_type = (descriptor >> 1) & 3
+        non_data += 1
+        expected_b += 2 if instruction_type == 0 else 4
+        if instruction_type in (0, 3):
+            expected_c += 2
+
+    expected_lengths = {
+        0: block.count,
+        1: non_data * 2,
+        2: non_data * 2,
+        3: expected_b,
+        4: expected_c,
+    }
+    actual_lengths = {role: len(column) for role, column in columns.items()}
+    if actual_lengths != expected_lengths:
+        raise ValueError(
+            f"logical block column lengths do not match descriptors: {actual_lengths} != {expected_lengths}"
+        )
+    block.column_order = order
+    block.column_spans = spans
+    block.descriptors = descriptors
+
+
 def constant_mask_state(index: int, prototype: Prototype) -> int:
     value = (
         index * 65537
@@ -471,6 +567,7 @@ def parse_prototype(data: bytes, start: int, length: int, preserve_line_info: bo
             raise ValueError("successor does not name a block start")
         if block_integrity(data, prototype, block) != block.tag:
             raise ValueError("complete block manifest authentication mismatch")
+        validate_columnar_block(data, prototype, block)
         for destination, wrapped_state in block.successors:
             expected_state = next(item.entry_state for item in prototype.blocks if item.start_pc == destination)
             recovered = wrapped_state ^ flow_key(
@@ -721,6 +818,52 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
     patch_u32(block_variant, info.root.tag_offset, prototype_integrity(block_variant, info.root))
     write_body_variant(info, output_dir, "block-manifest", block_variant)
 
+    # Column framing: extend the first physical page into the following frame,
+    # then repair both block and prototype tags. Authentication now passes, but
+    # the block-local five-page parser must reject the shifted framing.
+    column_framing_variant = bytearray(info.body)
+    first_page_length = struct.unpack_from("<I", column_framing_variant, entry_block.body_start)[0]
+    patch_u32(column_framing_variant, entry_block.body_start, first_page_length + 1)
+    patch_u32(
+        column_framing_variant,
+        entry_block.tag_offset,
+        block_integrity(column_framing_variant, info.root, entry_block),
+    )
+    patch_u32(
+        column_framing_variant,
+        info.root.tag_offset,
+        prototype_integrity(column_framing_variant, info.root),
+    )
+    write_body_variant(info, output_dir, "column-framing", column_framing_variant)
+
+    # Column consumption: turn one authenticated normal instruction into a data
+    # word without removing its opcode/operand bytes. The role map and framing
+    # remain valid, but exact per-column consumption must reject the leftovers.
+    normal_offset = next(
+        (offset for offset, descriptor in enumerate(entry_block.descriptors) if descriptor & 1 == 0),
+        None,
+    )
+    if normal_offset is None:
+        raise ValueError("entry block has no normal instruction for column-consumption tamper")
+    descriptor_frame_start, _ = entry_block.column_spans[0]
+    descriptor_offset = descriptor_frame_start + 4 + normal_offset
+    descriptor_mask = block_field_mask(
+        entry_block.entry_state, entry_block.start_pc + normal_offset, 7, info.root
+    )
+    column_consumption_variant = bytearray(info.body)
+    column_consumption_variant[descriptor_offset] = (1 ^ descriptor_mask) & 0xFF
+    patch_u32(
+        column_consumption_variant,
+        entry_block.tag_offset,
+        block_integrity(column_consumption_variant, info.root, entry_block),
+    )
+    patch_u32(
+        column_consumption_variant,
+        info.root.tag_offset,
+        prototype_integrity(column_consumption_variant, info.root),
+    )
+    write_body_variant(info, output_dir, "column-consumption", column_consumption_variant)
+
     # Capsule integrity: alter a referenced capsule's stored tag, repair every
     # block manifest that embeds that capsule, and finally repair the prototype
     # tag. DecodeConstantCapsule must be the remaining rejecting layer.
@@ -750,11 +893,20 @@ def count_capsules(prototype: Prototype) -> int:
     return len(prototype.capsules) + sum(count_capsules(child) for child in prototype.children)
 
 
+def collect_column_orders(prototype: Prototype) -> list[tuple[int, ...]]:
+    return [tuple(block.column_order) for block in prototype.blocks] + [
+        order for child in prototype.children for order in collect_column_orders(child)
+    ]
+
+
 def describe(info: PayloadInfo) -> str:
+    column_orders = collect_column_orders(info.root)
+    if len(column_orders) != count_blocks(info.root) or any(not order for order in column_orders):
+        raise ValueError("column-role validation did not cover every block")
     return (
         f"PASS authenticated v4 payload: features={info.flags & 15}, "
         f"prototypes={count_prototypes(info.root)}, blocks={count_blocks(info.root)}, "
-        f"capsules={count_capsules(info.root)}, entropy={info.entropy_length} bytes, "
+        f"column_layouts={len(set(column_orders))}, capsules={count_capsules(info.root)}, entropy={info.entropy_length} bytes, "
         f"records={len(info.records)}, H={info.shannon_entropy:.4f} bits/byte, "
         f"entropy_sha256={hashlib.sha256(info.entropy).hexdigest()}"
     )

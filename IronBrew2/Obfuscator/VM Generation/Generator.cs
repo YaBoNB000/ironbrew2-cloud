@@ -654,7 +654,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"gBit","Instrs","Functions","Lines","Consts","ConstCapsules","Capsule","Instr","Proto","Params","Top","Vararg","Args",
 				"PCount","Lupvals","Stk","Inst","Enum","Chunk","decompress","Pos","Xs","Xd","_R","Env",
 				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2","K3","OpcodeKey","FieldKey","FieldKey32","U32",
-				"DerivePermutation","Count","Domain","Values","State","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank",
+				"DerivePermutation","DeriveBlockPermutation","Count","Domain","Values","State","Identity","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank",
+				"Columns","ColumnOrder","ColumnPositions","ColumnRead8","ColumnRead16","ColumnRead32","ColumnData","ColumnPosition","PhysicalSlot","Role",
 				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","StoredTag","EncodedBody","RawParts","Raw","Cons","PreviousReference","Reference",
 				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root","Blocks","BlockMap",
 				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
@@ -1032,7 +1033,7 @@ local ToNumber = tonumber;");
 	                PreviousSuccessor = SuccessorStart;
 	            end;
 	            local Length = gBits32();
-	            if Length < 1 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
+	            if Length < 21 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
 	            local Block = {};
 	            Block[1] = BlockStart;
 	            Block[2] = Count;
@@ -1161,42 +1162,86 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState)
         local Index = References[ReferenceIndex];
         ConstCache[Index] = DecodeConstantCapsule(ConstCapsules[Index], Index, K1, K2, K3, ConstTags);
     end;
+    -- Authenticate first, then split all five length-framed physical pages and
+    -- recover their logical descriptor/opcode/A/B/C roles from this block's state.
     ByteString, Pos = Block[3], 1;
+    local ColumnOrder = DeriveBlockPermutation(5, EntryState, K1, K2, K3, 3253);
+    local Columns = {};
+    for PhysicalSlot = 1, 5 do
+        if Pos + 3 > #ByteString then error('invalid protected payload', 0); end;
+        local Length = gBits32();
+        if Length > #ByteString - Pos + 1 then error('invalid protected payload', 0); end;
+        local Role = ColumnOrder[PhysicalSlot] + 1;
+        if Columns[Role] ~= nil then error('invalid protected payload', 0); end;
+        Columns[Role] = Sub(ByteString, Pos, Pos + Length - 1);
+        Pos = Pos + Length;
+    end;
+    if Pos ~= #ByteString + 1 then error('invalid protected payload', 0); end;
+    ByteString, Pos = SavedByteString, SavedPos;
+
+    local ColumnPositions = {1, 1, 1, 1, 1};
+    local function ColumnRead8(Role)
+        local ColumnData = Columns[Role];
+        local ColumnPosition = ColumnPositions[Role];
+        if type(ColumnData) ~= 'string' or ColumnPosition > #ColumnData then error('invalid protected payload', 0); end;
+        ColumnPositions[Role] = ColumnPosition + 1;
+        return Byte(ColumnData, ColumnPosition, ColumnPosition);
+    end;
+    local function ColumnRead16(Role)
+        local ColumnData = Columns[Role];
+        local ColumnPosition = ColumnPositions[Role];
+        if type(ColumnData) ~= 'string' or ColumnPosition + 1 > #ColumnData then error('invalid protected payload', 0); end;
+        ColumnPositions[Role] = ColumnPosition + 2;
+        return Byte(ColumnData, ColumnPosition, ColumnPosition) + Byte(ColumnData, ColumnPosition + 1, ColumnPosition + 1) * 256;
+    end;
+    local function ColumnRead32(Role)
+        local ColumnData = Columns[Role];
+        local ColumnPosition = ColumnPositions[Role];
+        if type(ColumnData) ~= 'string' or ColumnPosition + 3 > #ColumnData then error('invalid protected payload', 0); end;
+        ColumnPositions[Role] = ColumnPosition + 4;
+        return Byte(ColumnData, ColumnPosition, ColumnPosition) + Byte(ColumnData, ColumnPosition + 1, ColumnPosition + 1) * 256 +
+               Byte(ColumnData, ColumnPosition + 2, ColumnPosition + 2) * 65536 + Byte(ColumnData, ColumnPosition + 3, ColumnPosition + 3) * 16777216;
+    end;
+
     __IB2_DECODE_TARGET__
     for Offset = 0, Block[2] - 1 do
         local Index = Block[1] + Offset;
-        local Descriptor = BitXOR(gBits8(), BlockFieldKey(EntryState, Index, 7, K1, K2, K3));
+        local Descriptor = BitXOR(ColumnRead8(1), BlockFieldKey(EntryState, Index, 7, K1, K2, K3) % 256);
+        if Descriptor >= 64 then error('invalid protected payload', 0); end;
         if (gBit(Descriptor, 1, 1) == 0) then
             local Type = gBit(Descriptor, 2, 3);
             local Mask = gBit(Descriptor, 4, 6);
             local Inst =
             {
-                gBits16(),
-                BitXOR(BitXOR(gBits16(), FieldKey(Index, 1, K1, K2, K3)), BlockFieldKey(EntryState, Index, 1, K1, K2, K3)),
+                ColumnRead16(2),
+                BitXOR(BitXOR(ColumnRead16(3), FieldKey(Index, 1, K1, K2, K3)), BlockFieldKey(EntryState, Index, 1, K1, K2, K3)),
                 nil,
                 nil
             };
 
             if (Type == 0) then
-                Inst[OP_B] = BitXOR(BitXOR(gBits16(), FieldKey(Index, 2, K1, K2, K3)), BlockFieldKey(EntryState, Index, 2, K1, K2, K3));
-                Inst[OP_C] = BitXOR(BitXOR(gBits16(), FieldKey(Index, 3, K1, K2, K3)), BlockFieldKey(EntryState, Index, 3, K1, K2, K3));
+                Inst[OP_B] = BitXOR(BitXOR(ColumnRead16(4), FieldKey(Index, 2, K1, K2, K3)), BlockFieldKey(EntryState, Index, 2, K1, K2, K3));
+                Inst[OP_C] = BitXOR(BitXOR(ColumnRead16(5), FieldKey(Index, 3, K1, K2, K3)), BlockFieldKey(EntryState, Index, 3, K1, K2, K3));
             elseif (Type == 1) then
-                Inst[OP_B] = U32(BitXOR(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3)));
+                Inst[OP_B] = U32(BitXOR(BitXOR(ColumnRead32(4), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3)));
             elseif (Type == 2) then
-                Inst[OP_B] = U32(BitXOR(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3))) - (2 ^ 16);
+                Inst[OP_B] = U32(BitXOR(BitXOR(ColumnRead32(4), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3))) - (2 ^ 16);
             elseif (Type == 3) then
-                Inst[OP_B] = U32(BitXOR(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3))) - (2 ^ 16);
-                Inst[OP_C] = BitXOR(BitXOR(gBits16(), FieldKey(Index, 3, K1, K2, K3)), BlockFieldKey(EntryState, Index, 3, K1, K2, K3));
+                Inst[OP_B] = U32(BitXOR(BitXOR(ColumnRead32(4), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3))) - (2 ^ 16);
+                Inst[OP_C] = BitXOR(BitXOR(ColumnRead16(5), FieldKey(Index, 3, K1, K2, K3)), BlockFieldKey(EntryState, Index, 3, K1, K2, K3));
             end;
 
             if (gBit(Mask, 1, 1) == 1) then Inst[OP_A] = ConstCache[Inst[OP_A]]; end;
             if (gBit(Mask, 2, 2) == 1) then Inst[OP_B] = ConstCache[Inst[OP_B]]; end;
             if (gBit(Mask, 3, 3) == 1) then Inst[OP_C] = ConstCache[Inst[OP_C]]; end;
             Instrs[Index] = Inst;
+        elseif Descriptor ~= 1 then
+            error('invalid protected payload', 0);
         end;
     end;
-    if Pos ~= #Block[3] + 1 then error('invalid protected payload', 0); end;
-    ByteString, Pos = SavedByteString, SavedPos;
+    for Role = 1, 5 do
+        if type(Columns[Role]) ~= 'string' or ColumnPositions[Role] ~= #Columns[Role] + 1 then error('invalid protected payload', 0); end;
+    end;
     __IB2_DECODE_FINALIZE__
 end;
 

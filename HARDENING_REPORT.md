@@ -1,7 +1,7 @@
 # IronBrew2 加固实施报告
 
 日期：2026-08-15  
-基线：`main` / `d6896333f26dc80a8a8c93aa7ff111bd3f9dab42`
+本轮基线：`main` / `928c9c75aa8d660cdf460027856257e2dbec65ed`
 
 ## 1. 实施原则
 
@@ -100,7 +100,17 @@
 
 这些变换改变生成源码结构而不改变指令执行次序、寄存器语义或 opcode bank。handler 仍是每次构建生成一组，并非按 prototype 复制一整套 VM。
 
-### 2.8 运行时槽位 ABI 随机化
+### 2.8 每 block columnar IR 与字段角色排列
+
+- 指令 block body 不再按 `descriptor/opcode/A/B/C` 的逐行记录串联，而是先聚合为五个逻辑列；descriptor 保持每条 1 byte，opcode/A 保持 16 bit，B/C 仍按 ABC/ABx/AsBx/AsBxC 选择原有 16/32 bit 宽度，因此没有扩大 handler ABI。
+- 五个逻辑列各自使用 `u32 length | bytes` framing。每个 block 由 entry state、prototype K1/K2/K3 和独立 domain 派生一组 physical-page → logical-role permutation；若 Fisher–Yates 偶然得到 identity，会交换前两项，保证不输出 canonical 物理顺序。
+- wire format 不显式保存字段角色表。VM 先验证覆盖完整新 block body 的 manifest，再由认证的 entry state/keys 恢复角色，将五列以独立 cursor 按 descriptor/type 消费并重建原有 canonical `Inst[1..4]`，opcode handler 无需感知列式存储。
+- runtime 拒绝物理 page 越界、重复/缺失角色、descriptor 高位、非 `1` 的 data-word descriptor，以及任一逻辑列未精确耗尽；column permutation、page/cursor/reader 等局部标识符继续参与每次构建的名称随机化。
+- Python v4 verifier 与 C#/Lua 使用对称派生和 mask 公式，递归验证每个 block 的非 identity role map、五页 framing、descriptor 与预期列长度。测试还会在重算 block/prototype/outer 全部认证后分别破坏 page framing 和 descriptor-driven consumption，两种样本仍必须由 VM 拒绝。
+
+该层提高依赖稳定 row schema 的静态批量解析和 AI 模式匹配成本，但运行时最终仍会重建 canonical instruction；它不是 IR-native superoperator，也不宣称阻止对 `DecodeInstructionBlock` 或 handler 的动态采集。
+
+### 2.9 运行时槽位 ABI 随机化
 
 - 生成器每次构建一次性产生四组 build-wide Fisher–Yates permutation：Chunk 15 槽、Block 9 槽、Flow 4 槽、FlowCache 3 槽；若随机结果恰为 identity，会交换前两项以强制非 identity。
 - 该层不是只改局部变量名。prototype/block 构造器、VM helper、opcode handler、CurrentBlock/NextBlock/SuccessorBlock aliases 和 line-info 路径中的所有数字索引，都会在 minify 前按同一映射重写。
@@ -110,13 +120,13 @@
 
 槽位随机化用于破坏依赖旧固定数字索引的通用 dump 脚本，不把客户端 ABI 描述为秘密；分析者仍可从单个生成 VM 恢复该次布局。
 
-### 2.9 随机源
+### 2.10 随机源
 
 - prototype keys、salt、XOR seed、64–96 KiB entropy、envelope nonce/record split/物理 shuffle 和随机选择改用操作系统 CSPRNG。
 - 仍需要 `System.Random` 接口的代码生成器、控制流及可选变换，改为使用 CSPRNG seed，避免同一时钟窗口产生相同序列。
 - 清理了不再使用的旧 XOR key 和全局常量映射字段。
 
-### 2.10 Luau/Roblox 反调试与 AntiDump
+### 2.11 Luau/Roblox 反调试与 AntiDump
 
 本轮在上一版 VM-integrated guard 基础上，筛选吸收了附件 `反调试v5.4.txt` 中可移植的分层探针、快照、provenance 和多信号评分思路；没有照搬其破坏性或高误报行为。
 
@@ -133,19 +143,19 @@
 
 这些机制提高动态收集成本，但不是服务端反作弊。所有探针、阈值和诱饵都在客户端，有能力的分析者可以 patch guard、伪造 capability/provenance 返回值，或在 accessor/handler 内收集每个临时块。
 
-### 2.11 EnvironmentLock
+### 2.12 EnvironmentLock
 
 - salt 与最终序列化 seed 的关系已核对：开启时头部写 salt，构建端和运行端都以相同 fingerprint 派生 seed；关闭时头部直接写随机 seed。
 - 完整性验证使用最终 seed，因此错误环境会在正文恢复前失败。
 - EnvironmentLock 是独立、严格的 Roblox 环境锁，固定 CLI 配置不启用它。若库调用方显式开启，预期 fingerprint 和算法仍随客户端交付，可被有能力的攻击者 patch。
 
-### 2.12 line info 与 Linux 工具链
+### 2.13 line info 与 Linux 工具链
 
 - line-info wrapper 的 legacy logical field 从错误的 Chunk 槽 7 修正为逻辑槽 4；v4 生成时该逻辑槽再与其余 Chunk 字段一起映射到随机物理槽。
 - LuaSrcDiet 的 `LUA_PATH` 由 C# 显式设置，不再依赖调用者当前目录。
 - 最终 minifier 非零退出码现在会被当作构建失败。
 
-### 2.13 单一 CLI 配置
+### 2.14 单一 CLI 配置
 
 CLI、Windows 拖放脚本和 GitHub Actions 均取消强度档位，统一使用原 `mid` 的稳定行为：
 
@@ -195,6 +205,9 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | 旧 `--strength` 参数拒绝 | 通过，退出码 2 |
 | prototype-local schema / tag / opcode bank 随机构建 | 通过 |
 | 完整 prototype tag、complete block manifest、constant capsule 的可重封装内层篡改 | 通过，三类均由 v4 内层认证拒绝 |
+| 每 block 五列 framing、非 identity 字段角色排列与 descriptor 驱动精确消费 | 通过，静态 verifier 递归覆盖所有 block |
+| 重算 block/prototype/outer 认证后的 column framing 与 descriptor-consumption 篡改 | 通过，两类均由运行时列解析器拒绝 |
+| columnar runtime 局部名随机化 | 通过，输出无稳定 permutation/column reader 标识符 |
 | Chunk 15 / Block 9 / Flow 4 / FlowCache 3 槽位完整非 identity permutation | 20/20 通过 |
 | 独立构建 runtime ABI 比较及 block aliases 一致性 | 通过，至少一组完整 ABI 变化，Current/Next/Successor aliases 均匹配 |
 | handler 等价模板 / 双 handler leaf 随机结构与 Lua 语法 | 20/20 通过 |
@@ -241,7 +254,7 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 
 `.github/workflows/ci.yml` 在 push、pull request 和手动触发时运行：
 
-- `ubuntu-24.04` 安装 .NET 8 与 PUC Lua 5.1，以 `IB2_RANDOM_RUNS=20` 执行完整 Linux 差分、authenticated entropy envelope、CFG、AntiDump/反调试、临时 block cache、篡改拒绝和泄漏检查套件；
+- `ubuntu-24.04` 安装 .NET 8 与 PUC Lua 5.1，以 `IB2_RANDOM_RUNS=20` 执行完整 Linux 差分、authenticated entropy envelope、每 block columnar IR/字段角色排列、CFG、AntiDump/反调试、临时 block cache、篡改拒绝和泄漏检查套件；
 - 独立 Release publish 矩阵覆盖 `linux-x64`、`win-x64` 和 `osx-arm64`，分别使用当前 GitHub-hosted Linux、Windows 与 macOS runner；
 - build matrix 使用 framework-dependent publish 和 `ContinuousIntegrationBuild=true`，验证三个目标 RID 均能完成 Release 编译；
 - 按当前范围不上传 CI Artifact、不调整现有云端混淆产物策略，也不增加仓库内二进制工具校验。

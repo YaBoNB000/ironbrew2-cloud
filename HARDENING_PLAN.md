@@ -87,6 +87,16 @@
 
 当前验收：prototype/body framing、block metadata/body 和常量 capsule 都不能在仅重算外层 tag 后被无影响修改；被引用常量直到目标块实际进入才恢复。随机回归每次同时检查 Lua 语义和四组非 identity 运行时槽位布局。
 
+### Phase 3.45：每 block columnar IR 与字段角色排列（已完成）
+
+- [x] 将原 row-oriented instruction body 改为 descriptor、opcode、A、B、C 五个逻辑列；每列保留原有 8/16/32 bit 字段宽度并独立 length-frame。
+- [x] 每个 block 由 entry state、prototype K1/K2/K3 与独立 domain 派生 physical-page → logical-role permutation，wire format 不明文保存角色表，并强制结果非 identity。
+- [x] runtime 仅在完整 block manifest 认证后恢复五页角色，使用独立安全 cursor 和 descriptor/type 重建 canonical instruction；现有 opcode handler ABI 不变。
+- [x] parser 严格拒绝 page 越界、重复/缺失角色、非法 descriptor、dummy descriptor 异常及任一列未精确耗尽；新增 helper/page/cursor 标识符全部进入 build-local 名称随机化。
+- [x] 静态 verifier 递归验证所有 block 的排列、framing、descriptor 与精确列长度；重算所有认证后破坏 column framing 或 descriptor consumption 的样本仍由 VM 拒绝。
+
+当前验收：同一 prototype 内各 block 按独立 entry state 派生列角色，稳定 row schema 解析器不再适用；运行语义仍由 canonical handler 执行。IR-native superoperator、完整 block-local opcode dialect 与受限 self-modifying IR 不并入本阶段。
+
 ### Phase 3.5：Luau 反调试与防 dump（已完成）
 
 - [x] 移除旧前置 guard 的“必须存在执行器 API，否则明确报错”行为，将能力探针直接嵌入生成 VM。
