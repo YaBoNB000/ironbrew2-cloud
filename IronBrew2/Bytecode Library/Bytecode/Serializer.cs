@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using IronBrew2.Bytecode_Library.IR;
 using IronBrew2.Obfuscator;
+using IronBrew2.Obfuscator.Control_Flow;
 
 namespace IronBrew2.Bytecode_Library.Bytecode
 {
@@ -14,7 +15,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 	{
 		private const byte FormatVersion = 3;
 		private const byte BasicBlockFeature = 2;
-		private const int MaxBlockInstructions = 24;
+		private const byte DispatcherFlatteningFeature = 4;
+		private const int MaxBlockInstructions = DispatcherFlatteningPlanner.MaxBlockInstructions;
 		private const uint IntegrityDomain = 0xA5C31F27u;
 		private const uint BlockIntegrityDomain = 0x7F4A7C15u;
 		private const uint FlowDomain = 0x6D2B79F5u;
@@ -48,7 +50,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			}
 
 			uint head = _settings.EnvironmentLock ? _context.Binder.Salt : _context.XorSeed;
-			byte flags = (byte)((FormatVersion << 4) | BasicBlockFeature | (_settings.BytecodeCompress ? 1 : 0));
+			byte flags = (byte)((FormatVersion << 4) | BasicBlockFeature | DispatcherFlatteningFeature |
+			                    (_settings.BytecodeCompress ? 1 : 0));
 			// Bind both the format/feature byte and encrypted body. This is tamper/corruption
 			// detection, not a client-side cryptographic trust root.
 			uint integrity = ComputeIntegrity(encrypted, _context.XorSeed, flags);
@@ -288,10 +291,21 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			}
 
 			chunk.UpdateMappings();
-			ControlFlowGraph controlFlow = ControlFlowGraph.Build(chunk, MaxBlockInstructions);
+			DispatcherFlatteningDecision flattening = _settings.ControlFlow
+				? DispatcherFlatteningPlanner.Apply(chunk)
+				: null;
+			if (!_settings.ControlFlow)
+			{
+				chunk.DispatcherFlattened = false;
+				chunk.DispatcherFlatteningReason = "control-flow-disabled";
+			}
+
+			ControlFlowGraph controlFlow = flattening?.Graph ??
+			                                   ControlFlowGraph.Build(chunk, MaxBlockInstructions);
 			var instructionBlocks = controlFlow.Blocks.ToList();
 			if (controlFlow.EntryBlock == null)
 				throw new InvalidOperationException("Prototype has no entry block.");
+			bool dispatcherFlattened = flattening?.IsEligible == true;
 
 			// Every block receives an independent execution state. Successor edges wrap
 			// the destination state with the source state, so a block cannot be entered
@@ -303,6 +317,22 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				uint state;
 				do state = NextState32(); while (!usedBlockStates.Add(state));
 				blockStates.Add(block, state);
+			}
+
+			// Eligible prototypes receive unrelated route tokens. A token is never a
+			// valid linear PC, so each cross-block transfer must be resolved by the VM's
+			// dispatcher before GetInstruction can validate and decode the destination.
+			var blockRoutes = new Dictionary<ControlFlowBlock, uint>(instructionBlocks.Count);
+			var usedRoutes = new HashSet<uint>();
+			if (dispatcherFlattened)
+			{
+				foreach (ControlFlowBlock block in instructionBlocks)
+				{
+					uint route;
+					do route = NextState32();
+					while (route <= (uint)chunk.Instructions.Count || !usedRoutes.Add(route));
+					blockRoutes.Add(block, route);
+				}
 			}
 
 			// Preserve the original linear mutation order. Several comparison/test
@@ -361,6 +391,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 						WriteUInt32Local((uint)chunk.Instructions.Count);
 						WriteUInt32Local((uint)instructionBlocks.Count);
 						WriteUInt32Local(blockStates[controlFlow.EntryBlock] ^ InitialFlowKey(k1, k2, k3));
+						WriteUInt32Local(dispatcherFlattened ? blockRoutes[controlFlow.EntryBlock] : 0u);
 						foreach (ControlFlowBlock block in instructionBlocks)
 						{
 							int start = block.Start;
@@ -386,6 +417,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 							WriteUInt32Local((uint)(start + 1));
 							WriteUInt32Local((uint)count);
+							WriteUInt32Local(dispatcherFlattened ? blockRoutes[block] : 0u);
 							WriteUInt32Local((uint)constantReferences.Count);
 							foreach (int constantIndex in constantReferences.OrderBy(value => value))
 							{

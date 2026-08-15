@@ -102,6 +102,11 @@ namespace IronBrew2.Obfuscator.Control_Flow
 			
 			if (chunkHasCflow)
 				c.Instructions.Insert(0, new Instruction(c, Opcode.NewStack));
+
+			// Marker transforms remain supported, but dispatcher selection is now
+			// automatic and prototype-wide. Apply only metadata after complete safety
+			// analysis; the serializer repeats the analysis after later transforms.
+			DispatcherFlatteningPlanner.Apply(c);
 			
 			foreach (Chunk _c in c.Functions)
 				DoChunk(_c);

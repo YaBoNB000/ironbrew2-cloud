@@ -1,5 +1,6 @@
 using IronBrew2.Bytecode_Library.Bytecode;
 using IronBrew2.Bytecode_Library.IR;
+using IronBrew2.Obfuscator.Control_Flow;
 
 static Chunk NewChunk(params Opcode[] opcodes)
 {
@@ -98,4 +99,61 @@ foreach (Opcode opcode in new[] { Opcode.Eq, Opcode.Lt, Opcode.Le, Opcode.Test, 
     ExpectSuccessors(graph.Blocks[1]);
 }
 
-Console.WriteLine("PASS CFG structural regression");
+// The automatic planner must select an ordinary, unmarked branching prototype.
+{
+    Chunk chunk = NewChunk(Opcode.Eq, Opcode.Jmp, Opcode.Move, Opcode.Return, Opcode.Move, Opcode.Return);
+    Target(chunk, 1, 4);
+    DispatcherFlatteningDecision decision = DispatcherFlatteningPlanner.Apply(chunk);
+    Expect(decision.IsEligible, $"ordinary branch prototype rejected: {decision.Reason}");
+    Expect(chunk.DispatcherFlattened, "eligible prototype was not marked for dispatcher flattening");
+    Expect(decision.Graph.Blocks.Count >= 2, "eligible prototype did not have multiple route blocks");
+}
+
+// Unsupported shapes must fall back atomically instead of receiving a partial
+// route representation.
+{
+    Chunk chunk = NewChunk(Opcode.Eq, Opcode.Move, Opcode.Move, Opcode.Move, Opcode.Move, Opcode.Return);
+    DispatcherFlatteningDecision decision = DispatcherFlatteningPlanner.Apply(chunk);
+    Expect(!decision.IsEligible, "comparison without companion JMP was accepted");
+    Expect(!chunk.DispatcherFlattened, "malformed prototype retained a dispatcher marker");
+    Expect(decision.Reason == "invalid-skip-next-companion", "unexpected malformed-comparison fallback reason");
+}
+{
+    Chunk chunk = NewChunk(Opcode.Move, Opcode.Move, Opcode.Move, Opcode.Move, Opcode.Move, Opcode.Return);
+    DispatcherFlatteningDecision decision = DispatcherFlatteningPlanner.Apply(chunk);
+    Expect(!decision.IsEligible && decision.Reason == "single-block", "single-block fallback failed");
+}
+
+// SETLIST's data word is supported when complete and rejected when truncated.
+{
+    Chunk chunk = NewChunk(Opcode.SetList, Opcode.Move, Opcode.Move, Opcode.Move, Opcode.Move, Opcode.Return);
+    chunk.Instructions[0].C = 0;
+    chunk.Instructions[1].InstructionType = InstructionType.Data;
+    DispatcherFlatteningDecision decision = DispatcherFlatteningPlanner.Apply(chunk);
+    Expect(decision.IsEligible, $"valid SETLIST data word rejected: {decision.Reason}");
+}
+{
+    Chunk chunk = NewChunk(Opcode.SetList, Opcode.Move, Opcode.Move, Opcode.Move, Opcode.Move, Opcode.Return);
+    chunk.Instructions[0].C = 0;
+    DispatcherFlatteningDecision decision = DispatcherFlatteningPlanner.Apply(chunk);
+    Expect(!decision.IsEligible && decision.Reason == "invalid-setlist-data-word", "truncated SETLIST fallback failed");
+}
+
+// Closure upvalue pseudo instructions are analyzed as one complete shape. This
+// remains eligible even when later serializer paging puts bindings in a new block.
+{
+    Chunk child = NewChunk(Opcode.Return);
+    child.UpvalueCount = 1;
+    Chunk chunk = NewChunk(Opcode.Closure, Opcode.Move, Opcode.Eq, Opcode.Jmp, Opcode.Move, Opcode.Return, Opcode.Return);
+    chunk.Functions.Add(child);
+    chunk.Instructions[0].RefOperands[0] = child;
+    Target(chunk, 3, 6);
+    DispatcherFlatteningDecision decision = DispatcherFlatteningPlanner.Apply(chunk);
+    Expect(decision.IsEligible, $"valid closure bindings rejected: {decision.Reason}");
+
+    chunk.Instructions[1].OpCode = Opcode.Add;
+    decision = DispatcherFlatteningPlanner.Apply(chunk);
+    Expect(!decision.IsEligible && decision.Reason == "invalid-closure-binding", "invalid closure binding fallback failed");
+}
+
+Console.WriteLine("PASS CFG and dispatcher planner regression");

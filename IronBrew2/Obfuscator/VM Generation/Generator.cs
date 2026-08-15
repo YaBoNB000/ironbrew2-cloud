@@ -659,7 +659,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
 				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier",
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
-				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock"
+				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
+				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock"
 			};
 			string[] luaKws = {"and","break","do","else","elseif","end","false","for","function","if","in","local","nil","not","or","repeat","return","then","true","until","while"};
 			var idents = new Dictionary<string,string>();
@@ -877,9 +878,11 @@ for StepIndex = 1, 5 do
         BlockCount = gBits32();
         Chunk[11] = BlockCount;
         Chunk[12] = gBits32();
+        InitialRouteToken = gBits32();
         for BlockIndex = 1, BlockCount do
             local BlockStart = gBits32();
             local Count = gBits32();
+            local RouteToken = gBits32();
             local RefCount = gBits32();
             local References = {};
             for ReferenceIndex = 1, RefCount do References[ReferenceIndex] = gBits32(); end;
@@ -892,9 +895,14 @@ for StepIndex = 1, 5 do
                 Successors[SuccessorStart] = gBits32();
             end;
             local Length = gBits32();
-            local Block = {BlockStart, Count, Sub(ByteString, Pos, Pos + Length - 1), References, Successors, Verifier, BlockTag};
+            local Block = {BlockStart, Count, Sub(ByteString, Pos, Pos + Length - 1), References, Successors, Verifier, BlockTag, RouteToken};
             Pos = Pos + Length;
             Blocks[BlockIndex] = Block;
+            if RouteToken ~= 0 then
+                if RouteToken <= InstrCount or Dispatcher[RouteToken] then error('invalid protected payload', 0); end;
+                Dispatcher[RouteToken] = BlockStart;
+                RouteCount = RouteCount + 1;
+            end;
             for Offset = 0, Count - 1 do BlockMap[BlockStart + Offset] = Block; end;
         end;
     elseif (Step == 3) then
@@ -909,6 +917,13 @@ for StepIndex = 1, 5 do
         for Idx = 1, gBits32() do Lines[Idx] = gBits32(); end;");
 
 			vm += T(@"    end;
+end;
+
+if InitialRouteToken ~= 0 then
+    if RouteCount ~= BlockCount or Dispatcher[InitialRouteToken] ~= 1 then error('invalid protected payload', 0); end;
+    Chunk[13], Chunk[14] = Dispatcher, InitialRouteToken;
+elseif RouteCount ~= 0 then
+    error('invalid protected payload', 0);
 end;
 
 for BlockIndex = 1, BlockCount do
@@ -1018,6 +1033,31 @@ local function GetInstruction(Chunk, Index, Flow)
     Inst = Chunk[1][Index];
     if not Inst then error('invalid protected payload', 0); end;
     return Inst;
+end;
+
+-- For selected prototypes InstrPoint is a random route token at every basic-
+-- block boundary. Sequential execution remains linear only inside one block.
+local function ResolveInstructionPoint(Chunk, Value, Flow)
+    local Dispatcher = Chunk[13];
+    if not Dispatcher then return Value; end;
+    local Routed = Dispatcher[Value];
+    if Routed then return Routed; end;
+    local Block = Chunk[10] and Chunk[10][Value];
+    if Block and Block == Flow[2] and Value == Flow[1] + 1 then return Value; end;
+    error('invalid protected payload', 0);
+end;
+
+local function NextInstructionPoint(Chunk, Index, Flow)
+    local Dispatcher = Chunk[13];
+    if not Dispatcher then return Index; end;
+    local NextBlock = Chunk[10] and Chunk[10][Index];
+    if not NextBlock then error('invalid protected payload', 0); end;
+    if NextBlock ~= Flow[2] or Index ~= Flow[1] + 1 then
+        local RouteToken = NextBlock[8];
+        if not RouteToken or Dispatcher[RouteToken] ~= NextBlock[1] then error('invalid protected payload', 0); end;
+        return RouteToken;
+    end;
+    return Index;
 end;");
 
 			vm += T(settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2));

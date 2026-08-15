@@ -21,6 +21,12 @@ namespace IronBrew2.Bytecode_Library.IR
 		public List<Chunk>                  Functions;
 		public Dictionary<Chunk, int>       FunctionMap = new Dictionary<Chunk, int>();
 		public List<string>                 Upvalues;
+
+		// Set by the conservative control-flow planner. The serializer revalidates
+		// this decision after all other transforms, so unsupported prototypes fall
+		// back without receiving a partial dispatcher representation.
+		public bool                         DispatcherFlattened;
+		public string                       DispatcherFlatteningReason = "not-analyzed";
 		
 		public void UpdateMappings()
 		{

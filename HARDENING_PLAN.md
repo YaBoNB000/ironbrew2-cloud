@@ -55,14 +55,14 @@
 
 - [x] 在 serializer 侧建立稳定 basic-block leader 与有界分区，供按需解码使用。
 - [x] 在 IR 上补全显式 CFG edge / predecessor 模型，并实际用于 wire successor records 与状态变换。
-- [ ] 自动选择安全函数做 dispatcher flattening，不要求源码 marker。
+- [x] 自动选择安全 prototype 做 route-state dispatcher flattening，不要求源码 marker；跨 basic-block 转移先变为随机状态 token，再由 invocation-local dispatcher 恢复目标入口。
 - [x] descriptor、opcode 与 operand mask 绑定每个基本块的独立随机入口状态；opcode 只在带当前状态的 dispatch 中恢复。
 - [x] 每条合法 edge 包装目标块状态；每次 closure invocation 使用独立 `Flow`，块内只允许顺序取指，跨块只允许已认证的目标块入口。
 - [x] 正确建模循环、自环、多前驱、comparison/Test/TForLoop companion JMP、`FORPREP` 优化、`LOADBOOL` skip、`SETLIST C==0` data word、Closure 伪指令和终止路径。
 - [x] 每个 opaque block 在首次解码前以入口状态、块范围、prototype keys 和 body 内容做完整性认证。
 - [ ] superoperator 基于 IR 生成并做语义验证，不用 handler 源码正则作为主实现。
 
-当前验收：v3 指令不能只按 PC 独立解码；缺失 edge、被修改的初始/边状态、错误目标入口和 block body 篡改都会以 `invalid protected payload` 拒绝。CFG 结构测试覆盖循环/自环、comparison companion、FORPREP/FORLOOP、skip-next、data word 和 24 条分页；运行测试覆盖递归 invocation、跨块 Closure 伪指令与合法多分支执行。dispatcher flattening 与 IR-native superoperator 仍是后续独立项目，不属于本次已完成范围。
+当前验收：v3 指令不能只按 PC 独立解码；缺失 edge、被修改的初始/边状态、dispatcher state、错误目标入口和 block body 篡改都会以 `invalid protected payload` 拒绝。CFG 结构测试覆盖循环/自环、comparison companion、FORPREP/FORLOOP、skip-next、data word 和 24 条分页；运行测试覆盖无 marker 自动命中、单块及畸形 prototype 安全回退、递归 invocation、跨块 Closure 伪指令与合法多分支执行。自动 dispatcher flattening 已完成，IR-native superoperator 仍是后续独立项目。
 
 ### Phase 4：Luau、性能和发布体系
 

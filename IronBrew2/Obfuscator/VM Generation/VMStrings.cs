@@ -168,7 +168,7 @@ local __ib2Tag = Byte(ByteString, 5, 5)
 local __ib2Flags = Byte(ByteString, 9, 9);
 local __ib2Features = __ib2Flags % 16;
 local __ib2Version = (__ib2Flags - __ib2Features) / 16;
-if __ib2Version ~= 3 or __ib2Features < 2 or __ib2Features > 3 then error('invalid protected payload', 0); end;
+if __ib2Version ~= 3 or __ib2Features < 6 or __ib2Features > 7 then error('invalid protected payload', 0); end;
 __IB2_SEED__
 
 -- 在解密前验证密文，检测损坏和直接 patch。客户端校验不是不可绕过的信任根。
@@ -343,6 +343,9 @@ local function Deserialize()
     local Blocks = {};
     local BlockMap = {};
     local BlockCount = 0;
+    local Dispatcher = {};
+    local RouteCount = 0;
+    local InitialRouteToken = 0;
     Chunk[9], Chunk[10] = Blocks, BlockMap;
 ";
 		
@@ -362,7 +365,7 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Params = Params;
 
 		local _R = _R
-		local InstrPoint = 1;
+		local InstrPoint = Chunk[14] or 1;
 		local Flow = {};
 		local Top = -1;
 
@@ -388,6 +391,7 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Enum;	
 
 		while true do
+			InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
 			Inst		= GetInstruction(Chunk, InstrPoint, Flow);
 			Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 
@@ -407,7 +411,7 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Params = Params;
 
 		local _R = _R
-		local InstrPoint = 1;
+		local InstrPoint = Chunk[14] or 1;
 		local Flow = {};
 		local Top = -1;
 
@@ -433,11 +437,13 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Enum;	
 
 		repeat
+			InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
 			Inst		= GetInstruction(Chunk, InstrPoint, Flow);
 			Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 
 		public static string VMP3 = @"
 			InstrPoint	= InstrPoint + 1;
+			InstrPoint = NextInstructionPoint(Chunk, InstrPoint, Flow);
 		end;
     end;
 end;	
@@ -448,6 +454,7 @@ end)()(...);
 ";
 		public static string VMP3_R = @"
 			InstrPoint	= InstrPoint + 1;
+			InstrPoint = NextInstructionPoint(Chunk, InstrPoint, Flow);
 		until false;
     end;
 end;	
@@ -468,7 +475,7 @@ local function Wrap(Chunk, Upvalues, Env)
 	local OpcodeBank = Chunk[8];
 
 	return function(...)
-		local InstrPoint = 1;
+		local InstrPoint = Chunk[14] or 1;
 		local Flow = {};
 		local Top = -1;
 
@@ -501,6 +508,7 @@ local function Wrap(Chunk, Upvalues, Env)
 			local Enum;	
 
 			while true do
+				InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
 				Inst		= GetInstruction(Chunk, InstrPoint, Flow);
 				Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 		
@@ -516,7 +524,7 @@ local function Wrap(Chunk, Upvalues, Env)
 	local OpcodeBank = Chunk[8];
 
 	return function(...)
-		local InstrPoint = 1;
+		local InstrPoint = Chunk[14] or 1;
 		local Flow = {};
 		local Top = -1;
 
@@ -549,11 +557,13 @@ local function Wrap(Chunk, Upvalues, Env)
 			local Enum;	
 
 			repeat
+				InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
 				Inst		= GetInstruction(Chunk, InstrPoint, Flow);
 				Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 		
 		public static string VMP3_LI = @"
 				InstrPoint	= InstrPoint + 1;
+				InstrPoint = NextInstructionPoint(Chunk, InstrPoint, Flow);
 			end;
 		end;
 
@@ -573,6 +583,7 @@ end)()(...);
 ";
 		public static string VMP3_LI_R = @"
 				InstrPoint	= InstrPoint + 1;
+				InstrPoint = NextInstructionPoint(Chunk, InstrPoint, Flow);
 			until false;
 		end;
 

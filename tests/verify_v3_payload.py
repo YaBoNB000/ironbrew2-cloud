@@ -56,8 +56,8 @@ def main() -> int:
     features = flags & 0x0F
     if version != 3:
         raise SystemExit(f"expected payload version 3, found {version}")
-    if features not in (2, 3):
-        raise SystemExit(f"unexpected v3 feature bits: {features}")
+    if features not in (6, 7):
+        raise SystemExit(f"unexpected v3 feature bits (block flow + dispatcher required): {features}")
     print(f"PASS generated payload header: v{version}, features={features}")
     return 0
 

@@ -50,6 +50,66 @@ python3 tests/verify_v3_payload.py "$WORK/fixed.lua"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
 
+# semantic.lua contains no IB_MAX_CFLOW markers. Assert that its root prototype
+# was nevertheless selected and received a complete random route-state map.
+python3 - "$ROOT/temp/t2.lua" "$WORK/automatic-dispatch.lua" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1]).read_text("latin1")
+pattern = re.compile(
+    r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
+)
+match = pattern.search(source)
+if not match:
+    raise SystemExit("could not locate the generated root prototype")
+root = match.group(2)
+probe = (
+    "do local d=" + root + "[13];local s=" + root + "[14];"
+    "assert(type(d)=='table' and type(s)=='number' and d[s]==1);"
+    "local n=0;for _ in pairs(d) do n=n+1;end;assert(n>=2);end;\n"
+)
+source = source[:match.end(1)] + probe + source[match.end(1):]
+Path(sys.argv[2]).write_text(source, "latin1")
+PY
+"$LUAC" -p "$WORK/automatic-dispatch.lua"
+"$LUA" "$WORK/automatic-dispatch.lua" > "$WORK/automatic-dispatch.out"
+cmp "$WORK/baseline.out" "$WORK/automatic-dispatch.out"
+echo "PASS automatic dispatcher selection without source markers"
+
+# A tiny straight-line prototype has no useful block transition to flatten. It
+# must retain the ordinary PC path and contain no partial dispatcher metadata.
+printf '%s\n' 'print(1 + 2)' > "$WORK/dispatcher-fallback.lua"
+"$LUA" "$WORK/dispatcher-fallback.lua" > "$WORK/dispatcher-fallback-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" "$WORK/dispatcher-fallback.lua" > "$WORK/dispatcher-fallback-build.log"
+mv out.lua "$WORK/dispatcher-fallback-obfuscated.lua"
+python3 - "$ROOT/temp/t2.lua" "$WORK/dispatcher-fallback-instrumented.lua" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1]).read_text("latin1")
+pattern = re.compile(
+    r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
+)
+match = pattern.search(source)
+if not match:
+    raise SystemExit("could not locate the generated root prototype")
+root = match.group(2)
+probe = "assert(" + root + "[13]==nil and " + root + "[14]==nil);\n"
+source = source[:match.end(1)] + probe + source[match.end(1):]
+Path(sys.argv[2]).write_text(source, "latin1")
+PY
+"$LUAC" -p "$WORK/dispatcher-fallback-obfuscated.lua"
+"$LUAC" -p "$WORK/dispatcher-fallback-instrumented.lua"
+"$LUA" "$WORK/dispatcher-fallback-instrumented.lua" > "$WORK/dispatcher-fallback.out"
+cmp "$WORK/dispatcher-fallback-baseline.out" "$WORK/dispatcher-fallback.out"
+echo "PASS unsupported dispatcher shape falls back without partial metadata"
+
 # Repeat randomized prototype keys, opcode maps and schema orders.
 for ((i = 1; i <= RANDOM_RUNS; i++)); do
     obfuscate "$WORK/random.lua"
@@ -85,6 +145,7 @@ probes = {
         "b[3]=string.char((string.byte(b[3],1)+1)%256)..string.sub(b[3],2);end;\n"
     ),
     "initial-state": root + "[12]=(" + root + "[12]+1)%4294967296;\n",
+    "dispatcher-state": root + "[14]=1;\n",
     "missing-edge": (
         "do local b;for _,v in pairs(" + root + "[9]) do if v[1]==1 then b=v;break;end;end;"
         "assert(b and next(b[5]));b[5]={};end;\n"
@@ -99,7 +160,7 @@ for name, probe in probes.items():
     modified = source[:match.end(1)] + probe + source[match.end(1):]
     (out_dir / ("flow-" + name + ".lua")).write_text(modified, "latin1")
 PY
-for flow_case in block-body initial-state missing-edge wrapped-edge-state; do
+for flow_case in block-body initial-state dispatcher-state missing-edge wrapped-edge-state; do
     flow_file="$WORK/flow-$flow_case.lua"
     "$LUAC" -p "$flow_file"
     set +e
