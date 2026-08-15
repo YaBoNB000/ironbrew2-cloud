@@ -12,10 +12,12 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 {
 	public class Serializer
 	{
-		private const byte FormatVersion = 2;
+		private const byte FormatVersion = 3;
 		private const byte BasicBlockFeature = 2;
 		private const int MaxBlockInstructions = 24;
 		private const uint IntegrityDomain = 0xA5C31F27u;
+		private const uint BlockIntegrityDomain = 0x7F4A7C15u;
+		private const uint FlowDomain = 0x6D2B79F5u;
 
 		private readonly ObfuscationContext _context;
 		private readonly ObfuscationSettings _settings;
@@ -28,7 +30,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		}
 
 		/// <summary>
-		/// v2 顶层格式（固定 9 字节头）：
+		/// v3 顶层格式（固定 9 字节头）：
 		///   head/salt 4B | integrity tag 4B | version+flags 1B | encrypted body
 		/// K1/K2/K3 不再出现在明文头，而是每个 prototype 独立生成并放入加密正文。
 		/// </summary>
@@ -83,65 +85,55 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			(uint)(OperandMask16(pc, k1, k2, k3, slot) |
 			       (OperandMask16(pc, k1, k2, k3, slot + 4) << 16));
 
-		/// <summary>
-		/// Partitions a prototype into stable control-flow blocks before opcode mutation.
-		/// Jump destinations and the instruction following each transfer are leaders.
-		/// Lua's comparison/test/TForLoop companion JMP consequently becomes its own
-		/// opaque block and is not decoded merely because the comparison executes.
-		/// </summary>
-		private static List<(int Start, int Count)> BuildInstructionBlocks(Chunk chunk)
+		private static uint NextState32()
 		{
-			int instructionCount = chunk.Instructions.Count;
-			var leaders = new HashSet<int> {0};
-
-			for (int index = 0; index < instructionCount; index++)
+			uint state;
+			do
 			{
-				Instruction instruction = chunk.Instructions[index];
-				foreach (object operand in instruction.RefOperands)
-				{
-					if (operand is Instruction target && chunk.InstructionMap.TryGetValue(target, out int targetIndex))
-						leaders.Add(targetIndex);
-				}
-
-				bool endsBlock = instruction.OpCode == Opcode.Jmp ||
-				                 instruction.OpCode == Opcode.ForLoop ||
-				                 instruction.OpCode == Opcode.ForPrep ||
-				                 instruction.OpCode == Opcode.Eq ||
-				                 instruction.OpCode == Opcode.Lt ||
-				                 instruction.OpCode == Opcode.Le ||
-				                 instruction.OpCode == Opcode.Test ||
-				                 instruction.OpCode == Opcode.TestSet ||
-				                 instruction.OpCode == Opcode.TForLoop ||
-				                 instruction.OpCode == Opcode.Return ||
-				                 instruction.OpCode == Opcode.TailCall ||
-				                 (instruction.OpCode == Opcode.LoadBool && instruction.C != 0);
-				if (endsBlock && index + 1 < instructionCount)
-					leaders.Add(index + 1);
-
-				// LOADBOOL with C != 0 skips the following instruction without an
-				// explicit JMP, so its actual successor must also start a block.
-				if (instruction.OpCode == Opcode.LoadBool && instruction.C != 0 && index + 2 < instructionCount)
-					leaders.Add(index + 2);
-			}
-
-			// Bound long straight-line regions as independent lazy pages. These extra
-			// leaders only subdivide a basic block and never merge CFG boundaries.
-			for (int index = MaxBlockInstructions; index < instructionCount; index += MaxBlockInstructions)
-				leaders.Add(index);
-
-			int[] ordered = leaders.Where(value => value >= 0 && value < instructionCount).OrderBy(value => value).ToArray();
-			var blocks = new List<(int Start, int Count)>(ordered.Length);
-			for (int index = 0; index < ordered.Length; index++)
-			{
-				int start = ordered[index];
-				int end = index + 1 < ordered.Length ? ordered[index + 1] : instructionCount;
-				if (end > start)
-					blocks.Add((start, end - start));
-			}
-			return blocks;
+				state = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(sizeof(uint)), 0);
+			} while (state == 0);
+			return state;
 		}
 
-		private static void ShuffleBlocks(List<(int Start, int Count)> blocks)
+		private static uint InitialFlowKey(ushort k1, ushort k2, ushort k3)
+		{
+			uint value = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3 + FlowDomain);
+			return unchecked(value * 1664525u + 1013904223u);
+		}
+
+		private static uint FlowKey(uint entryState, int fromPc, int toPc, ushort k1, ushort k2, ushort k3)
+		{
+			uint value = unchecked(entryState * 1664525u + (uint)fromPc * 257u +
+			                       (uint)toPc * 65537u + (uint)k1 * 251u +
+			                       (uint)k2 * 17u + k3 + FlowDomain);
+			return unchecked(value * 1664525u + 1013904223u);
+		}
+
+		private static uint FlowVerifier(uint entryState, int blockStart, ushort k1, ushort k2, ushort k3) =>
+			FlowKey(entryState, blockStart, blockStart ^ 0x5A5A, k1, k2, k3);
+
+		private static ushort BlockFieldMask(uint entryState, int pc, int slot, ushort k1, ushort k2, ushort k3)
+		{
+			uint low = entryState & 0xFFFFu;
+			uint high = entryState >> 16;
+			return (ushort)((low * (uint)((pc + slot * 29) % 251 + 1) + high * 17u +
+			                 (uint)k1 * 13u + (uint)k2 * 7u + k3 + (uint)slot * 911u) & 0xFFFFu);
+		}
+
+		private static uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
+			ushort k1, ushort k2, ushort k3)
+		{
+			uint hash = unchecked((entryState ^ BlockIntegrityDomain) * 31u + (uint)start);
+			hash = unchecked(hash * 31u + (uint)count);
+			hash = unchecked(hash * 31u + k1);
+			hash = unchecked(hash * 31u + k2);
+			hash = unchecked(hash * 31u + k3);
+			foreach (byte value in body)
+				hash = unchecked(hash * 31u + value);
+			return hash;
+		}
+
+		private static void ShuffleBlocks(List<ControlFlowBlock> blocks)
 		{
 			for (int index = blocks.Count - 1; index > 0; index--)
 			{
@@ -237,11 +229,13 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				}
 			}
 
-			void SerializeInstruction(Instruction instruction, int zeroBasedIndex)
+			void SerializeInstruction(Instruction instruction, int zeroBasedIndex, uint entryState)
 			{
+				int pc = zeroBasedIndex + 1;
+				byte descriptorMask = (byte)BlockFieldMask(entryState, pc, 7, k1, k2, k3);
 				if (instruction.InstructionType == InstructionType.Data)
 				{
-					WriteByte(1);
+					WriteByte((byte)(1 ^ descriptorMask));
 					return;
 				}
 
@@ -254,39 +248,62 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 				opcode = opcodeToLocal[opcode];
 
-				int pc = zeroBasedIndex + 1;
 				int type = (int)instruction.InstructionType;
 				int constantMask = (int)instruction.ConstantMask;
-				WriteByte((byte)((type << 1) | (constantMask << 3)));
+				WriteByte((byte)(((type << 1) | (constantMask << 3)) ^ descriptorMask));
 
-				ushort storedOpcode = (ushort)((ushort)opcode ^ OpcodeMask(pc, k1, k2, k3));
-				ushort storedA = (ushort)((ushort)instruction.A ^ OperandMask16(pc, k1, k2, k3, 1));
+				ushort storedOpcode = (ushort)((ushort)opcode ^ OpcodeMask(pc, k1, k2, k3) ^
+				                               BlockFieldMask(entryState, pc, 0, k1, k2, k3));
+				ushort storedA = (ushort)((ushort)instruction.A ^ OperandMask16(pc, k1, k2, k3, 1) ^
+				                          BlockFieldMask(entryState, pc, 1, k1, k2, k3));
 				WriteUInt16Local(storedOpcode);
 				WriteUInt16Local(storedA);
+
+				uint BlockMask32(int slot) =>
+					(uint)(BlockFieldMask(entryState, pc, slot, k1, k2, k3) |
+					       (BlockFieldMask(entryState, pc, slot + 4, k1, k2, k3) << 16));
 
 				int b = instruction.B;
 				int c = instruction.C;
 				switch (instruction.InstructionType)
 				{
 					case InstructionType.AsBx:
-						WriteUInt32Local(unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2));
+						WriteUInt32Local(unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
 						break;
 					case InstructionType.AsBxC:
-						WriteUInt32Local(unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2));
-						WriteUInt16Local((ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3)));
+						WriteUInt32Local(unchecked((uint)(b + (1 << 16))) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
+						WriteUInt16Local((ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3) ^
+						                              BlockFieldMask(entryState, pc, 3, k1, k2, k3)));
 						break;
 					case InstructionType.ABC:
-						WriteUInt16Local((ushort)((ushort)b ^ OperandMask16(pc, k1, k2, k3, 2)));
-						WriteUInt16Local((ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3)));
+						WriteUInt16Local((ushort)((ushort)b ^ OperandMask16(pc, k1, k2, k3, 2) ^
+						                              BlockFieldMask(entryState, pc, 2, k1, k2, k3)));
+						WriteUInt16Local((ushort)((ushort)c ^ OperandMask16(pc, k1, k2, k3, 3) ^
+						                              BlockFieldMask(entryState, pc, 3, k1, k2, k3)));
 						break;
 					case InstructionType.ABx:
-						WriteUInt32Local(unchecked((uint)b) ^ OperandMask32(pc, k1, k2, k3, 2));
+						WriteUInt32Local(unchecked((uint)b) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
 						break;
 				}
 			}
 
 			chunk.UpdateMappings();
-			List<(int Start, int Count)> instructionBlocks = BuildInstructionBlocks(chunk);
+			ControlFlowGraph controlFlow = ControlFlowGraph.Build(chunk, MaxBlockInstructions);
+			var instructionBlocks = controlFlow.Blocks.ToList();
+			if (controlFlow.EntryBlock == null)
+				throw new InvalidOperationException("Prototype has no entry block.");
+
+			// Every block receives an independent execution state. Successor edges wrap
+			// the destination state with the source state, so a block cannot be entered
+			// or decoded using only its linear PC.
+			var blockStates = new Dictionary<ControlFlowBlock, uint>(instructionBlocks.Count);
+			var usedBlockStates = new HashSet<uint>();
+			foreach (ControlFlowBlock block in instructionBlocks)
+			{
+				uint state;
+				do state = NextState32(); while (!usedBlockStates.Add(state));
+				blockStates.Add(block, state);
+			}
 
 			// Preserve the original linear mutation order. Several comparison/test
 			// opcodes consume the following JMP's still-relative B operand while
@@ -343,13 +360,17 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 					case ChunkStep.Instructions:
 						WriteUInt32Local((uint)chunk.Instructions.Count);
 						WriteUInt32Local((uint)instructionBlocks.Count);
-						foreach ((int start, int count) in instructionBlocks)
+						WriteUInt32Local(blockStates[controlFlow.EntryBlock] ^ InitialFlowKey(k1, k2, k3));
+						foreach (ControlFlowBlock block in instructionBlocks)
 						{
+							int start = block.Start;
+							int count = block.Count;
+							uint entryState = blockStates[block];
 							var blockBody = new List<byte>();
 							List<byte> savedOutput = output;
 							output = blockBody;
 							for (int offset = 0; offset < count; offset++)
-								SerializeInstruction(chunk.Instructions[start + offset], start + offset);
+								SerializeInstruction(chunk.Instructions[start + offset], start + offset, entryState);
 							output = savedOutput;
 
 							// Bind each opaque block only to the constants it can resolve. This
@@ -372,6 +393,19 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 									throw new InvalidOperationException("Invalid block constant reference.");
 								WriteUInt32Local((uint)constantIndex);
 							}
+
+							WriteUInt32Local(FlowVerifier(entryState, start + 1, k1, k2, k3));
+							WriteUInt32Local(ComputeBlockIntegrity(blockBody.ToArray(), entryState, start + 1, count, k1, k2, k3));
+							WriteUInt32Local((uint)block.Successors.Count);
+							foreach (ControlFlowBlock successor in block.Successors.OrderBy(value => value.Start))
+							{
+								int successorStart = successor.Start + 1;
+								uint wrappedState = blockStates[successor] ^
+								                    FlowKey(entryState, block.EndExclusive, successorStart, k1, k2, k3);
+								WriteUInt32Local((uint)successorStart);
+								WriteUInt32Local(wrappedState);
+							}
+
 							WriteUInt32Local((uint)blockBody.Count);
 							output.AddRange(blockBody);
 						}

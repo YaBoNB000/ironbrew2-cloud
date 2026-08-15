@@ -51,16 +51,18 @@
 
 当前验收状态：字段 schema、常量 tag 和 opcode bank 均由各 prototype 的 K1/K2/K3 加独立 domain 派生，通用解析器不能只恢复一次全局 schema/opcode 表后解析所有 prototype。handler 会按安全顶层 statement 边界选择 raw、`do` scope、恒真 guard 或 prefix/suffix 嵌套模板；dispatch 的双 handler leaf 也会在 `>`、`==`、`~=` 和嵌套 guard 形式间变化。prototype 和 basic-block 两级延迟恢复均已启用，自动测试通过运行时探针确认程序开始执行后仍存在未解码的 opaque block。
 
-### Phase 3：真实 CFG 与执行状态耦合
+### Phase 3：真实 CFG 与执行状态耦合（核心状态协议已完成）
 
 - [x] 在 serializer 侧建立稳定 basic-block leader 与有界分区，供按需解码使用。
-- [ ] 在 IR 上补全显式 CFG edge / predecessor 模型，并用于后续状态变换。
+- [x] 在 IR 上补全显式 CFG edge / predecessor 模型，并实际用于 wire successor records 与状态变换。
 - [ ] 自动选择安全函数做 dispatcher flattening，不要求源码 marker。
-- [ ] bank/operand mask 与基本块入口状态绑定。
-- [ ] 正确处理循环、多前驱、比较指令 skip-next、闭包附加指令和异常路径。
+- [x] descriptor、opcode 与 operand mask 绑定每个基本块的独立随机入口状态；opcode 只在带当前状态的 dispatch 中恢复。
+- [x] 每条合法 edge 包装目标块状态；每次 closure invocation 使用独立 `Flow`，块内只允许顺序取指，跨块只允许已认证的目标块入口。
+- [x] 正确建模循环、自环、多前驱、comparison/Test/TForLoop companion JMP、`FORPREP` 优化、`LOADBOOL` skip、`SETLIST C==0` data word、Closure 伪指令和终止路径。
+- [x] 每个 opaque block 在首次解码前以入口状态、块范围、prototype keys 和 body 内容做完整性认证。
 - [ ] superoperator 基于 IR 生成并做语义验证，不用 handler 源码正则作为主实现。
 
-验收：线性反汇编不能只按 PC 独立解码；错误控制流状态会触发完整性失败。
+当前验收：v3 指令不能只按 PC 独立解码；缺失 edge、被修改的初始/边状态、错误目标入口和 block body 篡改都会以 `invalid protected payload` 拒绝。CFG 结构测试覆盖循环/自环、comparison companion、FORPREP/FORLOOP、skip-next、data word 和 24 条分页；运行测试覆盖递归 invocation、跨块 Closure 伪指令与合法多分支执行。dispatcher flattening 与 IR-native superoperator 仍是后续独立项目，不属于本次已完成范围。
 
 ### Phase 4：Luau、性能和发布体系
 

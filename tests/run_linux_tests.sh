@@ -26,13 +26,14 @@ export DOTNET_NOLOGO=1
 
 WORK=$(mktemp -d /tmp/ib2-tests.XXXXXX)
 cleanup() {
-    rm -rf "$WORK" "$ROOT/temp" "$ROOT/out.lua"
+    rm -rf "$WORK" "$ROOT/temp" "$ROOT/out.lua" "$ROOT/luac.out"
 }
 trap cleanup EXIT
 
 cd "$ROOT"
 "$DOTNET" build "IronBrew2 CLI/IronBrew2 CLI.csproj" -c Release --nologo >/dev/null
 CLI="$ROOT/IronBrew2 CLI/bin/Release/net8.0/IronBrew2 CLI.dll"
+"$DOTNET" run --project tests/cfg_regression/cfg_regression.csproj --configuration Debug --nologo
 "$LUA" tests/semantic.lua > "$WORK/baseline.out"
 
 obfuscate() {
@@ -44,6 +45,7 @@ obfuscate() {
 }
 
 obfuscate "$WORK/fixed.lua"
+python3 tests/verify_v3_payload.py "$WORK/fixed.lua"
 "$LUA" "$WORK/fixed.lua" > "$WORK/fixed.out"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
@@ -55,6 +57,71 @@ for ((i = 1; i <= RANDOM_RUNS; i++)); do
     cmp -s "$WORK/baseline.out" "$WORK/random.out"
 done
 echo "PASS randomized runs: $RANDOM_RUNS/$RANDOM_RUNS"
+
+# Tamper with v3's invocation-local flow metadata only after the outer payload
+# has been authenticated and deserialized. These probes target the unminified
+# generated VM so each rejection is attributable to block/flow validation, not
+# to the top-level encrypted-payload checksum.
+python3 - "$ROOT/temp/t2.lua" "$WORK" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1]).read_text("latin1")
+out_dir = Path(sys.argv[2])
+pattern = re.compile(
+    r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
+)
+match = pattern.search(source)
+if not match:
+    raise SystemExit("could not locate the generated root prototype")
+root = match.group(2)
+
+probes = {
+    "block-body": (
+        "do local b;for _,v in pairs(" + root + "[9]) do if v[1]==1 then b=v;break;end;end;"
+        "assert(b and type(b[3])=='string' and #b[3]>0);"
+        "b[3]=string.char((string.byte(b[3],1)+1)%256)..string.sub(b[3],2);end;\n"
+    ),
+    "initial-state": root + "[12]=(" + root + "[12]+1)%4294967296;\n",
+    "missing-edge": (
+        "do local b;for _,v in pairs(" + root + "[9]) do if v[1]==1 then b=v;break;end;end;"
+        "assert(b and next(b[5]));b[5]={};end;\n"
+    ),
+    "wrapped-edge-state": (
+        "do local b;for _,v in pairs(" + root + "[9]) do if v[1]==1 then b=v;break;end;end;"
+        "assert(b);local changed=false;for k,v in pairs(b[5]) do b[5][k]=(v+1)%4294967296;changed=true;break;end;"
+        "assert(changed);end;\n"
+    ),
+}
+for name, probe in probes.items():
+    modified = source[:match.end(1)] + probe + source[match.end(1):]
+    (out_dir / ("flow-" + name + ".lua")).write_text(modified, "latin1")
+PY
+for flow_case in block-body initial-state missing-edge wrapped-edge-state; do
+    flow_file="$WORK/flow-$flow_case.lua"
+    "$LUAC" -p "$flow_file"
+    set +e
+    "$LUA" "$flow_file" > "$WORK/flow-$flow_case.stdout" 2> "$WORK/flow-$flow_case.stderr"
+    flow_code=$?
+    set -e
+    [[ $flow_code -ne 0 ]]
+    grep -Fq 'invalid protected payload' "$WORK/flow-$flow_case.stderr"
+done
+echo "PASS block body and flow edge/state tamper rejection"
+
+# Force a CLOSURE and its 30 pseudo upvalue-binding instructions across the
+# 24-instruction page boundary. OpClosure must carry the same Flow state while
+# fetching pseudo instructions in the next block.
+"$LUA" tests/closure_boundary.lua > "$WORK/closure-boundary-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/closure_boundary.lua > "$WORK/closure-boundary-build.log"
+mv out.lua "$WORK/closure-boundary.lua"
+"$LUAC" -p "$WORK/closure-boundary.lua"
+"$LUA" "$WORK/closure-boundary.lua" > "$WORK/closure-boundary.out"
+cmp "$WORK/closure-boundary-baseline.out" "$WORK/closure-boundary.out"
+echo "PASS Closure pseudo instructions across flow blocks"
 
 # Verify the runtime keeps unexecuted basic blocks as opaque byte slices. The
 # production output is executed first. We then instrument the unminified VM

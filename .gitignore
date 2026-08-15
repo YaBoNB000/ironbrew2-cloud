@@ -4,6 +4,7 @@
 # --- 编译中间产物 ---
 obj/
 bin/Debug/
+**/bin/Debug/
 *.pdb
 *.user
 .vs/

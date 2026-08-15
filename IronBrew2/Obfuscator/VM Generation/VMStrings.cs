@@ -155,7 +155,7 @@ local function inflate(d)
 	return Concat(res);
 end;
 
--- v2 固定头：head/salt 4B | integrity 4B | version+flags 1B。
+-- v3 固定头：head/salt 4B | integrity 4B | version+flags 1B。
 -- 每个 prototype 的 K1/K2/K3 位于加密 body，不再泄露在明文头。
 local __ib2Head = Byte(ByteString, 1, 1)
          + Byte(ByteString, 2, 2) * 256
@@ -168,7 +168,7 @@ local __ib2Tag = Byte(ByteString, 5, 5)
 local __ib2Flags = Byte(ByteString, 9, 9);
 local __ib2Features = __ib2Flags % 16;
 local __ib2Version = (__ib2Flags - __ib2Features) / 16;
-if __ib2Version ~= 2 or __ib2Features < 2 or __ib2Features > 3 then error('invalid protected payload', 0); end;
+if __ib2Version ~= 3 or __ib2Features < 2 or __ib2Features > 3 then error('invalid protected payload', 0); end;
 __IB2_SEED__
 
 -- 在解密前验证密文，检测损坏和直接 patch。客户端校验不是不可绕过的信任根。
@@ -266,6 +266,43 @@ local function FieldKey32(I, Slot, K1, K2, K3)
         + FieldKey(I, Slot + 4, K1, K2, K3) * 65536;
 end;
 
+local function InitialFlowKey(K1, K2, K3)
+    local Value = (K1 * 65537 + K2 * 257 + K3 + 1831565813) % 4294967296;
+    return (Value * 1664525 + 1013904223) % 4294967296;
+end;
+
+local function FlowKey(EntryState, FromPC, ToPC, K1, K2, K3)
+    local Value = (EntryState * 1664525 + FromPC * 257 + ToPC * 65537
+        + K1 * 251 + K2 * 17 + K3 + 1831565813) % 4294967296;
+    return (Value * 1664525 + 1013904223) % 4294967296;
+end;
+
+local function FlowVerifier(EntryState, BlockStart, K1, K2, K3)
+    return FlowKey(EntryState, BlockStart, BitXOR(BlockStart, 23130), K1, K2, K3);
+end;
+
+local function BlockFieldKey(EntryState, I, Slot, K1, K2, K3)
+    local Low = EntryState % 65536;
+    local High = (EntryState - Low) / 65536;
+    return (Low * (((I + Slot * 29) % 251) + 1) + High * 17
+        + K1 * 13 + K2 * 7 + K3 + Slot * 911) % 65536;
+end;
+
+local function BlockFieldKey32(EntryState, I, Slot, K1, K2, K3)
+    return BlockFieldKey(EntryState, I, Slot, K1, K2, K3)
+        + BlockFieldKey(EntryState, I, Slot + 4, K1, K2, K3) * 65536;
+end;
+
+local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, K1, K2, K3)
+    local Hash = (BitXOR(EntryState, 2135587861) * 31 + BlockStart) % 4294967296;
+    Hash = (Hash * 31 + Count) % 4294967296;
+    Hash = (Hash * 31 + K1) % 4294967296;
+    Hash = (Hash * 31 + K2) % 4294967296;
+    Hash = (Hash * 31 + K3) % 4294967296;
+    for I = 1, #Body do Hash = (Hash * 31 + Byte(Body, I, I)) % 4294967296; end;
+    return Hash;
+end;
+
 local gInt = gBits32;
 local function _R(...) return {...}, Select('#', ...) end
 
@@ -326,6 +363,7 @@ local function Wrap(Chunk, Upvalues, Env)
 
 		local _R = _R
 		local InstrPoint = 1;
+		local Flow = {};
 		local Top = -1;
 
 		local Vararg = {};
@@ -350,8 +388,8 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Enum;	
 
 		while true do
-			Inst		= GetInstruction(Chunk, InstrPoint);
-			Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
+			Inst		= GetInstruction(Chunk, InstrPoint, Flow);
+			Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 
 		public static string VMP2_R = @"
 local function Wrap(Chunk, Upvalues, Env)
@@ -370,6 +408,7 @@ local function Wrap(Chunk, Upvalues, Env)
 
 		local _R = _R
 		local InstrPoint = 1;
+		local Flow = {};
 		local Top = -1;
 
 		local Vararg = {};
@@ -394,8 +433,8 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Enum;	
 
 		repeat
-			Inst		= GetInstruction(Chunk, InstrPoint);
-			Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
+			Inst		= GetInstruction(Chunk, InstrPoint, Flow);
+			Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 
 		public static string VMP3 = @"
 			InstrPoint	= InstrPoint + 1;
@@ -430,6 +469,7 @@ local function Wrap(Chunk, Upvalues, Env)
 
 	return function(...)
 		local InstrPoint = 1;
+		local Flow = {};
 		local Top = -1;
 
 		local Args = {...};
@@ -461,8 +501,8 @@ local function Wrap(Chunk, Upvalues, Env)
 			local Enum;	
 
 			while true do
-				Inst		= GetInstruction(Chunk, InstrPoint);
-				Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
+				Inst		= GetInstruction(Chunk, InstrPoint, Flow);
+				Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 		
 		public static string VMP2_LI_R = @"
 local PCall = pcall
@@ -477,6 +517,7 @@ local function Wrap(Chunk, Upvalues, Env)
 
 	return function(...)
 		local InstrPoint = 1;
+		local Flow = {};
 		local Top = -1;
 
 		local Args = {...};
@@ -508,8 +549,8 @@ local function Wrap(Chunk, Upvalues, Env)
 			local Enum;	
 
 			repeat
-				Inst		= GetInstruction(Chunk, InstrPoint);
-				Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
+				Inst		= GetInstruction(Chunk, InstrPoint, Flow);
+				Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
 		
 		public static string VMP3_LI = @"
 				InstrPoint	= InstrPoint + 1;

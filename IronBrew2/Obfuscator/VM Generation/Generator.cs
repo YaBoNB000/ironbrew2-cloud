@@ -657,7 +657,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"DerivePermutation","Count","Domain","Values","State","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank",
 				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root","Blocks","BlockMap",
 				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
-				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction"
+				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier",
+				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
+				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock"
 			};
 			string[] luaKws = {"and","break","do","else","elseif","end","false","for","function","if","in","local","nil","not","or","repeat","return","then","true","until","while"};
 			var idents = new Dictionary<string,string>();
@@ -874,14 +876,23 @@ for StepIndex = 1, 5 do
         InstrCount = gBits32();
         BlockCount = gBits32();
         Chunk[11] = BlockCount;
+        Chunk[12] = gBits32();
         for BlockIndex = 1, BlockCount do
             local BlockStart = gBits32();
             local Count = gBits32();
             local RefCount = gBits32();
             local References = {};
             for ReferenceIndex = 1, RefCount do References[ReferenceIndex] = gBits32(); end;
+            local Verifier = gBits32();
+            local BlockTag = gBits32();
+            local SuccessorCount = gBits32();
+            local Successors = {};
+            for SuccessorIndex = 1, SuccessorCount do
+                local SuccessorStart = gBits32();
+                Successors[SuccessorStart] = gBits32();
+            end;
             local Length = gBits32();
-            local Block = {BlockStart, Count, Sub(ByteString, Pos, Pos + Length - 1), References};
+            local Block = {BlockStart, Count, Sub(ByteString, Pos, Pos + Length - 1), References, Successors, Verifier, BlockTag};
             Pos = Pos + Length;
             Blocks[BlockIndex] = Block;
             for Offset = 0, Count - 1 do BlockMap[BlockStart + Offset] = Block; end;
@@ -929,36 +940,39 @@ local function GetProto(Proto, Index)
     return Encoded;
 end;
 
-local function DecodeInstructionBlock(Chunk, Block)
+local function DecodeInstructionBlock(Chunk, Block, EntryState)
     local SavedByteString, SavedPos = ByteString, Pos;
+    local K1, K2, K3 = Chunk[5], Chunk[6], Chunk[7];
+    if ComputeBlockIntegrity(Block[3], EntryState, Block[1], Block[2], K1, K2, K3) ~= Block[7] then
+        error('invalid protected payload', 0);
+    end;
     ByteString, Pos = Block[3], 1;
     local Instrs = Chunk[1];
-    local K1, K2, K3 = Chunk[5], Chunk[6], Chunk[7];
     local ConstCache = Block[4];
     for Offset = 0, Block[2] - 1 do
         local Index = Block[1] + Offset;
-        local Descriptor = gBits8();
+        local Descriptor = BitXOR(gBits8(), BlockFieldKey(EntryState, Index, 7, K1, K2, K3));
         if (gBit(Descriptor, 1, 1) == 0) then
             local Type = gBit(Descriptor, 2, 3);
             local Mask = gBit(Descriptor, 4, 6);
             local Inst =
             {
                 gBits16(),
-                BitXOR(gBits16(), FieldKey(Index, 1, K1, K2, K3)),
+                BitXOR(BitXOR(gBits16(), FieldKey(Index, 1, K1, K2, K3)), BlockFieldKey(EntryState, Index, 1, K1, K2, K3)),
                 nil,
                 nil
             };
 
             if (Type == 0) then
-                Inst[OP_B] = BitXOR(gBits16(), FieldKey(Index, 2, K1, K2, K3));
-                Inst[OP_C] = BitXOR(gBits16(), FieldKey(Index, 3, K1, K2, K3));
+                Inst[OP_B] = BitXOR(BitXOR(gBits16(), FieldKey(Index, 2, K1, K2, K3)), BlockFieldKey(EntryState, Index, 2, K1, K2, K3));
+                Inst[OP_C] = BitXOR(BitXOR(gBits16(), FieldKey(Index, 3, K1, K2, K3)), BlockFieldKey(EntryState, Index, 3, K1, K2, K3));
             elseif (Type == 1) then
-                Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3)));
+                Inst[OP_B] = U32(BitXOR(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3)));
             elseif (Type == 2) then
-                Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3))) - (2 ^ 16);
+                Inst[OP_B] = U32(BitXOR(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3))) - (2 ^ 16);
             elseif (Type == 3) then
-                Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3))) - (2 ^ 16);
-                Inst[OP_C] = BitXOR(gBits16(), FieldKey(Index, 3, K1, K2, K3));
+                Inst[OP_B] = U32(BitXOR(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3))) - (2 ^ 16);
+                Inst[OP_C] = BitXOR(BitXOR(gBits16(), FieldKey(Index, 3, K1, K2, K3)), BlockFieldKey(EntryState, Index, 3, K1, K2, K3));
             end;
 
             if (gBit(Mask, 1, 1) == 1) then Inst[OP_A] = ConstCache[Inst[OP_A]]; end;
@@ -968,19 +982,39 @@ local function DecodeInstructionBlock(Chunk, Block)
         end;
     end;
     ByteString, Pos = SavedByteString, SavedPos;
-    for Offset = 0, Block[2] - 1 do Chunk[10][Block[1] + Offset] = nil; end;
-    Block[3], Block[4] = nil, nil;
+    Block[3], Block[4], Block[7] = nil, nil, nil;
     Chunk[11] = Chunk[11] - 1;
-    if Chunk[11] == 0 then Chunk[9], Chunk[10] = nil, nil; end;
+    if Chunk[11] == 0 then Chunk[9] = nil; end;
 end;
 
-local function GetInstruction(Chunk, Index)
-    local Inst = Chunk[1][Index];
-    if Inst then return Inst; end;
+local function GetInstruction(Chunk, Index, Flow)
     local BlockMap = Chunk[10];
     local Block = BlockMap and BlockMap[Index];
     if not Block then error('invalid protected payload', 0); end;
-    DecodeInstructionBlock(Chunk, Block);
+
+    local LastIndex = Flow[1];
+    local CurrentBlock = Flow[2];
+    local EntryState;
+    if not CurrentBlock then
+        if Index ~= 1 then error('invalid protected payload', 0); end;
+        EntryState = U32(BitXOR(Chunk[12], InitialFlowKey(Chunk[5], Chunk[6], Chunk[7])));
+    elseif CurrentBlock ~= Block or Index ~= LastIndex + 1 then
+        if Index ~= Block[1] then error('invalid protected payload', 0); end;
+        local WrappedState = CurrentBlock[5][Block[1]];
+        if not WrappedState then error('invalid protected payload', 0); end;
+        EntryState = U32(BitXOR(WrappedState, FlowKey(Flow[3], LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
+    else
+        EntryState = Flow[3];
+    end;
+
+    if FlowVerifier(EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]) ~= Block[6] then
+        error('invalid protected payload', 0);
+    end;
+    Flow[1], Flow[2], Flow[3] = Index, Block, EntryState;
+
+    local Inst = Chunk[1][Index];
+    if Inst then return Inst; end;
+    DecodeInstructionBlock(Chunk, Block, EntryState);
     Inst = Chunk[1][Index];
     if not Inst then error('invalid protected payload', 0); end;
     return Inst;

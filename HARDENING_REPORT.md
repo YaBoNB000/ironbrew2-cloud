@@ -11,21 +11,22 @@
 
 ## 2. 已完成的源码改动
 
-### 2.1 v2 payload 与完整性
+### 2.1 v3 payload 与分层完整性
 
-`Serializer.cs` 与 `VMStrings.cs` 已同步切换到 v2 格式：
+`Serializer.cs` 与 `VMStrings.cs` 已同步切换到 v3 格式：
 
 ```text
 4B head/salt | 4B integrity tag | 1B version+feature flags | encrypted body
 ```
 
-- 高 4 位为格式版本，目前必须为 `2`。
+- 高 4 位为格式版本，目前必须为 `3`；v2/旧 Release 产物会被新版 VM 明确拒绝。
 - 低位 bit 0 表示 DEFLATE，bit 1 表示 basic-block lazy decode；当前 VM 要求 bit 1 存在，未知 feature bits 会被拒绝。
-- 完整性值绑定格式/feature 字节、加密正文和运行 seed，并在解密、解压及反序列化前验证。
-- 修改加密 payload 会以 `invalid protected payload` 失败。
+- 顶层完整性值绑定格式/feature 字节、加密正文和运行 seed，并在解密、解压及反序列化前验证。
+- v3 另为每个 opaque instruction block 写入绑定入口状态、块起点/长度、prototype keys 与 body bytes 的完整性 tag；首次解码前才认证该块。
+- 修改加密 payload、已反序列化后的 block body 或 flow metadata 都会以 `invalid protected payload` 失败。
 - K1/K2 不再位于固定明文头。
 
-该完整性机制用于检测损坏和提高直接 patch 成本；算法和验证代码都交付给客户端，因此不是不可伪造的服务端信任根。
+这些完整性机制用于检测损坏和提高直接 patch 成本；算法和验证代码都交付给客户端，因此不是不可伪造的服务端信任根。
 
 ### 2.2 每 prototype 的指令、字段与 opcode bank
 
@@ -57,14 +58,17 @@
 - `OP_CLOSURE` 首次访问时通过 `GetProto` 切换到该 slice 反序列化，随后把结果缓存回父 prototype 表。
 - root prototype 恢复后立即释放完整解密 body；后续仅保留尚未使用的子 prototype slices，以及各 prototype 内尚未执行的 instruction block slices。
 
-### 2.5 basic-block 粒度按需解码
+### 2.5 显式 CFG、入口状态与 basic-block 按需解码
 
-- serializer 在 opcode mutation 前按 jump target、控制转移后继和 `LOADBOOL` skip successor 计算稳定 leader；长直线区额外按最多 24 条指令分块。
-- 每块独立写入 1-based start PC、instruction count、最小常量引用集合、body length 和 opaque body；块的物理写入顺序由 CSPRNG 打乱。
-- prototype 初始恢复只读取 block framing 并保存 body slice，不恢复 instruction table；统一的 `GetInstruction(Chunk, PC)` 在 PC 首次进入时恢复整个块并缓存各指令。
-- 主 while/repeat wrapper、`OP_CLOSURE` 的 upvalue 伪指令和可选 superoperator 的内部取指全部经过同一 accessor，避免绕过 lazy decode。
-- 块恢复后立即清除 opaque body 和块级常量引用；所有块恢复后再释放 block map。没有执行的分支持续保持 opaque。
-- 比较/Test/TForLoop 的 companion JMP 作为独立块处理；其目标已在前一条虚拟指令 mutation 时绑定。`SetList C==0` 的 data word 保留一字节 descriptor 并沿用 Lua 5.1 的 skip-next 行为。
+- 新增 `ControlFlowGraph` / `ControlFlowBlock` IR 模型，在 opcode mutation 前建立 instruction-indexed successor、predecessor 与 leader；长直线自然区域再按最多 24 条指令细分。
+- CFG 明确建模 JMP、FORLOOP、IronBrew 优化后的 FORPREP 双路径、comparison/Test/TForLoop companion JMP、`LOADBOOL` skip、`SETLIST C==0` data word、RETURN/TAILCALL 终止路径及自环/多前驱。
+- 每个块由 CSPRNG 分配独立非零 32 位 entry state；prototype framing 只写包装后的初始状态，每条合法 successor record 写目标块 1-based start PC 与由源状态、源末 PC、目标 PC 包装的目标状态。
+- 每块独立写入 1-based start PC、instruction count、最小常量引用集合、state verifier、body integrity tag、successor records、body length 和 opaque body；块的物理写入顺序由 CSPRNG 打乱。
+- descriptor、opcode、A/B/C/Bx/sBx 除 prototype/PC mask 外再叠加 entry-state mask。没有认证入口状态时，即使已知 PC 与 prototype keys 也不能直接按旧格式独立恢复字段。
+- prototype 初始恢复只读取 block framing 并保存 body slice，不恢复 instruction table；统一的 `GetInstruction(Chunk, PC, Flow)` 先验证初始入口、块内顺序或显式 edge，再验证目标 state/verifier，最后在首次访问时认证并解码整个块。
+- `Flow[1..3]` 分别保存该 invocation 的 last PC、current block 与 entry state。每次 wrapper 调用独立创建 Flow，因此递归/重复调用不会共享控制流游标。
+- 主 while/repeat wrapper、`OP_CLOSURE` 的 upvalue 伪指令和可选 superoperator 的内部取指全部经过同一 accessor；dispatcher 也必须结合 `Flow[3]` 才能恢复 opcode。
+- 块恢复后立即清除 opaque body、块级常量引用及 body tag；所有块恢复后释放 block 数组，但保留紧凑 block map、verifier 与 successor metadata，用于后续重入和控制流认证。没有执行的分支持续保持 opaque。
 
 ### 2.6 handler 与 dispatch leaf 结构多态
 
@@ -100,8 +104,8 @@ CLI、Windows 拖放脚本和 GitHub Actions 均取消强度档位，统一使�
 
 | 设置 | 固定值 |
 |---|---:|
-| v2 schema / prototype keys / 字段编码 / 常量内层编码 / 完整性检查 | 开 |
-| child prototype / basic-block 两级按需恢复 | 开 |
+| v3 schema / prototype keys / block-state 字段编码 / 常量内层编码 / 分层完整性检查 | 开 |
+| child prototype / CFG basic-block 两级按需恢复与合法 edge/state 验证 | 开 |
 | handler / 双 handler dispatch leaf 结构多态 | 开 |
 | ControlFlow | 开 |
 | DEFLATE | 开 |
@@ -131,15 +135,19 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | 检查 | 结果 |
 |---|---|
 | Release build | 通过，0 warnings / 0 errors |
+| Release 生成 payload header | 通过，version 3 / features 3 |
 | 固定配置与原脚本差分 | 通过 |
 | 固定配置随机构建 | 20/20 通过 |
 | 旧 `--strength` 参数拒绝 | 通过，退出码 2 |
 | prototype-local schema / tag / opcode bank 随机构建 | 通过 |
 | handler 等价模板 / 双 handler leaf 随机结构与 Lua 语法 | 20/20 通过 |
 | nested closure / upvalue / lazy child prototype / closure 伪指令 | 通过 |
+| 30 个 upvalue 的 Closure 伪指令跨 24 条 block 边界 | 通过 |
+| 显式 CFG 结构：循环/自环、predecessor、comparison/Test/TForLoop companion、FORPREP/FORLOOP、skip/data、24 条分页 | 通过 |
 | basic-block 首次进入解码与缓存 | 通过 |
 | 未执行 block 保持 opaque（unminified VM 运行时探针） | 通过 |
-| 分支/循环/table constructor 与块级常量引用 | 通过 |
+| block body、初始 state、缺失 edge、wrapped edge state 的反序列化后篡改 | 通过，均拒绝 |
+| 分支/循环/递归/table constructor 与块级常量引用 | 通过 |
 | `SETLIST C==0` 后继 data word（测试侧 patch Lua 5.1 chunk） | 通过 |
 | boolean、number、二进制 string 常量 | 通过 |
 | for/while/repeat/branch/recursion | 通过 |
@@ -154,21 +162,25 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 测试源位于：
 
 - `tests/semantic.lua`
+- `tests/closure_boundary.lua`
 - `tests/lazy_blocks.lua`
+- `tests/cfg_regression/Program.cs`
 - `tests/luac_setlist_c0_wrapper.py`（仅测试时构造 `SETLIST C==0` data word）
 - `tests/line_error.lua`
 - `tests/signed_bit_runner.lua`
+- `tests/verify_v3_payload.py`
 - `tests/run_linux_tests.sh`
 
 ## 4. 仍存在的边界
 
 1. 这是客户端混淆，不是密码学保密。seed、fingerprint、VM、prototype banks 和校验逻辑最终都在攻击者可执行的客户端中。
-2. 字段 schema、常量 tag 与 opcode bank 虽然按 prototype 变化，但 bank 会在运行时派生；有能力的分析者仍可 hook dispatch、`GetProto` 或 `GetInstruction` 收集已执行路径。
+2. 字段 schema、常量 tag 与 opcode bank 按 prototype 变化，block mask 和 edge wrapping 再依赖 CFG entry state；但所有派生与验证逻辑仍在客户端。有能力的分析者可以 hook dispatch、`GetProto`、`GetInstruction` 或已认证的 Flow 收集执行路径和状态。
 3. root prototype 的 schema、常量值和 block framing 仍在启动时恢复；延迟的是 instruction block body。字符串常量由相关 opaque block 持有引用，并不是逐次使用时才解码。
-4. basic-block 已用于分帧和按需恢复，但 operand mask/opcode bank 尚未与不可伪造的 CFG 入口状态耦合；拿到正确 prototype keys 后仍可离线逐块恢复。
-5. handler 拆分/合并/等价模板已经完成，但每次构建仍只生成一组 canonical handler；它们不是按 prototype 复制，也还没有依赖真实 CFG 入口状态的 bank/state。
-6. Mutation/SuperOperator 没有被本轮宣告为稳定；在没有更大差分语料前不应纳入固定配置。
-7. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持。
-8. 尚未接入 CI，也尚未完成大程序、性能、内存和体积基准。
+4. CFG state 是客户端执行一致性与反静态批量恢复机制，不是不可伪造的 CFI 信任根。修改 VM、跳过 verifier 或在解码后 dump instruction table 仍可绕过本地保护。
+5. 当前每个 block 使用一个固定 entry state；多前驱通过不同 wrapped edge 恢复同一目标状态。尚未实现按 predecessor 产生多版本 block 或动态 state merge。
+6. handler 拆分/合并/等价模板已经完成，但每次构建仍只生成一组 canonical handler；自动 dispatcher flattening 尚未完成。
+7. Mutation/SuperOperator 没有被本轮宣告为稳定；IR-native superoperator 及更大差分语料仍是后续工作，固定配置继续关闭它们。
+8. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持。
+9. 尚未接入 CI，也尚未完成大程序、性能、内存和体积基准。
 
-后续工作按 `HARDENING_PLAN.md` 的 Phase 3–4 继续：IR/CFG 级状态耦合、性能基准及多平台 CI。
+后续工作按 `HARDENING_PLAN.md` 的剩余 Phase 3–4 项继续：自动 dispatcher flattening、IR-native superoperator、性能基准及多平台 CI。

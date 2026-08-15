@@ -59,7 +59,7 @@ namespace IronBrew2.Obfuscator.Opcodes
 				s += s2;
 
 				if (index + 1 < SubOpcodes.Length)
-					s += "InstrPoint = InstrPoint + 1;Inst = GetInstruction(Chunk, InstrPoint);";
+					s += "InstrPoint = InstrPoint + 1;Inst = GetInstruction(Chunk, InstrPoint, Flow);";
 			}
 
 			foreach (string l in locals)

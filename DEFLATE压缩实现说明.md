@@ -12,14 +12,14 @@
 固定 CLI 配置始终开启压缩。当前数据流为：
 
 ```text
-v2 prototype/常量/指令序列化
+v3 prototype/常量/CFG block-state 指令序列化
 → DEFLATE
 → seed 驱动的流式 XOR
-→ 9 字节 v2 头（head/salt + integrity tag + version/features）
+→ 9 字节 v3 头（head/salt + integrity tag + version/features）
 → basE91
 ```
 
-运行端按相反顺序处理，并在解密、inflate 和反序列化前验证版本、feature 位及 seed-bound integrity tag。版本必须为 2，当前只接受 feature 值 0 或 1，其中 bit 0 表示 DEFLATE。
+运行端按相反顺序处理，并在解密、inflate 和反序列化前验证版本、feature 位及 seed-bound integrity tag。版本必须为 3，当前只接受 feature 值 2 或 3；bit 0 表示 DEFLATE，bit 1 表示 CFG basic-block lazy decode/state framing。固定配置产生 feature 值 3。
 
 ## 位序注意事项
 
@@ -34,7 +34,8 @@ DEFLATE 对较大的重复字节码通常有效，但最终 Lua 产物还包含 
 `tests/run_linux_tests.sh` 当前验证：
 
 - 固定压缩配置与原脚本输出一致；
-- 独立随机生成 10 次（可由 `IB2_RANDOM_RUNS` 调整）均一致；
+- 默认独立随机生成 20 次（可由 `IB2_RANDOM_RUNS` 调整）均一致；
+- 生成产物头必须为 v3 且携带 CFG basic-block feature；
 - signed 32-bit `bit.bxor` 模拟兼容；
 - payload 单字符篡改在 inflate 前确定性拒绝；
 - `luac -p` 语法检查通过。
