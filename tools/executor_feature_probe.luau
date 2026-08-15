@@ -634,5 +634,9 @@ end
 Print(SaveLine)
 Print(VerifyLine)
 Print(ClipboardLine)
--- Repeat the compact result last because some executor consoles retain only the tail.
+-- Repeat the compact result near the tail because some executor consoles retain only recent entries.
 Print(StrictSummaryLine)
+-- Replay the complete report in one final print call. Some executor consoles retain only the
+-- most recent log entry rather than the most recent lines, so per-line output disappears even
+-- though the final workspace status remains visible. Keep this as the last output operation.
+Print(Report)
