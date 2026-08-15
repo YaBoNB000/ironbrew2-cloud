@@ -155,7 +155,7 @@ local function inflate(d)
 	return Concat(res);
 end;
 
--- v3 固定头：head/salt 4B | integrity 4B | version+flags 1B。
+-- v4 固定头：head/salt 4B | integrity 4B | version+flags 1B。
 -- feature bit 8 表示认证 entropy envelope；固定配置必须同时带 block、dispatcher 与 envelope。
 local PayloadHead = Byte(ByteString, 1, 1)
          + Byte(ByteString, 2, 2) * 256
@@ -168,7 +168,7 @@ local PayloadTag = Byte(ByteString, 5, 5)
 local PayloadFlags = Byte(ByteString, 9, 9);
 local PayloadFeatures = PayloadFlags % 16;
 local PayloadVersion = (PayloadFlags - PayloadFeatures) / 16;
-if PayloadVersion ~= 3 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
+if PayloadVersion ~= 4 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
 __IB2_SEED__
 local OuterSeed = Xs;
 
@@ -396,12 +396,52 @@ local function BlockFieldKey32(EntryState, I, Slot, K1, K2, K3)
         + BlockFieldKey(EntryState, I, Slot + 4, K1, K2, K3) * 65536;
 end;
 
-local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, K1, K2, K3)
+local function ConstantMaskState(Index, K1, K2, K3)
+    local Value = (Index * 65537 + K1 * 257 + K2 * 17 + K3 + 1267671459) % 4294967296;
+    return (Value * 1664525 + 1013904223) % 4294967296;
+end;
+
+local function ComputeConstantIntegrity(EncodedBody, Index, K1, K2, K3)
+    local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
+    local Hash = (BitXOR(Keyed, 3510394489) * 31 + Index) % 4294967296;
+    Hash = (Hash * 31 + #EncodedBody) % 4294967296;
+    for I = 1, #EncodedBody do Hash = (Hash * 31 + Byte(EncodedBody, I, I)) % 4294967296; end;
+    return Hash;
+end;
+
+local function ComputePrototypeIntegrity(Body, K1, K2, K3)
+    local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
+    local Hash = (BitXOR(Keyed, 3911667051) * 31 + #Body) % 4294967296;
+    for I = 1, #Body do
+        if I < 7 or I > 10 then Hash = (Hash * 31 + Byte(Body, I, I)) % 4294967296; end;
+    end;
+    return Hash;
+end;
+
+local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteToken, References, ConstCapsules, Verifier, SuccessorRecords, K1, K2, K3)
     local Hash = (BitXOR(EntryState, 2135587861) * 31 + BlockStart) % 4294967296;
     Hash = (Hash * 31 + Count) % 4294967296;
     Hash = (Hash * 31 + K1) % 4294967296;
     Hash = (Hash * 31 + K2) % 4294967296;
     Hash = (Hash * 31 + K3) % 4294967296;
+    Hash = (Hash * 31 + RouteToken) % 4294967296;
+    Hash = (Hash * 31 + #References) % 4294967296;
+    for ReferenceIndex = 1, #References do
+        local Index = References[ReferenceIndex];
+        local Capsule = ConstCapsules[Index];
+        if type(Capsule) ~= 'string' then error('invalid protected payload', 0); end;
+        Hash = (Hash * 31 + Index) % 4294967296;
+        Hash = (Hash * 31 + #Capsule) % 4294967296;
+        for I = 1, #Capsule do Hash = (Hash * 31 + Byte(Capsule, I, I)) % 4294967296; end;
+    end;
+    Hash = (Hash * 31 + Verifier) % 4294967296;
+    Hash = (Hash * 31 + #SuccessorRecords) % 4294967296;
+    for SuccessorIndex = 1, #SuccessorRecords do
+        local SuccessorRecord = SuccessorRecords[SuccessorIndex];
+        Hash = (Hash * 31 + SuccessorRecord[1]) % 4294967296;
+        Hash = (Hash * 31 + SuccessorRecord[2]) % 4294967296;
+    end;
+    Hash = (Hash * 31 + #Body) % 4294967296;
     for I = 1, #Body do Hash = (Hash * 31 + Byte(Body, I, I)) % 4294967296; end;
     return Hash;
 end;
@@ -424,24 +464,24 @@ local function DerivePermutation(Count, K1, K2, K3, Domain)
 end;
 
 local function Deserialize()
+    local PrototypeLength = #ByteString;
     local Instrs = {};
     local Functions = {};
-	local Lines = {};
-    local Chunk = 
-	{
-		Instrs,
-		Functions,
-		nil,
-		Lines
-	};
+		local Lines = {};
+    local Chunk = {};
+    Chunk[1] = Instrs;
+    Chunk[2] = Functions;
+    Chunk[4] = Lines;
     local K1 = gBits16();
     local K2 = gBits16();
     local K3 = gBits16();
+    local PrototypeTag = gBits32();
+    if ComputePrototypeIntegrity(ByteString, K1, K2, K3) ~= PrototypeTag then error('invalid protected payload', 0); end;
     Chunk[5], Chunk[6], Chunk[7] = K1, K2, K3;
-    local ConstTags = DerivePermutation(4, K1, K2, K3, 911);
     local OpcodeBank = DerivePermutation(__IB2_OPCODE_COUNT__, K1, K2, K3, 1777);
     Chunk[8] = OpcodeBank;
-    local Consts = {};
+    local ConstCapsules = {};
+    Chunk[15] = ConstCapsules;
     local InstrCount = 0;
     local Blocks = {};
     local BlockMap = {};

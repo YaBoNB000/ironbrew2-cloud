@@ -13,7 +13,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 {
 	public class Serializer
 	{
-		private const byte FormatVersion = 3;
+		private const byte FormatVersion = 4;
 		private const byte BasicBlockFeature = 2;
 		private const byte DispatcherFlatteningFeature = 4;
 		private const byte EntropyEnvelopeFeature = 8;
@@ -28,6 +28,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private const uint EnvelopeIntegrityDomain = 0xC4D29A6Bu;
 		private const uint EntropyDigestDomain = 0x91E10DA5u;
 		private const uint EnvelopeMaskDomain = 0x3A75C9EFu;
+		private const uint ConstantIntegrityDomain = 0xD13C5E79u;
+		private const uint ConstantMaskDomain = 0x4B8F21A3u;
+		private const uint PrototypeIntegrityDomain = 0xE9274D6Bu;
 
 		private sealed class EntropyRecord
 		{
@@ -47,12 +50,13 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		}
 
 		/// <summary>
-		/// v3 顶层格式（固定 9 字节头）：
+		/// v4 顶层格式（固定 9 字节头）：
 		///   head/salt 4B | integrity tag 4B | version+flags 1B | encrypted envelope
 		/// 压缩后的真实 body 被拆为多个 data records，并与 64–96 KiB CSPRNG entropy
 		/// records 交错。entropy digest 同时派生内层 body mask；物理 record 顺序由独立
 		/// envelope tag 认证，因此删除、修改或重排 record 都不能退化为可移除 padding。
-		/// K1/K2/K3 不再出现在明文头，而是每个 prototype 独立生成并放入保护正文。
+		/// 每个 prototype 和完整 block manifest 都有独立认证；常量以延迟恢复 capsule
+		/// 保存，只有进入引用它的 block 时才恢复到 invocation-local cache。
 		/// </summary>
 		public byte[] SerializeLChunk(Chunk chunk)
 		{
@@ -275,16 +279,72 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			                 (uint)k1 * 13u + (uint)k2 * 7u + k3 + (uint)slot * 911u) & 0xFFFFu);
 		}
 
-		private static uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
+		private static uint HashWord(uint hash, uint value) => unchecked(hash * 31u + value);
+
+		private static uint HashBytes(uint hash, IEnumerable<byte> values)
+		{
+			foreach (byte value in values)
+				hash = HashWord(hash, value);
+			return hash;
+		}
+
+		private static uint ConstantMaskState(int oneBasedIndex, ushort k1, ushort k2, ushort k3)
+		{
+			uint value = unchecked((uint)oneBasedIndex * 65537u + (uint)k1 * 257u +
+			                       (uint)k2 * 17u + k3 + ConstantMaskDomain);
+			return unchecked(value * 1664525u + 1013904223u);
+		}
+
+		private static uint ComputeConstantIntegrity(byte[] encodedBody, int oneBasedIndex,
 			ushort k1, ushort k2, ushort k3)
 		{
-			uint hash = unchecked((entryState ^ BlockIntegrityDomain) * 31u + (uint)start);
-			hash = unchecked(hash * 31u + (uint)count);
-			hash = unchecked(hash * 31u + k1);
-			hash = unchecked(hash * 31u + k2);
-			hash = unchecked(hash * 31u + k3);
-			foreach (byte value in body)
-				hash = unchecked(hash * 31u + value);
+			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
+			uint hash = HashWord(keyed ^ ConstantIntegrityDomain, (uint)oneBasedIndex);
+			hash = HashWord(hash, (uint)encodedBody.Length);
+			return HashBytes(hash, encodedBody);
+		}
+
+		private static uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
+			uint routeToken, IReadOnlyList<int> constantReferences, IReadOnlyList<byte[]> constantCapsules,
+			uint verifier, IReadOnlyList<KeyValuePair<int, uint>> successors, ushort k1, ushort k2, ushort k3)
+		{
+			uint hash = HashWord(entryState ^ BlockIntegrityDomain, (uint)start);
+			hash = HashWord(hash, (uint)count);
+			hash = HashWord(hash, k1);
+			hash = HashWord(hash, k2);
+			hash = HashWord(hash, k3);
+			hash = HashWord(hash, routeToken);
+			hash = HashWord(hash, (uint)constantReferences.Count);
+			foreach (int constantIndex in constantReferences)
+			{
+				if (constantIndex < 1 || constantIndex > constantCapsules.Count)
+					throw new InvalidOperationException("Invalid block constant reference.");
+				byte[] capsule = constantCapsules[constantIndex - 1];
+				hash = HashWord(hash, (uint)constantIndex);
+				hash = HashWord(hash, (uint)capsule.Length);
+				hash = HashBytes(hash, capsule);
+			}
+			hash = HashWord(hash, verifier);
+			hash = HashWord(hash, (uint)successors.Count);
+			foreach (KeyValuePair<int, uint> successor in successors)
+			{
+				hash = HashWord(hash, (uint)successor.Key);
+				hash = HashWord(hash, successor.Value);
+			}
+			hash = HashWord(hash, (uint)body.Length);
+			return HashBytes(hash, body);
+		}
+
+		private static uint ComputePrototypeIntegrity(byte[] body, ushort k1, ushort k2, ushort k3)
+		{
+			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
+			uint hash = HashWord(keyed ^ PrototypeIntegrityDomain, (uint)body.Length);
+			for (int index = 0; index < body.Length; index++)
+			{
+				// Bytes 6..9 contain this prototype's own tag.
+				if (index >= 6 && index < 10) continue;
+				hash = HashWord(hash, body[index]);
+			}
 			return hash;
 		}
 
@@ -367,30 +427,6 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			void WriteByte(byte value) => output.Add(value);
 			void WriteUInt16Local(ushort value) => WriteUInt16(output, value);
 			void WriteUInt32Local(uint value) => WriteUInt32(output, value);
-
-			void WriteRaw(byte[] value, bool checkEndian = true)
-			{
-				if (!BitConverter.IsLittleEndian && checkEndian)
-					value = value.Reverse().ToArray();
-				output.AddRange(value);
-			}
-
-			void WriteNumber(double value) => WriteRaw(BitConverter.GetBytes(value));
-			void WriteBool(bool value) => WriteByte(value ? (byte)1 : (byte)0);
-
-			void WriteProtectedString(string value, int constantIndex)
-			{
-				byte[] raw = _luaEncoding.GetBytes(value);
-				WriteUInt32Local((uint)raw.Length);
-
-				int oneBasedIndex = constantIndex + 1;
-				uint state = (uint)((k1 + k2 + k3 + oneBasedIndex * 257L) % 65536L);
-				foreach (byte item in raw)
-				{
-					WriteByte((byte)(item ^ (state & 0xFF)));
-					state = (state * 251u + k3 + (uint)oneBasedIndex) & 0xFFFFu;
-				}
-			}
 
 			void SerializeInstruction(Instruction instruction, int zeroBasedIndex, uint entryState)
 			{
@@ -506,34 +542,69 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			ShuffleBlocks(instructionBlocks);
 
 			// 每 prototype 独立密钥位于外层加密正文中，不再泄露在固定头部。
+			// 紧随其后的 tag 在正文完成后回填，认证整个 prototype slice（包括
+			// schema、block manifests、constant capsules 与 child framing）。
 			WriteUInt16Local(k1);
 			WriteUInt16Local(k2);
 			WriteUInt16Local(k3);
+			WriteUInt32Local(0u);
 
 			// Schema 与常量 tag 都由当前 prototype 的独立 keys 派生，并使用不同 domain。
 			// 因此父子 prototype 不再共享一个全局 ChunkSteps 或简单 tag rotation。
 			int[] schema = DerivePermutation((int)ChunkStep.StepCount, k1, k2, k3, 113u);
 			int[] constantTags = DerivePermutation(4, k1, k2, k3, 911u);
 
+			byte[] BuildConstantCapsule(Constant constant, int constantIndex)
+			{
+				var raw = new List<byte>();
+				raw.Add((byte)constantTags[(int)constant.Type]);
+				switch (constant.Type)
+				{
+					case ConstantType.Boolean:
+						raw.Add(constant.Data ? (byte)1 : (byte)0);
+						break;
+					case ConstantType.Number:
+					{
+						byte[] number = BitConverter.GetBytes((double)constant.Data);
+						if (!BitConverter.IsLittleEndian) Array.Reverse(number);
+						raw.AddRange(number);
+						break;
+					}
+					case ConstantType.String:
+					{
+						byte[] value = _luaEncoding.GetBytes((string)constant.Data);
+						WriteUInt32(raw, (uint)value.Length);
+						raw.AddRange(value);
+						break;
+					}
+				}
+
+				int oneBasedIndex = constantIndex + 1;
+				uint state = ConstantMaskState(oneBasedIndex, k1, k2, k3);
+				byte[] encodedBody = new byte[raw.Count];
+				for (int index = 0; index < raw.Count; index++)
+				{
+					encodedBody[index] = (byte)(raw[index] ^ (byte)(state >> 24));
+					state = unchecked(state * 1664525u + 1013904223u);
+				}
+
+				var capsule = new List<byte>(encodedBody.Length + 4);
+				WriteUInt32(capsule, ComputeConstantIntegrity(encodedBody, oneBasedIndex, k1, k2, k3));
+				capsule.AddRange(encodedBody);
+				return capsule.ToArray();
+			}
+
+			List<byte[]> constantCapsules = chunk.Constants
+				.Select(BuildConstantCapsule)
+				.ToList();
+
 			void SerializeConstants()
 			{
-				WriteUInt32Local((uint)chunk.Constants.Count);
-				for (int constantIndex = 0; constantIndex < chunk.Constants.Count; constantIndex++)
+				WriteUInt32Local((uint)constantCapsules.Count);
+				foreach (byte[] capsule in constantCapsules)
 				{
-					Constant constant = chunk.Constants[constantIndex];
-					WriteByte((byte)constantTags[(int)constant.Type]);
-					switch (constant.Type)
-					{
-						case ConstantType.Boolean:
-							WriteBool(constant.Data);
-							break;
-						case ConstantType.Number:
-							WriteNumber(constant.Data);
-							break;
-						case ConstantType.String:
-							WriteProtectedString(constant.Data, constantIndex);
-							break;
-					}
+					WriteUInt32Local((uint)capsule.Length);
+					output.AddRange(capsule);
 				}
 			}
 
@@ -564,42 +635,52 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								SerializeInstruction(chunk.Instructions[start + offset], start + offset, entryState);
 							output = savedOutput;
 
-							// Bind each opaque block only to the constants it can resolve. This
-							// lets the VM release the prototype-wide constant cache immediately.
-							var constantReferences = new HashSet<int>();
+							// Keep only capsule references in each block. The manifest authenticates
+							// every referenced capsule together with route and successor metadata.
+							var referenceSet = new HashSet<int>();
 							for (int offset = 0; offset < count; offset++)
 							{
 								Instruction instruction = chunk.Instructions[start + offset];
-								if ((instruction.ConstantMask & InstructionConstantMask.RA) != 0) constantReferences.Add(instruction.A);
-								if ((instruction.ConstantMask & InstructionConstantMask.RB) != 0) constantReferences.Add(instruction.B);
-								if ((instruction.ConstantMask & InstructionConstantMask.RC) != 0) constantReferences.Add(instruction.C);
+								if ((instruction.ConstantMask & InstructionConstantMask.RA) != 0) referenceSet.Add(instruction.A);
+								if ((instruction.ConstantMask & InstructionConstantMask.RB) != 0) referenceSet.Add(instruction.B);
+								if ((instruction.ConstantMask & InstructionConstantMask.RC) != 0) referenceSet.Add(instruction.C);
 							}
-
-							WriteUInt32Local((uint)(start + 1));
-							WriteUInt32Local((uint)count);
-							WriteUInt32Local(dispatcherFlattened ? blockRoutes[block] : 0u);
-							WriteUInt32Local((uint)constantReferences.Count);
-							foreach (int constantIndex in constantReferences.OrderBy(value => value))
-							{
-								if (constantIndex < 1 || constantIndex > chunk.Constants.Count)
+							List<int> constantReferences = referenceSet.OrderBy(value => value).ToList();
+							foreach (int constantIndex in constantReferences)
+								if (constantIndex < 1 || constantIndex > constantCapsules.Count)
 									throw new InvalidOperationException("Invalid block constant reference.");
-								WriteUInt32Local((uint)constantIndex);
-							}
 
-							WriteUInt32Local(FlowVerifier(entryState, start + 1, k1, k2, k3));
-							WriteUInt32Local(ComputeBlockIntegrity(blockBody.ToArray(), entryState, start + 1, count, k1, k2, k3));
-							WriteUInt32Local((uint)block.Successors.Count);
+							uint routeToken = dispatcherFlattened ? blockRoutes[block] : 0u;
+							uint verifier = FlowVerifier(entryState, start + 1, k1, k2, k3);
+							var successorRecords = new List<KeyValuePair<int, uint>>();
 							foreach (ControlFlowBlock successor in block.Successors.OrderBy(value => value.Start))
 							{
 								int successorStart = successor.Start + 1;
 								uint wrappedState = blockStates[successor] ^
 								                    FlowKey(entryState, block.EndExclusive, successorStart, k1, k2, k3);
-								WriteUInt32Local((uint)successorStart);
-								WriteUInt32Local(wrappedState);
+								successorRecords.Add(new KeyValuePair<int, uint>(successorStart, wrappedState));
+							}
+							byte[] encodedBlockBody = blockBody.ToArray();
+							uint blockTag = ComputeBlockIntegrity(encodedBlockBody, entryState, start + 1, count,
+								routeToken, constantReferences, constantCapsules, verifier, successorRecords, k1, k2, k3);
+
+							WriteUInt32Local((uint)(start + 1));
+							WriteUInt32Local((uint)count);
+							WriteUInt32Local(routeToken);
+							WriteUInt32Local((uint)constantReferences.Count);
+							foreach (int constantIndex in constantReferences)
+								WriteUInt32Local((uint)constantIndex);
+							WriteUInt32Local(verifier);
+							WriteUInt32Local(blockTag);
+							WriteUInt32Local((uint)successorRecords.Count);
+							foreach (KeyValuePair<int, uint> successor in successorRecords)
+							{
+								WriteUInt32Local((uint)successor.Key);
+								WriteUInt32Local(successor.Value);
 							}
 
-							WriteUInt32Local((uint)blockBody.Count);
-							output.AddRange(blockBody);
+							WriteUInt32Local((uint)encodedBlockBody.Length);
+							output.AddRange(encodedBlockBody);
 						}
 						break;
 					case ChunkStep.Functions:
@@ -619,9 +700,11 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							WriteUInt32Local(unchecked((uint)instruction.Line));
 						break;
 				}
-			}
+				}
 
-			return bytes.ToArray();
+				byte[] result = bytes.ToArray();
+				WriteUInt32(result, 6, ComputePrototypeIntegrity(result, k1, k2, k3));
+				return result;
+			}
 		}
 	}
-}

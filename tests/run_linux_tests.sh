@@ -45,7 +45,9 @@ obfuscate() {
 }
 
 obfuscate "$WORK/fixed.lua"
-python3 tests/verify_v3_payload.py "$WORK/fixed.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/fixed-vm.lua"
+python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
+python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
 "$LUA" "$WORK/fixed.lua" > "$WORK/fixed.out"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
@@ -54,7 +56,8 @@ echo "PASS single fixed configuration"
 # records. The verifier authenticates the envelope, restores its real body and
 # checks record interleaving, entropy and state-derived inner masking.
 obfuscate "$WORK/entropy-second.lua"
-python3 tests/verify_v3_payload.py "$WORK/fixed.lua" --compare "$WORK/entropy-second.lua" --tamper-dir "$WORK"
+python3 tests/verify_v4_payload.py "$WORK/fixed.lua" --compare "$WORK/entropy-second.lua" --tamper-dir "$WORK"
+python3 tests/runtime_layout.py "$WORK/fixed-vm.lua" --compare "$ROOT/temp/t2.lua"
 "$LUA" "$WORK/entropy-second.lua" > "$WORK/entropy-second.out"
 cmp "$WORK/baseline.out" "$WORK/entropy-second.out"
 for entropy_case in modify delete reorder; do
@@ -68,6 +71,21 @@ for entropy_case in modify delete reorder; do
     grep -Fq 'invalid protected payload' "$WORK/entropy-$entropy_case.stderr"
 done
 echo "PASS entropy record modification, deletion and reordering rejection after outer-tag recomputation"
+
+# Rebuild every outer/envelope layer around deliberately damaged v4 internals.
+# Each case leaves exactly the named prototype, complete block-manifest, or
+# capsule-integrity layer as the first rejecting boundary.
+for payload_case in prototype-tag block-manifest capsule-integrity; do
+    payload_file="$WORK/payload-$payload_case.lua"
+    "$LUAC" -p "$payload_file"
+    set +e
+    "$LUA" "$payload_file" > "$WORK/payload-$payload_case.stdout" 2> "$WORK/payload-$payload_case.stderr"
+    payload_code=$?
+    set -e
+    [[ $payload_code -ne 0 ]]
+    grep -Fq 'invalid protected payload' "$WORK/payload-$payload_case.stderr"
+done
+echo "PASS v4 prototype, complete block-manifest and constant-capsule tamper rejection"
 
 # Capability-gated Luau/executor probes must accept untouched native primitives,
 # preserve executor globals, and silently select the decoy route for active hooks,
@@ -120,6 +138,9 @@ import re
 import sys
 
 source = Path(sys.argv[1]).read_text("latin1")
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from runtime_layout import derive_runtime_layout
+chunk_slots = derive_runtime_layout(source)["chunk"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
     r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
@@ -130,7 +151,7 @@ if not match:
     raise SystemExit("could not locate the generated root prototype")
 root = match.group(2)
 probe = (
-    "do local d=" + root + "[13];local s=" + root + "[14];"
+    "do local d=" + root + f"[{chunk_slots[13]}];local s=" + root + f"[{chunk_slots[14]}];"
     "assert(type(d)=='table' and type(s)=='number' and d[s]==1);"
     "local n=0;for _ in pairs(d) do n=n+1;end;assert(n>=2);end;\n"
 )
@@ -155,6 +176,9 @@ import re
 import sys
 
 source = Path(sys.argv[1]).read_text("latin1")
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from runtime_layout import derive_runtime_layout
+chunk_slots = derive_runtime_layout(source)["chunk"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
     r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
@@ -164,7 +188,7 @@ match = pattern.search(source)
 if not match:
     raise SystemExit("could not locate the generated root prototype")
 root = match.group(2)
-probe = "assert(" + root + "[13]==nil and " + root + "[14]==nil);\n"
+probe = "assert(" + root + f"[{chunk_slots[13]}]==nil and " + root + f"[{chunk_slots[14]}]==nil);\n"
 source = source[:match.end(1)] + probe + source[match.end(1):]
 Path(sys.argv[2]).write_text(source, "latin1")
 PY
@@ -177,12 +201,13 @@ echo "PASS unsupported dispatcher shape falls back without partial metadata"
 # Repeat randomized prototype keys, opcode maps and schema orders.
 for ((i = 1; i <= RANDOM_RUNS; i++)); do
     obfuscate "$WORK/random.lua"
+    python3 tests/runtime_layout.py "$ROOT/temp/t2.lua" > "$WORK/runtime-layout-$i.out"
     "$LUA" "$WORK/random.lua" > "$WORK/random.out"
     cmp -s "$WORK/baseline.out" "$WORK/random.out"
 done
-echo "PASS randomized runs: $RANDOM_RUNS/$RANDOM_RUNS"
+echo "PASS randomized opcode handlers and non-identity runtime layouts: $RANDOM_RUNS/$RANDOM_RUNS"
 
-# Tamper with v3's invocation-local flow metadata only after the outer payload
+# Tamper with v4's invocation-local flow metadata only after the outer payload
 # has been authenticated and deserialized. These probes target the unminified
 # generated VM so each rejection is attributable to block/flow validation, not
 # to the top-level encrypted-payload checksum.
@@ -193,6 +218,11 @@ import sys
 
 source = Path(sys.argv[1]).read_text("latin1")
 out_dir = Path(sys.argv[2])
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from runtime_layout import derive_runtime_layout
+layout = derive_runtime_layout(source)
+chunk_slots = layout["chunk"]
+block_slots = layout["block"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
     r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
@@ -203,22 +233,34 @@ if not match:
     raise SystemExit("could not locate the generated root prototype")
 root = match.group(2)
 
+blocks_slot = chunk_slots[9]
+initial_state_slot = chunk_slots[12]
+initial_route_slot = chunk_slots[14]
+block_start_slot = block_slots[1]
+block_body_slot = block_slots[3]
+block_successors_slot = block_slots[5]
+find_entry = (
+    "do local b;for _,v in pairs(" + root + f"[{blocks_slot}]) do "
+    f"if v[{block_start_slot}]==1 then b=v;break;end;end;"
+)
 probes = {
     "block-body": (
-        "do local b;for _,v in pairs(" + root + "[9]) do if v[1]==1 then b=v;break;end;end;"
-        "assert(b and type(b[3])=='string' and #b[3]>0);"
-        "b[3]=string.char((string.byte(b[3],1)+1)%256)..string.sub(b[3],2);end;\n"
+        find_entry
+        + f"assert(b and type(b[{block_body_slot}])=='string' and #b[{block_body_slot}]>0);"
+        + f"b[{block_body_slot}]=string.char((string.byte(b[{block_body_slot}],1)+1)%256).."
+          f"string.sub(b[{block_body_slot}],2);end;\n"
     ),
-    "initial-state": root + "[12]=(" + root + "[12]+1)%4294967296;\n",
-    "dispatcher-state": root + "[14]=1;\n",
+    "initial-state": root + f"[{initial_state_slot}]=(" + root + f"[{initial_state_slot}]+1)%4294967296;\n",
+    "dispatcher-state": root + f"[{initial_route_slot}]=1;\n",
     "missing-edge": (
-        "do local b;for _,v in pairs(" + root + "[9]) do if v[1]==1 then b=v;break;end;end;"
-        "assert(b and next(b[5]));b[5]={};end;\n"
+        find_entry
+        + f"assert(b and next(b[{block_successors_slot}]));b[{block_successors_slot}]={{}};end;\n"
     ),
     "wrapped-edge-state": (
-        "do local b;for _,v in pairs(" + root + "[9]) do if v[1]==1 then b=v;break;end;end;"
-        "assert(b);local changed=false;for k,v in pairs(b[5]) do b[5][k]=(v+1)%4294967296;changed=true;break;end;"
-        "assert(changed);end;\n"
+        find_entry
+        + f"assert(b);local changed=false;for k,v in pairs(b[{block_successors_slot}]) do "
+          f"b[{block_successors_slot}][k]=(v+1)%4294967296;changed=true;break;end;"
+          "assert(changed);end;\n"
     ),
 }
 for name, probe in probes.items():
@@ -265,6 +307,11 @@ import re
 import sys
 
 source = Path(sys.argv[1]).read_text("latin1")
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from runtime_layout import derive_runtime_layout
+layout = derive_runtime_layout(source)
+chunk_slots = layout["chunk"]
+block_slots = layout["block"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
     r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
@@ -276,10 +323,12 @@ if not match:
 root = match.group(2)
 probe = (
     "_G.__ib2_lazy_opaque=function() "
-    "assert(next(" + root + "[1])==nil,'decoded instructions escaped invocation-local cache');"
-    "local n=0;local blocks=" + root + "[9];"
+    "assert(next(" + root + f"[{chunk_slots[1]}])==nil,'decoded instructions escaped invocation-local cache');"
+    "local capsules=" + root + f"[{chunk_slots[15]}];assert(type(capsules)=='table');"
+    "for _,capsule in pairs(capsules) do assert(type(capsule)=='string','plaintext constant escaped block-local cache');end;"
+    "local n=0;local blocks=" + root + f"[{chunk_slots[9]}];"
     "if blocks then for _,block in pairs(blocks) do "
-    "if type(block[3])=='string' then n=n+1;end;end;end;"
+    f"if type(block[{block_slots[3]}])=='string' then n=n+1;end;end;end;"
     "return n;end;\n"
 )
 source = source[:match.end(1)] + probe + source[match.end(1):]
@@ -288,7 +337,7 @@ PY
 "$LUAC" -p "$WORK/lazy-instrumented.lua"
 "$LUA" "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
 grep -Eq '^lazy-blocks:[1-9][0-9]*:executed-constant:37$' "$WORK/lazy-instrumented.out"
-echo "PASS ephemeral instruction cache and opaque block retention"
+echo "PASS ephemeral instruction/constant cache and opaque block retention"
 
 # Exercise Lua 5.1's SETLIST C == 0 data word without checking in a huge table
 # constructor. A test-only luac wrapper patches the one-element fixture after

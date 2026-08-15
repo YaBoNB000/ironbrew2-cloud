@@ -651,15 +651,16 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"ByteString","InstrPoint","GetFEnv","Setmetatable","Getmetatable","RawGet","RawSet","RawEqual","Next","ToNumber","ToString","ConstCount","Deserialize",
 				"Wrap","Upvalues","NewProto","Indexes","Concat","Insert","LDExp","Select","Unpack",
 				"BitXOR","gBits32","gBits8","gBits16","gFloat","gSizet","gString","gInt","Byte","Char","Sub",
-				"gBit","Instrs","Functions","Lines","Consts","Instr","Proto","Params","Top","Vararg","Args",
+				"gBit","Instrs","Functions","Lines","Consts","ConstCapsules","Capsule","Instr","Proto","Params","Top","Vararg","Args",
 				"PCount","Lupvals","Stk","Inst","Enum","Chunk","decompress","Pos","Xs","Xd","_R","Env",
 				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2","K3","OpcodeKey","FieldKey","FieldKey32","U32",
 				"DerivePermutation","Count","Domain","Values","State","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank",
+				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","StoredTag","EncodedBody","RawParts","Raw","Cons","PreviousReference","Reference",
 				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root","Blocks","BlockMap",
 				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
 				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier",
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
-				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
+				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
 				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetHook","GuardGetInfo","GuardInfo","GuardInspector",
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardGetGenV",
@@ -699,6 +700,109 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				foreach (var kv in idents)
 					s = Regex.Replace(s, "\\b" + kv.Key + "\\b", kv.Value);
 				return s;
+			}
+
+			int[] GenerateRuntimeSlotPermutation(int count)
+			{
+				int[] slots = Enumerable.Range(1, count).ToArray();
+				for (int index = slots.Length - 1; index > 0; index--)
+				{
+					int swapIndex = r.Next(index + 1);
+					(slots[index], slots[swapIndex]) = (slots[swapIndex], slots[index]);
+				}
+				// Never emit the legacy identity layout, even in the unlikely event that
+				// Fisher-Yates produced it. This guarantees fixed-index dumpers fail.
+				if (slots.Select((value, index) => value == index + 1).All(value => value))
+					(slots[0], slots[1]) = (slots[1], slots[0]);
+				return slots;
+			}
+
+			string ApplyRuntimeSlotPermutation(string code, string identifier, int[] slots)
+			{
+				string pattern = "\\b" + Regex.Escape(identifier) + @"\s*\[\s*(\d+)\s*\]";
+				string RewriteCode(string segment) => Regex.Replace(segment, pattern, match =>
+				{
+					int oldSlot = int.Parse(match.Groups[1].Value);
+					return oldSlot >= 1 && oldSlot <= slots.Length
+						? identifier + "[" + slots[oldSlot - 1] + "]"
+						: match.Value;
+				});
+
+				// Do not let an identifier-looking sequence inside a base91 payload,
+				// watermark, quoted literal, long string or comment mutate protected data.
+				// Only executable Lua spans are eligible for numeric ABI rewriting.
+				var rewritten = new StringBuilder(code.Length);
+				int plainStart = 0;
+				int index = 0;
+
+				int LongBracketLevel(int at)
+				{
+					if (at >= code.Length || code[at] != '[') return -1;
+					int cursor = at + 1;
+					while (cursor < code.Length && code[cursor] == '=') cursor++;
+					return cursor < code.Length && code[cursor] == '[' ? cursor - at - 1 : -1;
+				}
+
+				int LongBracketEnd(int at, int level)
+				{
+					string close = "]" + new string('=', level) + "]";
+					int contentStart = at + level + 2;
+					int closeAt = code.IndexOf(close, contentStart, StringComparison.Ordinal);
+					return closeAt < 0 ? code.Length : closeAt + close.Length;
+				}
+
+				void Preserve(int start, int end)
+				{
+					rewritten.Append(RewriteCode(code.Substring(plainStart, start - plainStart)));
+					rewritten.Append(code, start, end - start);
+					plainStart = end;
+					index = end;
+				}
+
+				while (index < code.Length)
+				{
+					char current = code[index];
+					if (current == '\'' || current == '"')
+					{
+						char quote = current;
+						int end = index + 1;
+						while (end < code.Length)
+						{
+							if (code[end] == '\\')
+							{
+								end = Math.Min(code.Length, end + 2);
+								continue;
+							}
+							if (code[end++] == quote) break;
+						}
+						Preserve(index, end);
+						continue;
+					}
+
+					if (current == '-' && index + 1 < code.Length && code[index + 1] == '-')
+					{
+						int commentBody = index + 2;
+						int level = LongBracketLevel(commentBody);
+						int end = level >= 0 ? LongBracketEnd(commentBody, level) : code.IndexOf('\n', commentBody);
+						if (end < 0) end = code.Length;
+						Preserve(index, end);
+						continue;
+					}
+
+					if (current == '[')
+					{
+						int level = LongBracketLevel(index);
+						if (level >= 0)
+						{
+							Preserve(index, LongBracketEnd(index, level));
+							continue;
+						}
+					}
+					index++;
+				}
+
+				rewritten.Append(RewriteCode(code.Substring(plainStart)));
+				return rewritten.ToString();
 			}
 
 			bool useRepeat = r.Next(2) == 0;
@@ -879,89 +983,115 @@ local ToNumber = tonumber;");
 				.Replace("__IB2_WATERMARK__", EscapeLuaString(settings.Watermark))
 				.Replace("__IB2_OPCODE_COUNT__", virtuals.Count.ToString()));
 			
-			// 每个 prototype 根据自身 K1/K2/K3 派生独立字段顺序。
-			// 指令字段只读取 block framing；常量恢复后再把引用绑定到各 opaque block。
-			vm += T(@"local Schema = DerivePermutation(5, K1, K2, K3, 113);
-for StepIndex = 1, 5 do
-    local Step = Schema[StepIndex];
-    if (Step == 0) then
-        Chunk[3] = gBits8();
-    elseif (Step == 1) then
-        for Idx = 1, gBits32() do
-            local Type = gBits8();
-            local Cons;
-            if (Type == ConstTags[1]) then Cons = nil;
-            elseif (Type == ConstTags[2]) then Cons = (gBits8() ~= 0);
-            elseif (Type == ConstTags[3]) then Cons = gFloat();
-            elseif (Type == ConstTags[4]) then Cons = gString(nil, Idx, K1, K2, K3);
-            end;
-            Consts[Idx] = Cons;
-        end;
-    elseif (Step == 2) then
+				// 每个 prototype 根据自身 K1/K2/K3 派生独立字段顺序。
+				// 常量在这里仅按 capsule framing 切片；认证和明文恢复延迟到 block 进入时。
+				vm += T(@"local Schema = DerivePermutation(5, K1, K2, K3, 113);
+	for StepIndex = 1, 5 do
+	    local Step = Schema[StepIndex];
+	    if (Step == 0) then
+	        Chunk[3] = gBits8();
+	    elseif (Step == 1) then
+	        local ConstCount = gBits32();
+	        for Idx = 1, ConstCount do
+	            local Length = gBits32();
+	            if Length < 5 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
+	            ConstCapsules[Idx] = Sub(ByteString, Pos, Pos + Length - 1);
+	            Pos = Pos + Length;
+	        end;
+	    elseif (Step == 2) then
         InstrCount = gBits32();
         BlockCount = gBits32();
         Chunk[11] = BlockCount;
         Chunk[12] = gBits32();
         InitialRouteToken = gBits32();
-        for BlockIndex = 1, BlockCount do
-            local BlockStart = gBits32();
-            local Count = gBits32();
-            local RouteToken = gBits32();
-            local RefCount = gBits32();
-            local References = {};
-            for ReferenceIndex = 1, RefCount do References[ReferenceIndex] = gBits32(); end;
-            local Verifier = gBits32();
-            local BlockTag = gBits32();
-            local SuccessorCount = gBits32();
-            local Successors = {};
-            for SuccessorIndex = 1, SuccessorCount do
-                local SuccessorStart = gBits32();
-                Successors[SuccessorStart] = gBits32();
-            end;
-            local Length = gBits32();
-            local Block = {BlockStart, Count, Sub(ByteString, Pos, Pos + Length - 1), References, Successors, Verifier, BlockTag, RouteToken};
-            Pos = Pos + Length;
-            Blocks[BlockIndex] = Block;
-            if RouteToken ~= 0 then
-                if RouteToken <= InstrCount or Dispatcher[RouteToken] then error('invalid protected payload', 0); end;
-                Dispatcher[RouteToken] = BlockStart;
-                RouteCount = RouteCount + 1;
-            end;
-            for Offset = 0, Count - 1 do BlockMap[BlockStart + Offset] = Block; end;
-        end;
-    elseif (Step == 3) then
-        for Idx = 1, gBits32() do
-            local Length = gBits32();
-            Functions[Idx - 1] = Sub(ByteString, Pos, Pos + Length - 1);
-            Pos = Pos + Length;
-        end;");
+	        for BlockIndex = 1, BlockCount do
+	            local BlockStart = gBits32();
+	            local Count = gBits32();
+	            local RouteToken = gBits32();
+	            if BlockStart < 1 or Count < 1 or BlockStart + Count - 1 > InstrCount then error('invalid protected payload', 0); end;
+	            local RefCount = gBits32();
+	            local References = {};
+	            local PreviousReference = 0;
+	            for ReferenceIndex = 1, RefCount do
+	                local Reference = gBits32();
+	                if Reference <= PreviousReference then error('invalid protected payload', 0); end;
+	                References[ReferenceIndex], PreviousReference = Reference, Reference;
+	            end;
+	            local Verifier = gBits32();
+	            local BlockTag = gBits32();
+	            local SuccessorCount = gBits32();
+	            local Successors = {};
+	            local SuccessorRecords = {};
+	            local PreviousSuccessor = 0;
+	            for SuccessorIndex = 1, SuccessorCount do
+	                local SuccessorStart = gBits32();
+	                local WrappedState = gBits32();
+	                if SuccessorStart <= PreviousSuccessor then error('invalid protected payload', 0); end;
+	                Successors[SuccessorStart] = WrappedState;
+	                SuccessorRecords[SuccessorIndex] = {SuccessorStart, WrappedState};
+	                PreviousSuccessor = SuccessorStart;
+	            end;
+	            local Length = gBits32();
+	            if Length < 1 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
+	            local Block = {};
+	            Block[1] = BlockStart;
+	            Block[2] = Count;
+	            Block[3] = Sub(ByteString, Pos, Pos + Length - 1);
+	            Block[4] = References;
+	            Block[5] = Successors;
+	            Block[6] = Verifier;
+	            Block[7] = BlockTag;
+	            Block[8] = RouteToken;
+	            Block[9] = SuccessorRecords;
+	            Pos = Pos + Length;
+	            Blocks[BlockIndex] = Block;
+	            if RouteToken ~= 0 then
+	                if RouteToken <= InstrCount or Dispatcher[RouteToken] then error('invalid protected payload', 0); end;
+	                Dispatcher[RouteToken] = BlockStart;
+	                RouteCount = RouteCount + 1;
+	            end;
+	            for Offset = 0, Count - 1 do
+	                if BlockMap[BlockStart + Offset] then error('invalid protected payload', 0); end;
+	                BlockMap[BlockStart + Offset] = Block;
+	            end;
+	        end;
+	    elseif (Step == 3) then
+	        for Idx = 1, gBits32() do
+	            local Length = gBits32();
+	            if Length < 10 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
+	            Functions[Idx - 1] = Sub(ByteString, Pos, Pos + Length - 1);
+	            Pos = Pos + Length;
+	        end;");
 
 			if (settings.PreserveLineInfo)
 				vm += T(@"    elseif (Step == 4) then
         for Idx = 1, gBits32() do Lines[Idx] = gBits32(); end;");
 
-			vm += T(@"    end;
-end;
+				vm += T(@"    end;
+	end;
 
-if InitialRouteToken ~= 0 then
-    if RouteCount ~= BlockCount or Dispatcher[InitialRouteToken] ~= 1 then error('invalid protected payload', 0); end;
-    Chunk[13], Chunk[14] = Dispatcher, InitialRouteToken;
-elseif RouteCount ~= 0 then
-    error('invalid protected payload', 0);
-end;
+	if Pos ~= PrototypeLength + 1 or Chunk[3] == nil then error('invalid protected payload', 0); end;
+	if InitialRouteToken ~= 0 then
+	    if RouteCount ~= BlockCount or Dispatcher[InitialRouteToken] ~= 1 then error('invalid protected payload', 0); end;
+	    Chunk[13], Chunk[14] = Dispatcher, InitialRouteToken;
+	elseif RouteCount ~= 0 then
+	    error('invalid protected payload', 0);
+	end;
 
-for BlockIndex = 1, BlockCount do
-    local Block = Blocks[BlockIndex];
-    local References = Block[4];
-    local ConstCache = {};
-    for ReferenceIndex = 1, #References do
-        local Index = References[ReferenceIndex];
-        ConstCache[Index] = Consts[Index];
-    end;
-    Block[4] = ConstCache;
-end;
--- Constants are retained only by the opaque blocks that reference them.
-Consts = nil;");
+	for Index = 1, InstrCount do if not BlockMap[Index] then error('invalid protected payload', 0); end; end;
+	for BlockIndex = 1, BlockCount do
+	    local Block = Blocks[BlockIndex];
+	    local References = Block[4];
+	    for ReferenceIndex = 1, #References do
+	        if type(ConstCapsules[References[ReferenceIndex]]) ~= 'string' then error('invalid protected payload', 0); end;
+	    end;
+	    local SuccessorRecords = Block[9];
+	    for SuccessorIndex = 1, #SuccessorRecords do
+	        local SuccessorStart = SuccessorRecords[SuccessorIndex][1];
+	        local SuccessorBlock = BlockMap[SuccessorStart];
+	        if not SuccessorBlock or SuccessorBlock[1] ~= SuccessorStart then error('invalid protected payload', 0); end;
+	    end;
+	end;");
 
 			vm += T("return Chunk;end;");
 
@@ -979,15 +1109,60 @@ local function GetProto(Proto, Index)
     return Encoded;
 end;
 
+local function DecodeConstantCapsule(Capsule, Index, K1, K2, K3, ConstTags)
+    local SavedByteString, SavedPos = ByteString, Pos;
+    ByteString, Pos = Capsule, 1;
+    local StoredTag = gBits32();
+    local EncodedBody = Sub(Capsule, 5);
+    if ComputeConstantIntegrity(EncodedBody, Index, K1, K2, K3) ~= StoredTag then error('invalid protected payload', 0); end;
+    local State = ConstantMaskState(Index, K1, K2, K3);
+    local RawParts = {};
+    for I = 1, #EncodedBody do
+        local Mask = (State - State % 16777216) / 16777216;
+        RawParts[I] = Char(BitXOR(Byte(EncodedBody, I, I), Mask));
+        State = (State * 1664525 + 1013904223) % 4294967296;
+    end;
+    local Raw = Concat(RawParts);
+    ByteString, Pos = Raw, 1;
+    local Type = gBits8();
+    local Cons;
+    if Type == ConstTags[1] then
+        Cons = nil;
+    elseif Type == ConstTags[2] then
+        local Value = gBits8();
+        if Value > 1 then error('invalid protected payload', 0); end;
+        Cons = Value ~= 0;
+    elseif Type == ConstTags[3] then
+        Cons = gFloat();
+    elseif Type == ConstTags[4] then
+        local Length = gBits32();
+        if Pos + Length - 1 > #Raw then error('invalid protected payload', 0); end;
+        Cons = Sub(Raw, Pos, Pos + Length - 1);
+        Pos = Pos + Length;
+    else
+        error('invalid protected payload', 0);
+    end;
+    if Pos ~= #Raw + 1 then error('invalid protected payload', 0); end;
+    ByteString, Pos = SavedByteString, SavedPos;
+    return Cons;
+end;
+
 local function DecodeInstructionBlock(Chunk, Block, EntryState)
     local SavedByteString, SavedPos = ByteString, Pos;
     local K1, K2, K3 = Chunk[5], Chunk[6], Chunk[7];
-    if ComputeBlockIntegrity(Block[3], EntryState, Block[1], Block[2], K1, K2, K3) ~= Block[7] then
+    local References = Block[4];
+    local ConstCapsules = Chunk[15];
+    if ComputeBlockIntegrity(Block[3], EntryState, Block[1], Block[2], Block[8], References, ConstCapsules, Block[6], Block[9], K1, K2, K3) ~= Block[7] then
         error('invalid protected payload', 0);
+    end;
+    local ConstTags = DerivePermutation(4, K1, K2, K3, 911);
+    local ConstCache = {};
+    for ReferenceIndex = 1, #References do
+        local Index = References[ReferenceIndex];
+        ConstCache[Index] = DecodeConstantCapsule(ConstCapsules[Index], Index, K1, K2, K3, ConstTags);
     end;
     ByteString, Pos = Block[3], 1;
     __IB2_DECODE_TARGET__
-    local ConstCache = Block[4];
     for Offset = 0, Block[2] - 1 do
         local Index = Block[1] + Offset;
         local Descriptor = BitXOR(gBits8(), BlockFieldKey(EntryState, Index, 7, K1, K2, K3));
@@ -1020,6 +1195,7 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState)
             Instrs[Index] = Inst;
         end;
     end;
+    if Pos ~= #Block[3] + 1 then error('invalid protected payload', 0); end;
     ByteString, Pos = SavedByteString, SavedPos;
     __IB2_DECODE_FINALIZE__
 end;
@@ -1084,10 +1260,13 @@ end;";
 					.Replace("__IB2_DECODE_TARGET__", "local Instrs = {};")
 					.Replace("__IB2_DECODE_FINALIZE__", "return Instrs;")
 					.Replace("__IB2_CACHE_SEQUENTIAL__", "local IsSequential = CurrentBlock ~= nil and CurrentBlock == Block and Index == LastIndex + 1;")
-					.Replace("__IB2_INSTRUCTION_LOOKUP__", @"local FlowCache = Flow[4];
+						.Replace("__IB2_INSTRUCTION_LOOKUP__", @"local FlowCache = Flow[4];
     if not IsSequential or not FlowCache or FlowCache[1] ~= Block or FlowCache[2] ~= EntryState then
         local DecodedInstrs = DecodeInstructionBlock(Chunk, Block, EntryState);
-        FlowCache = {Block, EntryState, DecodedInstrs};
+        FlowCache = {};
+        FlowCache[1] = Block;
+        FlowCache[2] = EntryState;
+        FlowCache[3] = DecodedInstrs;
         Flow[4] = FlowCache;
     end;
     local Inst = FlowCache[3][Index];
@@ -1098,7 +1277,7 @@ end;";
 			{
 				blockRuntime = blockRuntime
 					.Replace("__IB2_DECODE_TARGET__", "local Instrs = Chunk[1];")
-					.Replace("__IB2_DECODE_FINALIZE__", "Block[3], Block[4], Block[7] = nil, nil, nil; Chunk[11] = Chunk[11] - 1; if Chunk[11] == 0 then Chunk[9] = nil; end;")
+					.Replace("__IB2_DECODE_FINALIZE__", "Block[3], Block[4], Block[7], Block[9] = nil, nil, nil, nil; Chunk[11] = Chunk[11] - 1; if Chunk[11] == 0 then Chunk[9], Chunk[15] = nil, nil; end;")
 					.Replace("__IB2_CACHE_SEQUENTIAL__", "")
 					.Replace("__IB2_INSTRUCTION_LOOKUP__", "local Inst = Chunk[1][Index]; if Inst then return Inst; end; DecodeInstructionBlock(Chunk, Block, EntryState); Inst = Chunk[1][Index]; if not Inst then error('invalid protected payload', 0); end; return Inst;");
 			}
@@ -1222,7 +1401,19 @@ end;";
 				.Replace("OP_B", "3")
 				.Replace("OP_C", "4");
 
-			
+			// Build-wide runtime ABI randomization. All table constructors above use
+			// explicit keyed assignments, so these independent permutations cover every
+			// Chunk/Block/Flow/cache access, including opcode handlers after T().
+			int[] chunkSlots = GenerateRuntimeSlotPermutation(15);
+			int[] blockSlots = GenerateRuntimeSlotPermutation(9);
+			int[] flowSlots = GenerateRuntimeSlotPermutation(4);
+			int[] flowCacheSlots = GenerateRuntimeSlotPermutation(3);
+			vm = ApplyRuntimeSlotPermutation(vm, idents["Chunk"], chunkSlots);
+			foreach (string blockAlias in new[] {"Block", "CurrentBlock", "NextBlock", "SuccessorBlock"})
+				vm = ApplyRuntimeSlotPermutation(vm, idents[blockAlias], blockSlots);
+			vm = ApplyRuntimeSlotPermutation(vm, idents["Flow"], flowSlots);
+			vm = ApplyRuntimeSlotPermutation(vm, idents["FlowCache"], flowCacheSlots);
+
 			return vm;
 		}
 	}

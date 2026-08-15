@@ -11,15 +11,15 @@
 
 ## 2. 已完成的源码改动
 
-### 2.1 v3 payload 与分层完整性
+### 2.1 v4 payload 与分层完整性
 
-`Serializer.cs` 与 `VMStrings.cs` 已同步切换到 v3 格式：
+`Serializer.cs` 与 `VMStrings.cs` 已同步切换到 v4 格式：
 
 ```text
 4B head/salt | 4B outer integrity tag | 1B version+feature flags | encrypted entropy envelope
 ```
 
-- 高 4 位为格式版本，目前必须为 `3`；v2/旧 Release 产物会被新版 VM 明确拒绝。
+- 高 4 位为格式版本，目前必须为 `4`；v3/旧 Release 产物会被新版 VM 明确拒绝。
 - 低位 bit 0 表示 DEFLATE，bit 1 表示 basic-block lazy decode，bit 2 表示 route-state dispatcher framing，新增 bit 3 表示 authenticated entropy envelope。固定配置四项全部开启，因此 feature 值为 `15`。
 - 顶层完整性值绑定格式/feature 字节、整个加密 envelope 和运行 seed，并在外层解密前验证。
 - 真实序列化 body 先按现有配置做 raw DEFLATE，再以由 entropy digest、nonce、seed、真实长度和独立 domain 派生的内层流状态逐字节掩码；恢复正文不再只依赖原有外层 XOR。
@@ -27,8 +27,9 @@
 - envelope 固定头记录真实/entropy 总长度、total/data/entropy record 数、nonce、entropy digest 和 envelope tag。每个 record 另有 kind、ordinal、长度 framing 和 bytes。
 - entropy digest 绑定 seed、nonce、总长度、record 数、每个 logical ordinal/长度和全部 entropy bytes，并直接参与内层真实 body mask 的初始状态。即使某个 entropy record 位于最后，它仍会改变真实流恢复状态，因此随机区不是可裁掉的尾部 padding。
 - 独立 envelope tag 绑定固定头（排除 tag 自身）、全部 record framing、record bytes 和物理顺序。VM 在 inflate 前还严格检查长度范围/终态、record 数、kind、ordinal 唯一性、logical 总长度和 digest。
-- v3 另为每个 opaque instruction block 写入绑定入口状态、块起点/长度、prototype keys 与 body bytes 的完整性 tag；从 opaque body 解码前认证该块。
-- 修改加密 payload、删除/修改/重排 entropy record、篡改已反序列化后的 block body 或 flow metadata 都会以 `invalid protected payload` 失败。
+- v4 为每个 prototype 写入覆盖完整 prototype slice 的独立 tag；VM 在解析 prototype-local schema、block、capsule 与 child framing 前先验证。
+- 每个 block 的认证范围已从 body tag 扩展为完整 manifest：绑定块起点/长度、route token、有序常量引用及引用 capsule 的完整 bytes、flow verifier、有序 successor/wrapped-state records、body 长度/body bytes，以及 prototype keys/state。
+- 修改加密 payload、删除/修改/重排 entropy record，或在重新计算外层 tag 后篡改 prototype、完整 block manifest、constant capsule、flow metadata 或 body，都会以 `invalid protected payload` 失败。
 - K1/K2 不再位于固定明文头。
 
 上述 envelope 在 basE91 前固定新增 65,536–98,304 bytes entropy，另有少量 framing；生成 Lua 的实际文本增量还包含 basE91 约 1.23 倍展开。这是当前唯一配置有意接受的保护/体积取舍。完整性机制用于检测损坏和提高直接 patch/裁剪成本；算法、seed（默认未锁环境时）和验证代码都交付给客户端，因此不是不可伪造的服务端信任根。
@@ -51,9 +52,10 @@
 
 - 移除了全局 `ConstantMapping`、简单 tag rotation 及 `CONST_*` 模板替换。
 - Nil、Boolean、Number、String 四种 tag 由每个 prototype 的 K1/K2/K3 和独立 domain 做完整 Fisher–Yates permutation。
-- 字符串常量在外层 payload 加密之外，再按 prototype keys 和 1-based 常量索引逐字节编码。
-- 指令字段允许排在常量字段之前：instruction framing 记录各块使用的常量索引，五类字段读取完毕后才为每个 opaque block 建立最小引用表。
-- prototype 的临时常量 decode cache 随后立即清空。默认 AntiDump 模式下，各 opaque block 只保留自身最小常量引用集合，进入块时解析 A/B/C 常量引用，重入时可重新认证和解码；未执行子 prototype 的常量不会在启动时恢复。
+- v4 不在 prototype 解析时生成明文常量数组。每个值以绑定 prototype keys、1-based 常量索引、permuted type、encoded 长度与 encoded bytes 的独立认证 capsule 保存；字符串仍使用 prototype/索引相关的逐字节编码。
+- 指令字段允许排在 capsule 字段之前：instruction framing 记录每块的有序常量索引，prototype-local schema 全部解析后再做完整 block manifest 交叉验证。
+- `DecodeInstructionBlock` 先认证包括完整引用 capsule bytes 在内的 manifest，再在该次函数调用的局部 `ConstCache` 恢复被引用值并解析 A/B/C 常量引用。缓存不写回 Chunk/Block，也不跨 block 或 closure invocation 共享。
+- 默认 AntiDump 模式保留 opaque capsule 和 opaque block body，重入时重新认证、重新恢复。未进入块的常量和未执行子 prototype 的常量均不会提前成为明文。
 - 测试输入中的字符串、嵌套闭包标签和二进制字符串没有以源码字面量出现在生成结果中。
 
 ### 2.4 子 prototype 按需恢复
@@ -68,12 +70,12 @@
 - 新增 `ControlFlowGraph` / `ControlFlowBlock` IR 模型，在 opcode mutation 前建立 instruction-indexed successor、predecessor 与 leader；长直线自然区域再按最多 24 条指令细分。
 - CFG 明确建模 JMP、FORLOOP、IronBrew 优化后的 FORPREP 双路径、comparison/Test/TForLoop companion JMP、`LOADBOOL` skip、`SETLIST C==0` data word、RETURN/TAILCALL 终止路径及自环/多前驱。
 - 每个块由 CSPRNG 分配独立非零 32 位 entry state；prototype framing 只写包装后的初始状态，每条合法 successor record 写目标块 1-based start PC 与由源状态、源末 PC、目标 PC 包装的目标状态。
-- 每块独立写入 1-based start PC、instruction count、随机 dispatcher route token（不适用时为 0）、最小常量引用集合、state verifier、body integrity tag、successor records、body length 和 opaque body；块的物理写入顺序由 CSPRNG 打乱。
+- 每块独立写入 1-based start PC、instruction count、随机 dispatcher route token（不适用时为 0）、有序常量 capsule 引用、state verifier、complete manifest tag、successor records、body length 和 opaque body；块的物理写入顺序由 CSPRNG 打乱。
 - descriptor、opcode、A/B/C/Bx/sBx 除 prototype/PC mask 外再叠加 entry-state mask。没有认证入口状态时，即使已知 PC 与 prototype keys 也不能直接按旧格式独立恢复字段。
 - prototype 初始恢复只读取 block framing 并保存 body slice，不恢复 instruction table；统一的 `GetInstruction(Chunk, PC, Flow)` 先验证初始入口、块内顺序或显式 edge，再验证目标 state/verifier，然后认证并解码整个目标块。
-- `Flow[1..3]` 分别保存该 invocation 的 last PC、current block 与 entry state；默认 AntiDump 模式下 `Flow[4]` 保存当前 block/state/instruction 临时缓存。每次 wrapper 调用独立创建 Flow，因此递归/重复调用不会共享控制流游标或明文块。
-- 主 while/repeat wrapper、`OP_CLOSURE` 的 upvalue 伪指令和可选 superoperator 的内部取指全部经过同一 accessor；dispatcher 也必须结合 `Flow[3]` 才能恢复 opcode。
-- 默认 AntiDump 模式不会把明文块写入共享 `Chunk[1]`，也不会清除 opaque body、块级常量引用和 body tag；跨块或非顺序转移会替换 `Flow[4]`，块重入时重新认证和解码。因此正常执行路径不会在共享 prototype 表里逐步累积完整明文 instruction table。
+- Flow 的四个逻辑字段分别保存该 invocation 的 last PC、current block、entry state 和当前 block/state/instruction 临时缓存；其物理数字槽由每次构建的 Flow permutation 决定。每次 wrapper 调用独立创建 Flow，因此递归/重复调用不会共享控制流游标、明文常量或明文块。
+- 主 while/repeat wrapper、`OP_CLOSURE` 的 upvalue 伪指令和可选 superoperator 的内部取指全部经过同一 accessor；dispatcher 也必须结合当前 Flow 的随机化 entry-state 槽才能恢复 opcode。
+- 默认 AntiDump 模式不会把明文块写入共享 instruction 槽，也不会清除 opaque body、capsule、引用索引和 manifest tag；跨块或非顺序转移会替换随机化的 FlowCache 槽。块重入时重新认证 manifest、恢复引用常量并解码 body，因此正常执行路径不会在共享 prototype 表里逐步累积完整明文 instruction/constant table。
 - 库级调用若显式关闭 AntiDump，仍可使用原共享 lazy cache 路径；唯一固定 CLI 配置始终启用 invocation-local 临时缓存。
 
 ### 2.6 自动 route-state dispatcher flattening
@@ -98,13 +100,23 @@
 
 这些变换改变生成源码结构而不改变指令执行次序、寄存器语义或 opcode bank。handler 仍是每次构建生成一组，并非按 prototype 复制一整套 VM。
 
-### 2.8 随机源
+### 2.8 运行时槽位 ABI 随机化
+
+- 生成器每次构建一次性产生四组 build-wide Fisher–Yates permutation：Chunk 15 槽、Block 9 槽、Flow 4 槽、FlowCache 3 槽；若随机结果恰为 identity，会交换前两项以强制非 identity。
+- 该层不是只改局部变量名。prototype/block 构造器、VM helper、opcode handler、CurrentBlock/NextBlock/SuccessorBlock aliases 和 line-info 路径中的所有数字索引，都会在 minify 前按同一映射重写。
+- 重写器使用轻量 Lua lexical scan 跳过单双引号、long string 和注释，避免 base91 payload、watermark 或普通字符串中偶然形似 `identifier[number]` 的内容被改写。
+- Chunk 与 Block constructor 使用显式 keyed assignment，字段物理位置不再依赖 table constructor 的顺序；同一生成文件内所有 prototype 和 block 共享一套 ABI，保证运行一致性。
+- `tests/runtime_layout.py` 从生成 Lua 独立恢复四组 old logical slot → generated physical slot 映射，验证每组都是完整非 identity permutation，并静态确认三个 block alias 使用同一随机布局。独立构建比较还要求至少一组 ABI 发生变化。
+
+槽位随机化用于破坏依赖旧固定数字索引的通用 dump 脚本，不把客户端 ABI 描述为秘密；分析者仍可从单个生成 VM 恢复该次布局。
+
+### 2.9 随机源
 
 - prototype keys、salt、XOR seed、64–96 KiB entropy、envelope nonce/record split/物理 shuffle 和随机选择改用操作系统 CSPRNG。
 - 仍需要 `System.Random` 接口的代码生成器、控制流及可选变换，改为使用 CSPRNG seed，避免同一时钟窗口产生相同序列。
 - 清理了不再使用的旧 XOR key 和全局常量映射字段。
 
-### 2.9 Luau/Roblox 反调试与 AntiDump
+### 2.10 Luau/Roblox 反调试与 AntiDump
 
 本轮在上一版 VM-integrated guard 基础上，筛选吸收了附件 `反调试v5.4.txt` 中可移植的分层探针、快照、provenance 和多信号评分思路；没有照搬其破坏性或高误报行为。
 
@@ -116,32 +128,33 @@
 - capability 不存在时保持普通 Lua 5.1 兼容；`getgc`、`hookfunction`、文件 API 或 load API 仅仅存在不会触发。正常 capability 环境也不得修改 executor global。
 - 检测命中后不输出阻断原因，也不抛出可识别的专用错误，而是在当前 invocation 执行固定上限的诱饵计算后静默返回。没有网络/文件探测、后台线程或 registry 深扫，也没有无限循环、递归崩溃、大内存分配或全局 API 覆盖。
 - guard 触发状态在当前 VM 运行期保持，避免通过首次检查后再安装 hook；全部新增 guard 局部名都进入生成器 identifier map，每次构建继续随机化。
-- 指令驻留防 dump 与上述 guard 同属 `AntiDump` 固定开关：共享 `Chunk[1]` 不积累明文，当前 invocation 的 `Flow[4]` 最多保留一个已认证块，跨块后替换，重入时从 opaque body 重建。
+- 指令驻留防 dump 与上述 guard 同属 `AntiDump` 固定开关：共享 Chunk 的随机化 instruction 槽不积累明文，当前 invocation 的随机化 FlowCache 槽最多保留一个已认证块；跨块后替换，重入时从 opaque manifest/capsule/body 重建。
 - `DefenseGenerator` 仅保留为空的兼容 shim，`AggressiveDefense` 也不再恢复旧 API hook 或 registry 扫描行为。
 
 这些机制提高动态收集成本，但不是服务端反作弊。所有探针、阈值和诱饵都在客户端，有能力的分析者可以 patch guard、伪造 capability/provenance 返回值，或在 accessor/handler 内收集每个临时块。
 
-### 2.10 EnvironmentLock
+### 2.11 EnvironmentLock
 
 - salt 与最终序列化 seed 的关系已核对：开启时头部写 salt，构建端和运行端都以相同 fingerprint 派生 seed；关闭时头部直接写随机 seed。
 - 完整性验证使用最终 seed，因此错误环境会在正文恢复前失败。
 - EnvironmentLock 是独立、严格的 Roblox 环境锁，固定 CLI 配置不启用它。若库调用方显式开启，预期 fingerprint 和算法仍随客户端交付，可被有能力的攻击者 patch。
 
-### 2.11 line info 与 Linux 工具链
+### 2.12 line info 与 Linux 工具链
 
-- line-info wrapper 从错误的 `Chunk[7]` 修正为 `Chunk[4]`。
+- line-info wrapper 的 legacy logical field 从错误的 Chunk 槽 7 修正为逻辑槽 4；v4 生成时该逻辑槽再与其余 Chunk 字段一起映射到随机物理槽。
 - LuaSrcDiet 的 `LUA_PATH` 由 C# 显式设置，不再依赖调用者当前目录。
 - 最终 minifier 非零退出码现在会被当作构建失败。
 
-### 2.12 单一 CLI 配置
+### 2.13 单一 CLI 配置
 
 CLI、Windows 拖放脚本和 GitHub Actions 均取消强度档位，统一使用原 `mid` 的稳定行为：
 
 | 设置 | 固定值 |
 |---|---:|
-| v3 schema / prototype keys / block-state 字段编码 / 常量内层编码 / 分层完整性检查 | 开 |
+| v4 schema / prototype keys / block-state 字段编码 / block-local constant capsule / prototype + complete block manifest 完整性检查 | 开 |
 | 64–96 KiB authenticated/state-coupled entropy envelope（feature bit 3） | 开 |
 | child prototype / CFG basic-block 两级按需恢复、自动 route-state dispatcher 与合法 edge/state 验证 | 开 |
+| Chunk/Block/Flow/FlowCache 四组 build-wide 非 identity 运行时槽位 permutation | 开 |
 | handler / 双 handler dispatch leaf 结构多态 | 开 |
 | ControlFlow | 开 |
 | DEFLATE | 开 |
@@ -172,7 +185,7 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | 检查 | 结果 |
 |---|---|
 | Release build | 通过，0 warnings / 0 errors |
-| Release 生成 payload header | 通过，version 3 / features 15（DEFLATE + block flow + dispatcher + entropy envelope） |
+| Release 生成 payload header | 通过，version 4 / features 15（DEFLATE + block flow + dispatcher + entropy envelope） |
 | entropy envelope 规模/熵值/完整恢复 | 通过，每次 64–96 KiB，Shannon entropy ≥ 7.95 bits/byte，真实 DEFLATE body 可恢复 |
 | 两次生成 entropy/nonce/digest 独立 | 通过 |
 | 重新计算外层 tag 后修改、删除、重排 entropy record | 通过，三种均由 envelope 层拒绝 |
@@ -181,6 +194,9 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | 固定配置随机构建 | 20/20 通过 |
 | 旧 `--strength` 参数拒绝 | 通过，退出码 2 |
 | prototype-local schema / tag / opcode bank 随机构建 | 通过 |
+| 完整 prototype tag、complete block manifest、constant capsule 的可重封装内层篡改 | 通过，三类均由 v4 内层认证拒绝 |
+| Chunk 15 / Block 9 / Flow 4 / FlowCache 3 槽位完整非 identity permutation | 20/20 通过 |
+| 独立构建 runtime ABI 比较及 block aliases 一致性 | 通过，至少一组完整 ABI 变化，Current/Next/Successor aliases 均匹配 |
 | handler 等价模板 / 双 handler leaf 随机结构与 Lua 语法 | 20/20 通过 |
 | nested closure / upvalue / lazy child prototype / closure 伪指令 | 通过 |
 | 30 个 upvalue 的 Closure 伪指令跨 24 条 block 边界 | 通过 |
@@ -188,13 +204,13 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | 无 marker 普通 prototype 自动 dispatcher 命中与完整 route map | 通过 |
 | 单块、畸形 companion/SETLIST/Closure prototype 安全回退且无部分 route metadata | 通过 |
 | basic-block 进入时认证与 invocation-local 单块临时解码 | 通过 |
-| root `Chunk[1]` 不积累明文，opaque body 在已执行/未执行 block 中均保留 | 通过 |
+| root 的随机化 instruction 槽不积累明文；constant store 保持 opaque capsule；已执行/未执行 block 的 opaque body 均保留 | 通过 |
 | 无 capability / 模拟 Luau capability 的正常输出 | 通过 |
 | wrapped `string.byte`、`rawset`、`debug.getinfo`、活动 `debug` hook、矛盾 `iscclosure`/`islclosure` 的静默诱饵（0 bytes 输出） | 通过 |
 | guard 启动、root 反序列化后、jittered dispatch 三阶段调用 | 通过 |
 | 新增 guard 局部名随机化，最终输出无稳定 `Guard*` 标识符 | 通过 |
 | executor `hookfunction`、`getgenv` 与 closure classifier 等全局能力不被修改 | 通过 |
-| block body、初始 state、dispatcher state、缺失 edge、wrapped edge state 的反序列化后篡改 | 通过，均拒绝 |
+| block body、完整 manifest、初始 state、dispatcher state、缺失 edge、wrapped edge state 的反序列化后篡改 | 通过，均拒绝 |
 | 分支/循环/递归/table constructor 与块级常量引用 | 通过 |
 | `SETLIST C==0` 后继 data word（测试侧 patch Lua 5.1 chunk） | 通过 |
 | boolean、number、二进制 string 常量 | 通过 |
@@ -217,7 +233,8 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 - `tests/luac_setlist_c0_wrapper.py`（仅测试时构造 `SETLIST C==0` data word）
 - `tests/line_error.lua`
 - `tests/signed_bit_runner.lua`
-- `tests/verify_v3_payload.py`
+- `tests/verify_v4_payload.py`
+- `tests/runtime_layout.py`
 - `tests/run_linux_tests.sh`
 
 ### 3.1 CI 与多平台构建
@@ -234,8 +251,8 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 ## 4. 仍存在的边界
 
 1. 这是客户端混淆，不是密码学保密。seed、fingerprint、VM、prototype banks、entropy envelope 派生和校验逻辑最终都在攻击者可执行的客户端中；state coupling 能阻止无脑裁剪，却不能阻止分析者同步 patch/重实现客户端验证器。
-2. 字段 schema、常量 tag 与 opcode bank 按 prototype 变化，block mask 和 edge wrapping 再依赖 CFG entry state；但所有派生、guard 与验证逻辑仍在客户端。有能力的分析者可以 patch capability 探针，或 hook dispatch、`GetProto`、`GetInstruction`、handler 与当前 `Flow[4]` 收集执行路径和临时块。
-3. root prototype 的 schema、常量值和 block framing 仍在启动时恢复；延迟的是 instruction block body。默认 AntiDump 模式不会在共享 `Chunk[1]` 累积明文指令，但相关 opaque block 仍持有重解码所需的最小常量引用，并不是逐次常量使用时才恢复。
+2. 字段 schema、常量 tag 与 opcode bank 按 prototype 变化，block mask 和 edge wrapping 再依赖 CFG entry state；但所有派生、guard、v4 验证逻辑与该次 runtime slot ABI 仍在客户端。有能力的分析者可以 patch capability 探针，或 hook dispatch、`GetProto`、`GetInstruction`、handler 与随机化 FlowCache 槽收集执行路径、临时常量和指令块。
+3. root prototype 的 schema、opaque constant capsules 和 block framing 仍在启动时恢复，但常量值只在引用它的完整 block manifest 认证后进入一次 block decode 的 invocation-local cache。默认 AntiDump 模式不会在共享 Chunk 表累积明文常量或指令；不过 capsule、索引和恢复算法都留在客户端，分析者仍可 hook capsule decode 或逐块触发执行来收集值。
 4. CFG state 是客户端执行一致性与反静态批量恢复机制，不是不可伪造的 CFI 信任根。修改 VM、跳过 verifier，或在每个临时块进入 handler 前主动收集，仍可绕过本地保护。
 5. 当前每个 block 使用一个固定 entry state；多前驱通过不同 wrapped edge 恢复同一目标状态。尚未实现按 predecessor 产生多版本 block 或动态 state merge。
 6. 自动 dispatcher 已按 prototype 启用，但它复用随机物理 block 和 VM route token，不是把原 Lua 指令复制成多版本 block；客户端仍可在 route 解析后观测真实 PC。

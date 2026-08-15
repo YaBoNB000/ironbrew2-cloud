@@ -46,10 +46,10 @@
 - [x] handler 拆分、双 handler leaf 合并和等价模板；使用小型 Lua 词法扫描器识别安全 statement 边界，不依赖纯正则拼接。
 - [x] 子 prototype 使用长度 framing 保留为 opaque slice，在 `OP_CLOSURE` 首次需要时才反序列化并缓存。
 - [x] basic block 按需解码：按 CFG leader 分块，长直线块最多 24 条指令；块顺序随机，PC 进入时才认证并恢复整块。
-- [x] 常量恢复缓存限定在单个 prototype 的反序列化过程；prototype 级表随后释放。默认 AntiDump 模式由各 opaque block 保留自己的最小引用集合，供重入时重新解码。
+- [x] v4 将常量值改为独立认证的 opaque capsule；prototype 启动反序列化不恢复常量。只有某个 block 的完整 manifest 认证通过后，才把该块引用的 capsule 恢复到本次 block decode 的局部缓存。
 - [x] 主循环、closure upvalue 伪指令和可选 superoperator 的直接取指统一经过 `GetInstruction`；`SetList C==0` data word 仍按 Lua 5.1 skip 语义处理。
 
-当前验收状态：字段 schema、常量 tag 和 opcode bank 均由各 prototype 的 K1/K2/K3 加独立 domain 派生，通用解析器不能只恢复一次全局 schema/opcode 表后解析所有 prototype。handler 会按安全顶层 statement 边界选择 raw、`do` scope、恒真 guard 或 prefix/suffix 嵌套模板；dispatch 的双 handler leaf 也会在 `>`、`==`、`~=` 和嵌套 guard 形式间变化。prototype 和 basic-block 两级延迟恢复均已启用；默认 AntiDump 模式下共享 `Chunk[1]` 保持为空，明文指令只存在于当前 invocation 的单块 `Flow` 缓存。
+当前验收状态：字段 schema、常量 tag 和 opcode bank 均由各 prototype 的 K1/K2/K3 加独立 domain 派生，通用解析器不能只恢复一次全局 schema/opcode 表后解析所有 prototype。handler 会按安全顶层 statement 边界选择 raw、`do` scope、恒真 guard 或 prefix/suffix 嵌套模板；dispatch 的双 handler leaf 也会在 `>`、`==`、`~=` 和嵌套 guard 形式间变化。prototype、basic block 和 block-local constant capsule 三层延迟恢复均已启用；默认 AntiDump 模式下共享 instruction table 保持为空，明文常量与指令只存在于当前 invocation 的单块解码/执行窗口。
 
 ### Phase 3：真实 CFG 与执行状态耦合（核心状态协议已完成）
 
@@ -62,11 +62,11 @@
 - [x] 每个 opaque block 从 body 解码前以入口状态、块范围、prototype keys 和 body 内容做完整性认证；AntiDump 模式下重入会再次认证。
 - [ ] superoperator 基于 IR 生成并做语义验证，不用 handler 源码正则作为主实现。
 
-当前验收：v3 指令不能只按 PC 独立解码；缺失 edge、被修改的初始/边状态、dispatcher state、错误目标入口和 block body 篡改都会以 `invalid protected payload` 拒绝。CFG 结构测试覆盖循环/自环、comparison companion、FORPREP/FORLOOP、skip-next、data word 和 24 条分页；运行测试覆盖无 marker 自动命中、单块及畸形 prototype 安全回退、递归 invocation、跨块 Closure 伪指令与合法多分支执行。自动 dispatcher flattening 已完成，IR-native superoperator 仍是后续独立项目。
+当前验收：v4 指令不能只按 PC 独立解码；缺失 edge、被修改的初始/边状态、dispatcher state、错误目标入口、block body 或完整 block manifest 篡改都会以 `invalid protected payload` 拒绝。CFG 结构测试覆盖循环/自环、comparison companion、FORPREP/FORLOOP、skip-next、data word 和 24 条分页；运行测试覆盖无 marker 自动命中、单块及畸形 prototype 安全回退、递归 invocation、跨块 Closure 伪指令与合法多分支执行。自动 dispatcher flattening 已完成，IR-native superoperator 仍是后续独立项目。
 
 ### Phase 3.25：认证且状态耦合的高熵 envelope（已完成）
 
-- [x] 在真实 body 完成 DEFLATE 后、外层 streaming XOR 前加入 v3 feature bit 3 的 entropy envelope；固定配置 feature 值由 `7` 升为 `15`。
+- [x] 在真实 body 完成 DEFLATE 后、外层 streaming XOR 前加入 feature bit 3 的 entropy envelope；该 envelope 现由 v4 格式承载，固定配置 feature 值为 `15`。
 - [x] 每次输出使用操作系统 CSPRNG 生成独立的 64–96 KiB entropy，并随机切分为 12–20 个 records；真实压缩流切分为 4–8 个 data records，两类 record 强制交错后再随机物理排序。
 - [x] entropy digest 绑定 seed、nonce、总长度、logical ordinal、record 长度与每个 entropy byte，并参与真实 body 的内层流状态派生；随机区不是可删除的尾部 padding。
 - [x] 独立 envelope tag 覆盖固定头、全部 record framing、物理顺序与 record bytes；VM 在 inflate 前严格验证版本/features、长度上限、record 数量、kind、ordinal 唯一性、总长度、终止位置、digest 和 tag。
@@ -74,6 +74,18 @@
 - [x] verifier 会完整恢复 envelope 和真实 DEFLATE body，检查熵值与跨次独立性；测试在重新计算外层 tag 后分别修改、删除和重排 entropy record，三种情况均被 VM 拒绝。
 
 当前验收：每次生成的随机区严格位于 65,536–98,304 bytes，测试样本 Shannon entropy 不低于 7.95 bits/byte；record 删除、修改或重排不能作为无影响 padding 操作。该机制提高静态载荷分析和直接裁剪成本，但全部派生与验证代码仍交付客户端，不宣称服务端密码学信任根。
+
+### Phase 3.4：v4 延迟常量、完整 manifest 与运行时 ABI 随机化（已完成）
+
+- [x] 格式版本升至 v4；每个 prototype 写入覆盖其完整字节切片的独立 tag，VM 在解析 schema、block、常量或子 prototype framing 前先验证。
+- [x] 每个常量写成绑定 prototype keys、常量索引、类型、长度和 encoded bytes 的独立 capsule；prototype 初始解析只保留不透明 capsule，不生成共享明文常量表。
+- [x] 每个 block 的完整 manifest 绑定 block range、route token、有序常量引用及完整 capsule bytes、flow verifier、有序 successor/wrapped-state records、body 长度与 body bytes，并加入 prototype keys/state。
+- [x] block body 与引用常量只在完整 manifest 通过后恢复；capsule 明文缓存是本次 `DecodeInstructionBlock` 调用的局部变量，不写回 prototype 或跨 invocation 共享。
+- [x] 每次生成一次 build-wide permutation，覆盖 15 个 Chunk、9 个 Block、4 个 Flow 与 3 个 FlowCache 槽；四组都禁止 identity，constructor、alias、handler 和 helper 统一使用同一映射。
+- [x] 静态 verifier 递归恢复 v4、完整验证 prototype/block/capsule；可在重算所有外层认证后生成 prototype tag、block manifest 或 capsule 内层篡改样本，运行时仍拒绝。
+- [x] runtime layout 工具恢复四类排列，检查 CurrentBlock/NextBlock/SuccessorBlock aliases，并验证独立构建至少一类完整 ABI 发生变化。
+
+当前验收：prototype/body framing、block metadata/body 和常量 capsule 都不能在仅重算外层 tag 后被无影响修改；被引用常量直到目标块实际进入才恢复。随机回归每次同时检查 Lua 语义和四组非 identity 运行时槽位布局。
 
 ### Phase 3.5：Luau 反调试与防 dump（已完成）
 
