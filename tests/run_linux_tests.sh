@@ -56,6 +56,62 @@ for ((i = 1; i <= RANDOM_RUNS; i++)); do
 done
 echo "PASS randomized runs: $RANDOM_RUNS/$RANDOM_RUNS"
 
+# Verify the runtime keeps unexecuted basic blocks as opaque byte slices. The
+# production output is executed first. We then instrument the unminified VM
+# generated in temp/t2.lua, without changing product code, to count root blocks
+# whose encoded body has not yet been decoded when the protected program starts.
+"$LUA" tests/lazy_blocks.lua > "$WORK/lazy-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/lazy_blocks.lua > "$WORK/lazy-build.log"
+mv out.lua "$WORK/lazy.lua"
+"$LUAC" -p "$WORK/lazy.lua"
+"$LUA" "$WORK/lazy.lua" > "$WORK/lazy.out"
+cmp "$WORK/lazy-baseline.out" "$WORK/lazy.out"
+python3 - "$ROOT/temp/t2.lua" "$WORK/lazy-instrumented.lua" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1]).read_text("latin1")
+pattern = re.compile(
+    r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
+)
+match = pattern.search(source)
+if not match:
+    raise SystemExit("could not locate the generated root prototype")
+root = match.group(2)
+probe = (
+    "_G.__ib2_lazy_opaque=function() "
+    "local n=0;local blocks=" + root + "[9];"
+    "if blocks then for _,block in pairs(blocks) do "
+    "if type(block[3])=='string' then n=n+1;end;end;end;"
+    "return n;end;\n"
+)
+source = source[:match.end(1)] + probe + source[match.end(1):]
+Path(sys.argv[2]).write_text(source, "latin1")
+PY
+"$LUAC" -p "$WORK/lazy-instrumented.lua"
+"$LUA" "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
+grep -Eq '^lazy-blocks:[1-9][0-9]*:executed-constant:37$' "$WORK/lazy-instrumented.out"
+echo "PASS unexecuted basic blocks remain opaque"
+
+# Exercise Lua 5.1's SETLIST C == 0 data word without checking in a huge table
+# constructor. A test-only luac wrapper patches the one-element fixture after
+# source preprocessing and before IronBrew2 deserializes it.
+mkdir -p "$WORK/setlist-bin"
+ln -s "$ROOT/tests/luac_setlist_c0_wrapper.py" "$WORK/setlist-bin/luac"
+printf '%s\n' 'local t={123}; print("setlist-c0:" .. t[1])' > "$WORK/setlist-c0.lua"
+"$LUA" "$WORK/setlist-c0.lua" > "$WORK/setlist-c0-baseline.out"
+rm -rf temp out.lua
+IB2_REAL_LUAC="$LUAC" PATH="$WORK/setlist-bin:$PATH" \
+    "$DOTNET" "$CLI" "$WORK/setlist-c0.lua" > "$WORK/setlist-c0-build.log"
+mv out.lua "$WORK/setlist-c0-obfuscated.lua"
+"$LUAC" -p "$WORK/setlist-c0-obfuscated.lua"
+"$LUA" "$WORK/setlist-c0-obfuscated.lua" > "$WORK/setlist-c0-obfuscated.out"
+cmp "$WORK/setlist-c0-baseline.out" "$WORK/setlist-c0-obfuscated.out"
+echo "PASS SETLIST C=0 data-word semantics"
+
 # The old tier selector must no longer be accepted.
 rm -rf temp out.lua
 set +e

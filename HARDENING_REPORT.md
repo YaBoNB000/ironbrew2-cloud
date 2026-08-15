@@ -20,7 +20,7 @@
 ```
 
 - 高 4 位为格式版本，目前必须为 `2`。
-- 低位 bit 0 表示 DEFLATE；未知 feature bits 会被拒绝。
+- 低位 bit 0 表示 DEFLATE，bit 1 表示 basic-block lazy decode；当前 VM 要求 bit 1 存在，未知 feature bits 会被拒绝。
 - 完整性值绑定格式/feature 字节、加密正文和运行 seed，并在解密、解压及反序列化前验证。
 - 修改加密 payload 会以 `invalid protected payload` 失败。
 - K1/K2 不再位于固定明文头。
@@ -46,8 +46,8 @@
 - 移除了全局 `ConstantMapping`、简单 tag rotation 及 `CONST_*` 模板替换。
 - Nil、Boolean、Number、String 四种 tag 由每个 prototype 的 K1/K2/K3 和独立 domain 做完整 Fisher–Yates permutation。
 - 字符串常量在外层 payload 加密之外，再按 prototype keys 和 1-based 常量索引逐字节编码。
-- 指令字段允许排在常量字段之前：VM 先保留 constant mask，五类字段读取完毕后再解析 A/B/C 的常量引用。
-- prototype 的临时常量 decode cache 在引用绑定后清空；未引用常量可回收，未执行子 prototype 的常量不会在启动时恢复。
+- 指令字段允许排在常量字段之前：instruction framing 记录各块使用的常量索引，五类字段读取完毕后才为每个 opaque block 建立最小引用表。
+- prototype 的临时常量 decode cache 随后立即清空；各块在首次解码时解析 A/B/C 常量引用并释放自己的引用表，未执行子 prototype 的常量不会在启动时恢复。
 - 测试输入中的字符串、嵌套闭包标签和二进制字符串没有以源码字面量出现在生成结果中。
 
 ### 2.4 子 prototype 按需恢复
@@ -55,11 +55,18 @@
 - 子 prototype 在父 prototype 的 Functions 字段中增加长度 framing。
 - 初次反序列化只保留每个子 prototype 的 opaque byte slice，不递归展开其指令、常量和后代。
 - `OP_CLOSURE` 首次访问时通过 `GetProto` 切换到该 slice 反序列化，随后把结果缓存回父 prototype 表。
-- root prototype 恢复后立即释放完整解密 body；后续仅保留尚未使用的子 prototype slices。
+- root prototype 恢复后立即释放完整解密 body；后续仅保留尚未使用的子 prototype slices，以及各 prototype 内尚未执行的 instruction block slices。
 
-当前延迟粒度是 prototype；basic-block 粒度的按需解码仍属于后续工作。
+### 2.5 basic-block 粒度按需解码
 
-### 2.5 handler 与 dispatch leaf 结构多态
+- serializer 在 opcode mutation 前按 jump target、控制转移后继和 `LOADBOOL` skip successor 计算稳定 leader；长直线区额外按最多 24 条指令分块。
+- 每块独立写入 1-based start PC、instruction count、最小常量引用集合、body length 和 opaque body；块的物理写入顺序由 CSPRNG 打乱。
+- prototype 初始恢复只读取 block framing 并保存 body slice，不恢复 instruction table；统一的 `GetInstruction(Chunk, PC)` 在 PC 首次进入时恢复整个块并缓存各指令。
+- 主 while/repeat wrapper、`OP_CLOSURE` 的 upvalue 伪指令和可选 superoperator 的内部取指全部经过同一 accessor，避免绕过 lazy decode。
+- 块恢复后立即清除 opaque body 和块级常量引用；所有块恢复后再释放 block map。没有执行的分支持续保持 opaque。
+- 比较/Test/TForLoop 的 companion JMP 作为独立块处理；其目标已在前一条虚拟指令 mutation 时绑定。`SetList C==0` 的 data word 保留一字节 descriptor 并沿用 Lua 5.1 的 skip-next 行为。
+
+### 2.6 handler 与 dispatch leaf 结构多态
 
 - `Generator.cs` 增加小型 Lua 词法扫描器，只在 handler 的顶层分号处分段；扫描时跳过引号/长字符串、行/长注释，并跟踪圆括号、table/index 以及 function/if/loop/repeat/do 块。
 - 每个 canonical handler 独立选择 raw、`do` scope、`Enum == Enum` 恒真 guard 或保持原顺序的 prefix/suffix 嵌套模板。
@@ -69,31 +76,32 @@
 
 这些变换改变生成源码结构而不改变指令执行次序、寄存器语义或 opcode bank。handler 仍是每次构建生成一组，并非按 prototype 复制一整套 VM。
 
-### 2.6 随机源
+### 2.7 随机源
 
 - prototype keys、salt、XOR seed、shuffle 和随机选择改用操作系统 CSPRNG。
 - 仍需要 `System.Random` 接口的代码生成器、控制流及可选变换，改为使用 CSPRNG seed，避免同一时钟窗口产生相同序列。
 - 清理了不再使用的旧 XOR key 和全局常量映射字段。
 
-### 2.7 EnvironmentLock
+### 2.8 EnvironmentLock
 
 - salt 与最终序列化 seed 的关系已核对：开启时头部写 salt，构建端和运行端都以相同 fingerprint 派生 seed；关闭时头部直接写随机 seed。
 - 完整性验证使用最终 seed，因此错误环境会在正文恢复前失败。
 - 环境探针属于可选的 Roblox capability gate，而不是秘密；固定 CLI 配置不启用它。若库调用方显式开启，预期 fingerprint 和算法仍随客户端交付，可被有能力的攻击者 patch。
 
-### 2.8 line info 与 Linux 工具链
+### 2.9 line info 与 Linux 工具链
 
 - line-info wrapper 从错误的 `Chunk[7]` 修正为 `Chunk[4]`。
 - LuaSrcDiet 的 `LUA_PATH` 由 C# 显式设置，不再依赖调用者当前目录。
 - 最终 minifier 非零退出码现在会被当作构建失败。
 
-### 2.9 单一 CLI 配置
+### 2.10 单一 CLI 配置
 
 CLI、Windows 拖放脚本和 GitHub Actions 均取消强度档位，统一使用原 `mid` 的稳定行为：
 
 | 设置 | 固定值 |
 |---|---:|
 | v2 schema / prototype keys / 字段编码 / 常量内层编码 / 完整性检查 | 开 |
+| child prototype / basic-block 两级按需恢复 | 开 |
 | handler / 双 handler dispatch leaf 结构多态 | 开 |
 | ControlFlow | 开 |
 | DEFLATE | 开 |
@@ -129,6 +137,10 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | prototype-local schema / tag / opcode bank 随机构建 | 通过 |
 | handler 等价模板 / 双 handler leaf 随机结构与 Lua 语法 | 20/20 通过 |
 | nested closure / upvalue / lazy child prototype / closure 伪指令 | 通过 |
+| basic-block 首次进入解码与缓存 | 通过 |
+| 未执行 block 保持 opaque（unminified VM 运行时探针） | 通过 |
+| 分支/循环/table constructor 与块级常量引用 | 通过 |
+| `SETLIST C==0` 后继 data word（测试侧 patch Lua 5.1 chunk） | 通过 |
 | boolean、number、二进制 string 常量 | 通过 |
 | for/while/repeat/branch/recursion | 通过 |
 | vararg 与多返回值 | 通过 |
@@ -142,6 +154,8 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 测试源位于：
 
 - `tests/semantic.lua`
+- `tests/lazy_blocks.lua`
+- `tests/luac_setlist_c0_wrapper.py`（仅测试时构造 `SETLIST C==0` data word）
 - `tests/line_error.lua`
 - `tests/signed_bit_runner.lua`
 - `tests/run_linux_tests.sh`
@@ -149,11 +163,12 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 ## 4. 仍存在的边界
 
 1. 这是客户端混淆，不是密码学保密。seed、fingerprint、VM、prototype banks 和校验逻辑最终都在攻击者可执行的客户端中。
-2. 字段 schema、常量 tag 与 opcode bank 虽然按 prototype 变化，但 bank 会在运行时派生；有能力的分析者仍可 hook dispatch 或 `GetProto` 收集已执行 prototype。
-3. 按需恢复目前以 prototype 为粒度；root prototype 仍在启动时恢复，已执行 prototype 的字符串常量会绑定到其指令操作数。basic-block 和使用点级常量延迟尚未实现。
-4. handler 拆分/合并/等价模板已经完成，但每次构建仍只生成一组 canonical handler；它们不是按 prototype 复制，也还没有依赖真实 CFG 入口状态的 bank/state。
-5. Mutation/SuperOperator 没有被本轮宣告为稳定；在没有更大差分语料前不应纳入固定配置。
-6. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持。
-7. 尚未接入 CI，也尚未完成大程序、性能、内存和体积基准。
+2. 字段 schema、常量 tag 与 opcode bank 虽然按 prototype 变化，但 bank 会在运行时派生；有能力的分析者仍可 hook dispatch、`GetProto` 或 `GetInstruction` 收集已执行路径。
+3. root prototype 的 schema、常量值和 block framing 仍在启动时恢复；延迟的是 instruction block body。字符串常量由相关 opaque block 持有引用，并不是逐次使用时才解码。
+4. basic-block 已用于分帧和按需恢复，但 operand mask/opcode bank 尚未与不可伪造的 CFG 入口状态耦合；拿到正确 prototype keys 后仍可离线逐块恢复。
+5. handler 拆分/合并/等价模板已经完成，但每次构建仍只生成一组 canonical handler；它们不是按 prototype 复制，也还没有依赖真实 CFG 入口状态的 bank/state。
+6. Mutation/SuperOperator 没有被本轮宣告为稳定；在没有更大差分语料前不应纳入固定配置。
+7. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持。
+8. 尚未接入 CI，也尚未完成大程序、性能、内存和体积基准。
 
-后续工作按 `HARDENING_PLAN.md` 的 Phase 2–4 继续：basic-block 延迟解码、IR/CFG 级状态耦合、性能基准及多平台 CI。
+后续工作按 `HARDENING_PLAN.md` 的 Phase 3–4 继续：IR/CFG 级状态耦合、性能基准及多平台 CI。

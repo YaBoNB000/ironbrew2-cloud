@@ -13,6 +13,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 	public class Serializer
 	{
 		private const byte FormatVersion = 2;
+		private const byte BasicBlockFeature = 2;
+		private const int MaxBlockInstructions = 24;
 		private const uint IntegrityDomain = 0xA5C31F27u;
 
 		private readonly ObfuscationContext _context;
@@ -44,7 +46,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			}
 
 			uint head = _settings.EnvironmentLock ? _context.Binder.Salt : _context.XorSeed;
-			byte flags = (byte)((FormatVersion << 4) | (_settings.BytecodeCompress ? 1 : 0));
+			byte flags = (byte)((FormatVersion << 4) | BasicBlockFeature | (_settings.BytecodeCompress ? 1 : 0));
 			// Bind both the format/feature byte and encrypted body. This is tamper/corruption
 			// detection, not a client-side cryptographic trust root.
 			uint integrity = ComputeIntegrity(encrypted, _context.XorSeed, flags);
@@ -80,6 +82,73 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private static uint OperandMask32(int pc, ushort k1, ushort k2, ushort k3, int slot) =>
 			(uint)(OperandMask16(pc, k1, k2, k3, slot) |
 			       (OperandMask16(pc, k1, k2, k3, slot + 4) << 16));
+
+		/// <summary>
+		/// Partitions a prototype into stable control-flow blocks before opcode mutation.
+		/// Jump destinations and the instruction following each transfer are leaders.
+		/// Lua's comparison/test/TForLoop companion JMP consequently becomes its own
+		/// opaque block and is not decoded merely because the comparison executes.
+		/// </summary>
+		private static List<(int Start, int Count)> BuildInstructionBlocks(Chunk chunk)
+		{
+			int instructionCount = chunk.Instructions.Count;
+			var leaders = new HashSet<int> {0};
+
+			for (int index = 0; index < instructionCount; index++)
+			{
+				Instruction instruction = chunk.Instructions[index];
+				foreach (object operand in instruction.RefOperands)
+				{
+					if (operand is Instruction target && chunk.InstructionMap.TryGetValue(target, out int targetIndex))
+						leaders.Add(targetIndex);
+				}
+
+				bool endsBlock = instruction.OpCode == Opcode.Jmp ||
+				                 instruction.OpCode == Opcode.ForLoop ||
+				                 instruction.OpCode == Opcode.ForPrep ||
+				                 instruction.OpCode == Opcode.Eq ||
+				                 instruction.OpCode == Opcode.Lt ||
+				                 instruction.OpCode == Opcode.Le ||
+				                 instruction.OpCode == Opcode.Test ||
+				                 instruction.OpCode == Opcode.TestSet ||
+				                 instruction.OpCode == Opcode.TForLoop ||
+				                 instruction.OpCode == Opcode.Return ||
+				                 instruction.OpCode == Opcode.TailCall ||
+				                 (instruction.OpCode == Opcode.LoadBool && instruction.C != 0);
+				if (endsBlock && index + 1 < instructionCount)
+					leaders.Add(index + 1);
+
+				// LOADBOOL with C != 0 skips the following instruction without an
+				// explicit JMP, so its actual successor must also start a block.
+				if (instruction.OpCode == Opcode.LoadBool && instruction.C != 0 && index + 2 < instructionCount)
+					leaders.Add(index + 2);
+			}
+
+			// Bound long straight-line regions as independent lazy pages. These extra
+			// leaders only subdivide a basic block and never merge CFG boundaries.
+			for (int index = MaxBlockInstructions; index < instructionCount; index += MaxBlockInstructions)
+				leaders.Add(index);
+
+			int[] ordered = leaders.Where(value => value >= 0 && value < instructionCount).OrderBy(value => value).ToArray();
+			var blocks = new List<(int Start, int Count)>(ordered.Length);
+			for (int index = 0; index < ordered.Length; index++)
+			{
+				int start = ordered[index];
+				int end = index + 1 < ordered.Length ? ordered[index + 1] : instructionCount;
+				if (end > start)
+					blocks.Add((start, end - start));
+			}
+			return blocks;
+		}
+
+		private static void ShuffleBlocks(List<(int Start, int Count)> blocks)
+		{
+			for (int index = blocks.Count - 1; index > 0; index--)
+			{
+				int swapIndex = RandomNumberGenerator.GetInt32(index + 1);
+				(blocks[index], blocks[swapIndex]) = (blocks[swapIndex], blocks[index]);
+			}
+		}
 
 		/// <summary>
 		/// Derives a prototype-local permutation from that prototype's independent keys.
@@ -125,6 +194,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private byte[] SerializeBody(Chunk chunk)
 		{
 			var bytes = new List<byte>();
+			List<byte> output = bytes;
 			ushort k1 = NextKey16();
 			ushort k2 = NextKey16();
 			ushort k3 = NextKey16();
@@ -139,15 +209,15 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			for (int localIndex = 0; localIndex < opcodeBank.Length; localIndex++)
 				opcodeToLocal[opcodeBank[localIndex]] = localIndex;
 
-			void WriteByte(byte value) => bytes.Add(value);
-			void WriteUInt16Local(ushort value) => WriteUInt16(bytes, value);
-			void WriteUInt32Local(uint value) => WriteUInt32(bytes, value);
+			void WriteByte(byte value) => output.Add(value);
+			void WriteUInt16Local(ushort value) => WriteUInt16(output, value);
+			void WriteUInt32Local(uint value) => WriteUInt32(output, value);
 
 			void WriteRaw(byte[] value, bool checkEndian = true)
 			{
 				if (!BitConverter.IsLittleEndian && checkEndian)
 					value = value.Reverse().ToArray();
-				bytes.AddRange(value);
+				output.AddRange(value);
 			}
 
 			void WriteNumber(double value) => WriteRaw(BitConverter.GetBytes(value));
@@ -175,13 +245,11 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 					return;
 				}
 
-				instruction.UpdateRegisters();
 				int opcode = (int)instruction.OpCode;
 				if (instruction.CustomData != null)
 				{
 					var virtualOpcode = instruction.CustomData.Opcode;
 					opcode = instruction.CustomData.WrittenOpcode?.VIndex ?? virtualOpcode.VIndex;
-					virtualOpcode?.Mutate(instruction);
 				}
 
 				opcode = opcodeToLocal[opcode];
@@ -218,6 +286,17 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			}
 
 			chunk.UpdateMappings();
+			List<(int Start, int Count)> instructionBlocks = BuildInstructionBlocks(chunk);
+
+			// Preserve the original linear mutation order. Several comparison/test
+			// opcodes consume the following JMP's still-relative B operand while
+			// mutating, even though blocks are emitted in randomized order below.
+			foreach (Instruction instruction in chunk.Instructions)
+				instruction.UpdateRegisters();
+			foreach (Instruction instruction in chunk.Instructions)
+				instruction.CustomData?.Opcode?.Mutate(instruction);
+
+			ShuffleBlocks(instructionBlocks);
 
 			// 每 prototype 独立密钥位于外层加密正文中，不再泄露在固定头部。
 			WriteUInt16Local(k1);
@@ -263,8 +342,39 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 						break;
 					case ChunkStep.Instructions:
 						WriteUInt32Local((uint)chunk.Instructions.Count);
-						for (int instructionIndex = 0; instructionIndex < chunk.Instructions.Count; instructionIndex++)
-							SerializeInstruction(chunk.Instructions[instructionIndex], instructionIndex);
+						WriteUInt32Local((uint)instructionBlocks.Count);
+						foreach ((int start, int count) in instructionBlocks)
+						{
+							var blockBody = new List<byte>();
+							List<byte> savedOutput = output;
+							output = blockBody;
+							for (int offset = 0; offset < count; offset++)
+								SerializeInstruction(chunk.Instructions[start + offset], start + offset);
+							output = savedOutput;
+
+							// Bind each opaque block only to the constants it can resolve. This
+							// lets the VM release the prototype-wide constant cache immediately.
+							var constantReferences = new HashSet<int>();
+							for (int offset = 0; offset < count; offset++)
+							{
+								Instruction instruction = chunk.Instructions[start + offset];
+								if ((instruction.ConstantMask & InstructionConstantMask.RA) != 0) constantReferences.Add(instruction.A);
+								if ((instruction.ConstantMask & InstructionConstantMask.RB) != 0) constantReferences.Add(instruction.B);
+								if ((instruction.ConstantMask & InstructionConstantMask.RC) != 0) constantReferences.Add(instruction.C);
+							}
+
+							WriteUInt32Local((uint)(start + 1));
+							WriteUInt32Local((uint)count);
+							WriteUInt32Local((uint)constantReferences.Count);
+							foreach (int constantIndex in constantReferences.OrderBy(value => value))
+							{
+								if (constantIndex < 1 || constantIndex > chunk.Constants.Count)
+									throw new InvalidOperationException("Invalid block constant reference.");
+								WriteUInt32Local((uint)constantIndex);
+							}
+							WriteUInt32Local((uint)blockBody.Count);
+							output.AddRange(blockBody);
+						}
 						break;
 					case ChunkStep.Functions:
 						WriteUInt32Local((uint)chunk.Functions.Count);
@@ -274,7 +384,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							// slices and deserialize each one only when OP_CLOSURE first needs it.
 							byte[] childBody = SerializeBody(child);
 							WriteUInt32Local((uint)childBody.Length);
-							bytes.AddRange(childBody);
+							output.AddRange(childBody);
 						}
 						break;
 					case ChunkStep.LineInfo when _settings.PreserveLineInfo:

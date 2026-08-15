@@ -655,7 +655,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"PCount","Lupvals","Stk","Inst","Enum","Chunk","decompress","Pos","Xs","Xd","_R","Env",
 				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2","K3","OpcodeKey","FieldKey","FieldKey32","U32",
 				"DerivePermutation","Count","Domain","Values","State","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank",
-				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root"
+				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root","Blocks","BlockMap",
+				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
+				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction"
 			};
 			string[] luaKws = {"and","break","do","else","elseif","end","false","for","function","if","in","local","nil","not","or","repeat","return","then","true","until","while"};
 			var idents = new Dictionary<string,string>();
@@ -851,7 +853,7 @@ local ToNumber = tonumber;");
 				.Replace("__IB2_OPCODE_COUNT__", virtuals.Count.ToString()));
 			
 			// 每个 prototype 根据自身 K1/K2/K3 派生独立字段顺序。
-			// 常量可能排在指令之后，因此先保存 constant mask，字段全部恢复后再解析引用。
+			// 指令字段只读取 block framing；常量恢复后再把引用绑定到各 opaque block。
 			vm += T(@"local Schema = DerivePermutation(5, K1, K2, K3, 113);
 for StepIndex = 1, 5 do
     local Step = Schema[StepIndex];
@@ -870,33 +872,19 @@ for StepIndex = 1, 5 do
         end;
     elseif (Step == 2) then
         InstrCount = gBits32();
-        for Idx = 1, InstrCount do
-            local Descriptor = gBits8();
-            if (gBit(Descriptor, 1, 1) == 0) then
-                local Type = gBit(Descriptor, 2, 3);
-                local Mask = gBit(Descriptor, 4, 6);
-                local Inst =
-                {
-                    gBits16(),
-                    BitXOR(gBits16(), FieldKey(Idx, 1, K1, K2, K3)),
-                    nil,
-                    nil,
-                    Mask
-                };
-
-                if (Type == 0) then
-                    Inst[OP_B] = BitXOR(gBits16(), FieldKey(Idx, 2, K1, K2, K3));
-                    Inst[OP_C] = BitXOR(gBits16(), FieldKey(Idx, 3, K1, K2, K3));
-                elseif (Type == 1) then
-                    Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Idx, 2, K1, K2, K3)));
-                elseif (Type == 2) then
-                    Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Idx, 2, K1, K2, K3))) - (2 ^ 16);
-                elseif (Type == 3) then
-                    Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Idx, 2, K1, K2, K3))) - (2 ^ 16);
-                    Inst[OP_C] = BitXOR(gBits16(), FieldKey(Idx, 3, K1, K2, K3));
-                end;
-                Instrs[Idx] = Inst;
-            end;
+        BlockCount = gBits32();
+        Chunk[11] = BlockCount;
+        for BlockIndex = 1, BlockCount do
+            local BlockStart = gBits32();
+            local Count = gBits32();
+            local RefCount = gBits32();
+            local References = {};
+            for ReferenceIndex = 1, RefCount do References[ReferenceIndex] = gBits32(); end;
+            local Length = gBits32();
+            local Block = {BlockStart, Count, Sub(ByteString, Pos, Pos + Length - 1), References};
+            Pos = Pos + Length;
+            Blocks[BlockIndex] = Block;
+            for Offset = 0, Count - 1 do BlockMap[BlockStart + Offset] = Block; end;
         end;
     elseif (Step == 3) then
         for Idx = 1, gBits32() do
@@ -912,17 +900,17 @@ for StepIndex = 1, 5 do
 			vm += T(@"    end;
 end;
 
-for Idx = 1, InstrCount do
-    local Inst = Instrs[Idx];
-    if Inst then
-        local Mask = Inst[5];
-        if (gBit(Mask, 1, 1) == 1) then Inst[OP_A] = Consts[Inst[OP_A]]; end;
-        if (gBit(Mask, 2, 2) == 1) then Inst[OP_B] = Consts[Inst[OP_B]]; end;
-        if (gBit(Mask, 3, 3) == 1) then Inst[OP_C] = Consts[Inst[OP_C]]; end;
-        Inst[5] = nil;
+for BlockIndex = 1, BlockCount do
+    local Block = Blocks[BlockIndex];
+    local References = Block[4];
+    local ConstCache = {};
+    for ReferenceIndex = 1, #References do
+        local Index = References[ReferenceIndex];
+        ConstCache[Index] = Consts[Index];
     end;
+    Block[4] = ConstCache;
 end;
--- Drop the prototype-local decode cache; only operands that reference constants survive.
+-- Constants are retained only by the opaque blocks that reference them.
 Consts = nil;");
 
 			vm += T("return Chunk;end;");
@@ -939,6 +927,63 @@ local function GetProto(Proto, Index)
         return Decoded;
     end;
     return Encoded;
+end;
+
+local function DecodeInstructionBlock(Chunk, Block)
+    local SavedByteString, SavedPos = ByteString, Pos;
+    ByteString, Pos = Block[3], 1;
+    local Instrs = Chunk[1];
+    local K1, K2, K3 = Chunk[5], Chunk[6], Chunk[7];
+    local ConstCache = Block[4];
+    for Offset = 0, Block[2] - 1 do
+        local Index = Block[1] + Offset;
+        local Descriptor = gBits8();
+        if (gBit(Descriptor, 1, 1) == 0) then
+            local Type = gBit(Descriptor, 2, 3);
+            local Mask = gBit(Descriptor, 4, 6);
+            local Inst =
+            {
+                gBits16(),
+                BitXOR(gBits16(), FieldKey(Index, 1, K1, K2, K3)),
+                nil,
+                nil
+            };
+
+            if (Type == 0) then
+                Inst[OP_B] = BitXOR(gBits16(), FieldKey(Index, 2, K1, K2, K3));
+                Inst[OP_C] = BitXOR(gBits16(), FieldKey(Index, 3, K1, K2, K3));
+            elseif (Type == 1) then
+                Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3)));
+            elseif (Type == 2) then
+                Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3))) - (2 ^ 16);
+            elseif (Type == 3) then
+                Inst[OP_B] = U32(BitXOR(gBits32(), FieldKey32(Index, 2, K1, K2, K3))) - (2 ^ 16);
+                Inst[OP_C] = BitXOR(gBits16(), FieldKey(Index, 3, K1, K2, K3));
+            end;
+
+            if (gBit(Mask, 1, 1) == 1) then Inst[OP_A] = ConstCache[Inst[OP_A]]; end;
+            if (gBit(Mask, 2, 2) == 1) then Inst[OP_B] = ConstCache[Inst[OP_B]]; end;
+            if (gBit(Mask, 3, 3) == 1) then Inst[OP_C] = ConstCache[Inst[OP_C]]; end;
+            Instrs[Index] = Inst;
+        end;
+    end;
+    ByteString, Pos = SavedByteString, SavedPos;
+    for Offset = 0, Block[2] - 1 do Chunk[10][Block[1] + Offset] = nil; end;
+    Block[3], Block[4] = nil, nil;
+    Chunk[11] = Chunk[11] - 1;
+    if Chunk[11] == 0 then Chunk[9], Chunk[10] = nil, nil; end;
+end;
+
+local function GetInstruction(Chunk, Index)
+    local Inst = Chunk[1][Index];
+    if Inst then return Inst; end;
+    local BlockMap = Chunk[10];
+    local Block = BlockMap and BlockMap[Index];
+    if not Block then error('invalid protected payload', 0); end;
+    DecodeInstructionBlock(Chunk, Block);
+    Inst = Chunk[1][Index];
+    if not Inst then error('invalid protected payload', 0); end;
+    return Inst;
 end;");
 
 			vm += T(settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2));

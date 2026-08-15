@@ -38,21 +38,23 @@
 - [x] Lua 5.1 差分测试覆盖闭包、循环、vararg、多返回值、表和错误路径。
 - [x] Linux 自动化脚本覆盖固定配置差分、随机构建、line info、有符号 bit、旧档位参数拒绝及篡改失败。
 
-### Phase 2：原型与 VM 多态（进行中）
+### Phase 2：原型与 VM 多态（已完成）
 
 - [x] 每 prototype 独立字段布局，不再全局共享 `ChunkSteps`。
 - [x] 每 prototype 独立常量类型映射，而不只是旋转。
 - [x] 多 opcode bank：canonical VIndex 经每 prototype 的独立 permutation 映射为 local VIndex，dispatch 时才恢复。
 - [x] handler 拆分、双 handler leaf 合并和等价模板；使用小型 Lua 词法扫描器识别安全 statement 边界，不依赖纯正则拼接。
 - [x] 子 prototype 使用长度 framing 保留为 opaque slice，在 `OP_CLOSURE` 首次需要时才反序列化并缓存。
-- [ ] basic block 按需解码；当前延迟粒度是 prototype，不是块。
-- [x] 常量恢复缓存限定在单个 prototype 的反序列化过程；绑定到指令后立即释放，未执行子 prototype 的常量不会在启动时展开。
+- [x] basic block 按需解码：按 CFG leader 分块，长直线块最多 24 条指令；块顺序随机，PC 首次进入时才恢复整块。
+- [x] 常量恢复缓存限定在单个 prototype 的反序列化过程；prototype 级表随后释放，尚未解码的块只保留自身引用的常量。
+- [x] 主循环、closure upvalue 伪指令和可选 superoperator 的直接取指统一经过 `GetInstruction`；`SetList C==0` data word 仍按 Lua 5.1 skip 语义处理。
 
-当前验收状态：字段 schema、常量 tag 和 opcode bank 均由各 prototype 的 K1/K2/K3 加独立 domain 派生，通用解析器不能只恢复一次全局 schema/opcode 表后解析所有 prototype。handler 现在会按安全顶层 statement 边界选择 raw、`do` scope、恒真 guard 或 prefix/suffix 嵌套模板；dispatch 的双 handler leaf 也会在 `>`、`==`、`~=` 和嵌套 guard 形式间变化。basic-block 粒度延迟仍待后续实现。
+当前验收状态：字段 schema、常量 tag 和 opcode bank 均由各 prototype 的 K1/K2/K3 加独立 domain 派生，通用解析器不能只恢复一次全局 schema/opcode 表后解析所有 prototype。handler 会按安全顶层 statement 边界选择 raw、`do` scope、恒真 guard 或 prefix/suffix 嵌套模板；dispatch 的双 handler leaf 也会在 `>`、`==`、`~=` 和嵌套 guard 形式间变化。prototype 和 basic-block 两级延迟恢复均已启用，自动测试通过运行时探针确认程序开始执行后仍存在未解码的 opaque block。
 
 ### Phase 3：真实 CFG 与执行状态耦合
 
-- [ ] 在 IR 上构建 basic block 与 CFG。
+- [x] 在 serializer 侧建立稳定 basic-block leader 与有界分区，供按需解码使用。
+- [ ] 在 IR 上补全显式 CFG edge / predecessor 模型，并用于后续状态变换。
 - [ ] 自动选择安全函数做 dispatcher flattening，不要求源码 marker。
 - [ ] bank/operand mask 与基本块入口状态绑定。
 - [ ] 正确处理循环、多前驱、比较指令 skip-next、闭包附加指令和异常路径。

@@ -168,7 +168,7 @@ local __ib2Tag = Byte(ByteString, 5, 5)
 local __ib2Flags = Byte(ByteString, 9, 9);
 local __ib2Features = __ib2Flags % 16;
 local __ib2Version = (__ib2Flags - __ib2Features) / 16;
-if __ib2Version ~= 2 or __ib2Features > 1 then error('invalid protected payload', 0); end;
+if __ib2Version ~= 2 or __ib2Features < 2 or __ib2Features > 3 then error('invalid protected payload', 0); end;
 __IB2_SEED__
 
 -- 在解密前验证密文，检测损坏和直接 patch。客户端校验不是不可绕过的信任根。
@@ -187,7 +187,7 @@ for __ib2i = 10, #ByteString do
 	__ib2Dec[__ib2i - 9] = Char(BitXOR(__ib2b, __ib2k));
 end
 ByteString = Concat(__ib2Dec);
-if __ib2Features ~= 0 then
+if gBit(__ib2Features, 1, 1) == 1 then
 	ByteString = inflate(ByteString);
 end
 local Pos = 1;
@@ -303,6 +303,10 @@ local function Deserialize()
     Chunk[8] = OpcodeBank;
     local Consts = {};
     local InstrCount = 0;
+    local Blocks = {};
+    local BlockMap = {};
+    local BlockCount = 0;
+    Chunk[9], Chunk[10] = Blocks, BlockMap;
 ";
 		
 		public static string VMP2 = @"
@@ -346,7 +350,7 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Enum;	
 
 		while true do
-			Inst		= Instr[InstrPoint];
+			Inst		= GetInstruction(Chunk, InstrPoint);
 			Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
 
 		public static string VMP2_R = @"
@@ -390,7 +394,7 @@ local function Wrap(Chunk, Upvalues, Env)
 		local Enum;	
 
 		repeat
-			Inst		= Instr[InstrPoint];
+			Inst		= GetInstruction(Chunk, InstrPoint);
 			Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
 
 		public static string VMP3 = @"
@@ -457,7 +461,7 @@ local function Wrap(Chunk, Upvalues, Env)
 			local Enum;	
 
 			while true do
-				Inst		= Instr[InstrPoint];
+				Inst		= GetInstruction(Chunk, InstrPoint);
 				Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
 		
 		public static string VMP2_LI_R = @"
@@ -504,7 +508,7 @@ local function Wrap(Chunk, Upvalues, Env)
 			local Enum;	
 
 			repeat
-				Inst		= Instr[InstrPoint];
+				Inst		= GetInstruction(Chunk, InstrPoint);
 				Enum		= OpcodeBank[BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)) + 1];";
 		
 		public static string VMP3_LI = @"

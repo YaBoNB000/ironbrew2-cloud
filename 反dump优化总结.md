@@ -10,6 +10,7 @@
 - 字节码 DEFLATE：开启
 - v2 payload、prototype-local 字段 schema / 常量 tag / opcode bank、字段编码和完整性检查：开启
 - 子 prototype 按 `OP_CLOSURE` 首次访问延迟恢复：开启
+- basic block 按 PC 首次进入恢复，长直线块最多 24 条且物理顺序随机：开启
 - handler 安全分段/等价模板与双 handler dispatch leaf 结构多态：开启
 - AntiDump、EnvironmentLock、AggressiveDefense、Noise：关闭
 - Mutation、SuperOperator、源码字符串转换：关闭
@@ -23,12 +24,15 @@
 3. VM 模板只包含实际需要的 opcode handler。
 4. 字符串常量由 serializer 的外层 payload 加密和 prototype/常量索引相关内层编码保护，不启用容易放大体积且影响闭包语义的源码级解密函数。
 5. 父 prototype 只保留子 prototype 的长度分帧 opaque slice；子指令和常量在 closure 首次创建时恢复，root 解密 body 随后释放。
-6. handler 通过词法扫描器在顶层 statement 边界安全分段，随机使用 raw、`do`、恒真 guard 和 prefix/suffix 嵌套模板；双 handler dispatch leaf 也使用多种等价选择结构，但不融合指令或冒充 superoperator。
+6. instruction stream 按 CFG leader 分块；每块仅保存自己的 opaque body 和最小常量引用集合，首次取指时才恢复，恢复后立即释放块 body 和常量引用。
+7. handler 通过词法扫描器在顶层 statement 边界安全分段，随机使用 raw、`do`、恒真 guard 和 prefix/suffix 嵌套模板；双 handler dispatch leaf 也使用多种等价选择结构，但不融合指令或冒充 superoperator。
 
 ## 当前安全边界
 
 - v2 完整性检查可以确定性拒绝正文损坏和简单篡改，但校验算法随客户端交付，不是服务端信任根。
 - AntiDump 或环境 fingerprint 都不能让离线客户端机制变成“不可逆”。
+- basic-block 延迟只减少启动时和未执行路径的明文暴露；攻击者仍可 hook `GetInstruction` 收集已执行块，拿到 prototype keys 后也能离线恢复。
+- 当前常量值在 prototype schema 恢复时解码，再由相关 block 的最小引用集合保留；尚未做到逐次使用时解码。
 - 后续体积优化应通过语义差分、性能和产物大小基准评估，而不是增加无意义编码层或默认启用高误判 API hook。
 
 ## 验证
@@ -40,4 +44,4 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua5.1 LUAC=/path/to/luac5.1 \
   tests/run_linux_tests.sh
 ```
 
-当前测试覆盖固定配置语义差分、20 次 handler/dispatch/schema/tag/opcode 随机生成、closure/upvalue、vararg、多返回值、line info、有符号 32 位 bit、payload 篡改和明文字符串扫描。
+当前测试覆盖固定配置语义差分、20 次 handler/dispatch/schema/tag/opcode/block 随机生成、closure/upvalue、vararg、多返回值、`SETLIST C==0` data word、line info、有符号 32 位 bit、payload 篡改和明文字符串扫描。测试还会只对 `temp/t2.lua` 工作副本注入运行时探针，确认受保护程序启动后仍有未执行 block 保持 opaque；生产 VM 不包含该调试接口。
