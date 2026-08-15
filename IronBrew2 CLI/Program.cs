@@ -14,9 +14,9 @@ namespace IronBrew2_CLI
 
 		private static ObfuscationSettings CreateSettings(bool preserveLineInfo)
 		{
-			// Single supported profile. VM-integrated anti-debug/anti-dump defense is
-			// enabled; destructive executor hooks and the strict Roblox fingerprint gate
-			// remain disabled.
+			// Single supported profile. VM-integrated anti-debug/anti-dump defense and
+			// strict brand-neutral Roblox executor attestation are always enabled.
+			// Destructive global hooks remain disabled.
 			return new ObfuscationSettings
 			{
 				Mutate = false,
@@ -26,7 +26,7 @@ namespace IronBrew2_CLI
 				AggressiveDefense = false,
 				Noise = false,
 				AntiDump = true,
-				EnvironmentLock = false,
+				EnvironmentLock = true,
 				ControlFlow = true,
 				BytecodeCompress = true,
 				PreserveLineInfo = preserveLineInfo

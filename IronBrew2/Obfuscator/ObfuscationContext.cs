@@ -47,11 +47,11 @@ namespace IronBrew2.Obfuscator
 		// prototype 派生独立的 local-index -> canonical-index bank。
 		public int VirtualOpcodeCount;
 
-		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|环境指纹)，
-		// 序列化头部只写"盐"，VM 端跑探针后才派生得到同一种子；否则头部明文写种子。
+		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|attestation token)，
+		// 序列化头部只写盐，VM 端严格探针成功后才派生同一种子。
 		public uint XorSeed;
 
-		// 环境绑定器：生成盐、预期指纹、VM 端种子派生代码
+		// 环境绑定器：生成盐、attestation token 和 VM 端种子派生代码
 		public EnvBinder Binder;
 		
 		public ObfuscationContext(Chunk chunk, ObfuscationSettings settings)
@@ -68,8 +68,8 @@ namespace IronBrew2.Obfuscator
 
 			if (settings.EnvironmentLock)
 			{
-				// 种子 = Hash(盐 | 预期指纹)。真环境探针返回同指纹 → 种子一致。
-				XorSeed = Binder.DeriveSeed(Binder.ExpectedFingerprint);
+				// 只有严格 executor guard 成功后才恢复同一 token 与 serializer seed。
+				XorSeed = Binder.DeriveSeed(Binder.AttestationToken);
 			}
 			else
 			{

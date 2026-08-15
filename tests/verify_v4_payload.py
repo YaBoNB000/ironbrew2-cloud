@@ -31,6 +31,7 @@ ENTROPY_MAX = 96 * 1024
 LCG_MULTIPLIER = 1664525
 LCG_INCREMENT = 1013904223
 LCG_INVERSE = pow(LCG_MULTIPLIER, -1, MOD32)
+POLY31_INVERSE = pow(31, -1, MOD32)
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class Prototype:
     k2: int
     k3: int
     tag_offset: int
+    binding: int
     parameter_offset: int | None = None
     instruction_count: int = 0
     capsules: list[Capsule] = field(default_factory=list)
@@ -97,6 +99,7 @@ class PayloadInfo:
     source: str
     literals: list[Literal]
     payload: bytes
+    head: int
     seed: int
     flags: int
     envelope: bytes
@@ -266,6 +269,20 @@ def stream_xor(data: bytes, seed: int) -> bytes:
     return bytes(output)
 
 
+def recover_outer_seed(stored_integrity: int, flags: int, encrypted: bytes) -> int:
+    """Invert the public polynomial tag to recover the serializer seed.
+
+    EnvironmentLock writes a salt, not this seed, in the payload head. This
+    inversion is intentional verifier tooling and also documents that the
+    client-side binding is a coupling/cost amplifier rather than a secret key.
+    """
+    value = stored_integrity
+    for item in reversed(encrypted):
+        value = ((value - item) * POLY31_INVERSE) & MASK32
+    value = ((value - flags) * POLY31_INVERSE) & MASK32
+    return value ^ INTEGRITY_DOMAIN
+
+
 def shannon_entropy(data: bytes) -> float:
     counts = [0] * 256
     for value in data:
@@ -412,6 +429,7 @@ def flow_key(entry_state: int, from_pc: int, to_pc: int, prototype: Prototype) -
         + prototype.k2 * 17
         + prototype.k3
         + FLOW_DOMAIN
+        + prototype.binding
     ) & MASK32
     return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
 
@@ -426,12 +444,13 @@ def recover_entry_state(verifier: int, block_start: int, prototype: Prototype) -
         + prototype.k2 * 17
         + prototype.k3
         + FLOW_DOMAIN
+        + prototype.binding
     ) & MASK32
     return ((value - constant) * LCG_INVERSE) & MASK32
 
 
 def block_integrity(data: bytes | bytearray, prototype: Prototype, block: Block) -> int:
-    value = hash_word(block.entry_state ^ BLOCK_INTEGRITY_DOMAIN, block.start_pc)
+    value = hash_word(block.entry_state ^ BLOCK_INTEGRITY_DOMAIN ^ prototype.binding, block.start_pc)
     for word in (block.count, prototype.k1, prototype.k2, prototype.k3, block.route_token, len(block.references)):
         value = hash_word(value, word)
     for index in block.references:
@@ -473,12 +492,14 @@ def validate_capsule(data: bytes, prototype: Prototype, capsule: Capsule) -> Non
             raise ValueError("invalid decoded string constant framing")
 
 
-def parse_prototype(data: bytes, start: int, length: int, preserve_line_info: bool = False) -> Prototype:
+def parse_prototype(
+    data: bytes, start: int, length: int, binding: int, preserve_line_info: bool = False
+) -> Prototype:
     end = start + length
     if length < 10 or start < 0 or end > len(data):
         raise ValueError("invalid prototype slice length")
     k1, k2, k3 = struct.unpack_from("<HHH", data, start)
-    prototype = Prototype(start, end, k1, k2, k3, start + 6)
+    prototype = Prototype(start, end, k1, k2, k3, start + 6, binding)
     stored_tag = struct.unpack_from("<I", data, prototype.tag_offset)[0]
     if prototype_integrity(data, prototype) != stored_tag:
         raise ValueError("prototype slice authentication mismatch")
@@ -506,7 +527,7 @@ def parse_prototype(data: bytes, start: int, length: int, preserve_line_info: bo
             prototype.instruction_count = cursor.u32()
             block_count = cursor.u32()
             initial_wrapped_state = cursor.u32()
-            initial_route = cursor.u32()
+            initial_route = cursor.u32() ^ binding
             if prototype.instruction_count < 1 or block_count < 1 or block_count > prototype.instruction_count:
                 raise ValueError("invalid block/instruction count")
             for _ in range(block_count):
@@ -545,7 +566,7 @@ def parse_prototype(data: bytes, start: int, length: int, preserve_line_info: bo
                 child_length = cursor.u32()
                 child_start = cursor.position
                 cursor.take(child_length)
-                prototype.children.append(parse_prototype(data, child_start, child_length, preserve_line_info))
+                prototype.children.append(parse_prototype(data, child_start, child_length, binding, preserve_line_info))
         elif step == 4 and preserve_line_info:
             line_count = cursor.u32()
             if line_count != prototype.instruction_count:
@@ -580,7 +601,7 @@ def parse_prototype(data: bytes, start: int, length: int, preserve_line_info: bo
     entry = next((block for block in prototype.blocks if block.start_pc == 1), None)
     if entry is None:
         raise ValueError("prototype has no entry block")
-    initial_key_value = (k1 * 65537 + k2 * 257 + k3 + FLOW_DOMAIN) & MASK32
+    initial_key_value = (k1 * 65537 + k2 * 257 + k3 + FLOW_DOMAIN + binding) & MASK32
     initial_key = (initial_key_value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
     if initial_wrapped_state ^ initial_key != entry.entry_state:
         raise ValueError("initial block state mismatch")
@@ -601,7 +622,7 @@ def parse_prototype(data: bytes, start: int, length: int, preserve_line_info: bo
 def parse_and_verify(path: Path) -> PayloadInfo:
     source = path.read_text("latin1")
     literals, payload = extract_payload(source)
-    seed, stored_integrity = struct.unpack_from("<II", payload)
+    head, stored_integrity = struct.unpack_from("<II", payload)
     flags = payload[8]
     version, features = flags >> 4, flags & 0x0F
     if version != 4:
@@ -610,9 +631,12 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         raise ValueError(f"unexpected v4 feature bits (block + dispatcher + entropy required): {features}")
 
     encrypted = payload[9:]
+    seed = recover_outer_seed(stored_integrity, flags, encrypted)
     integrity = hash_bytes(((seed ^ INTEGRITY_DOMAIN) * 31 + flags) & MASK32, encrypted)
-    if integrity != stored_integrity:
-        raise ValueError("outer encrypted-payload integrity mismatch (default unlocked output required)")
+    if integrity != stored_integrity or seed == 0:
+        raise ValueError("could not recover the environment-bound outer serializer seed")
+    if head == seed:
+        raise ValueError("strict EnvironmentLock unexpectedly exposed the serializer seed in the payload head")
     envelope = stream_xor(encrypted, seed)
     if len(envelope) < 32:
         raise ValueError("entropy envelope is shorter than its fixed header")
@@ -692,7 +716,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         raise ValueError(f"restored body is not a valid raw DEFLATE stream: {error}") from error
     if not body:
         raise ValueError("restored serialized body is empty")
-    root = parse_prototype(body, 0, len(body))
+    root = parse_prototype(body, 0, len(body), seed)
 
     entropy = b"".join(entropy_records[index] for index in range(1, entropy_count + 1))
     entropy_score = shannon_entropy(entropy)
@@ -700,7 +724,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         raise ValueError(f"entropy records are not high entropy enough: {entropy_score:.4f} bits/byte")
 
     return PayloadInfo(
-        path, source, literals, payload, seed, flags, envelope, records, entropy,
+        path, source, literals, payload, head, seed, flags, envelope, records, entropy,
         protected_body, body, root, entropy_length, entropy_digest, nonce,
         data_count, entropy_count, entropy_score
     )
@@ -709,7 +733,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
 def build_outer_payload(info: PayloadInfo, envelope: bytes) -> bytes:
     encrypted = stream_xor(envelope, info.seed)
     integrity = hash_bytes(((info.seed ^ INTEGRITY_DOMAIN) * 31 + info.flags) & MASK32, encrypted)
-    return struct.pack("<II", info.seed, integrity) + bytes([info.flags]) + encrypted
+    return struct.pack("<II", info.head, integrity) + bytes([info.flags]) + encrypted
 
 
 def replace_payload_literals(info: PayloadInfo, payload: bytes) -> str:

@@ -588,6 +588,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 
 		public string GenerateVM(ObfuscationSettings settings)
 		{
+			if (settings.EnvironmentLock && !settings.AntiDump)
+				throw new InvalidOperationException("EnvironmentLock requires the VM-integrated AntiDump attestation guard.");
+
 			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 
 			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
@@ -672,6 +675,19 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
 				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
 				"GuardBehaviorKey","GuardFirstKey","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential",
+				"GuardAttestation","GuardAttested","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
+				"GuardClassOK1","GuardClassOK2","GuardClassOK3","GuardClassOK4","GuardCompileOK","GuardConstantProbe","GuardConstants","GuardConstantsOK",
+				"GuardCurrentEnvOK","GuardCurrentEnvironment","GuardCurrentIdentity","GuardExpected","GuardGame","GuardGetConstants","GuardGetProto","GuardGetProtos",
+				"GuardGetUpvalues","GuardHostOK","GuardHostResult","GuardIdOK1","GuardIdOK2","GuardIdentify","GuardInstance","GuardLaneA","GuardLaneB","GuardLaneC",
+				"GuardLeft","GuardLeftBit","GuardLoadSource","GuardLoadString","GuardLoaded","GuardLoadedC","GuardLoadedCOK","GuardLoadedConstants","GuardLoadedConstantsOK",
+				"GuardLoadedL","GuardLoadedLOK","GuardLoadedOK","GuardLoadedValue","GuardLookup","GuardLookupKey","GuardLookupValue","GuardLuaByte","GuardLuaProbeResult",
+				"GuardName1","GuardName2","GuardNativeByte","GuardNativeProbe","GuardNewC","GuardPlayers","GuardProtoCallOK","GuardProtoCallResult","GuardProtoCandidate",
+				"GuardProtoChild","GuardProtoClassOK","GuardProtoIsL","GuardProtoItem","GuardProtoKey","GuardProtoOK","GuardProtoProbe","GuardProtoResult","GuardProtoValue",
+				"GuardProtos","GuardProtosOK","GuardRestoreOK","GuardRight","GuardRightBit","GuardRoute","GuardSetOK","GuardSetupValue","GuardStrictChallenge",
+				"GuardTableContains","GuardTask","GuardTranscript","GuardTranscriptValue","GuardTranscriptWord","GuardTypeOf","GuardUpvalue","GuardUpvalueProbe","GuardUpvalues",
+				"GuardUpvaluesOK","GuardValid","GuardValueItem","GuardValueKey","GuardValues","GuardVector","GuardVector3","GuardVersion1","GuardVersion2","GuardWrapOK",
+				"GuardWrapped","GuardWrappedC","GuardWrappedCOK","GuardWrappedL","GuardWrappedLOK","GuardWrappedOK","GuardWrappedValue","GuardXorBit","GuardXorIndex","GuardXorValue",
+				"GuardAlias","GuardAliasIndex","GuardAliasName","GuardAliasOK","GuardExecutorNameAlias","GuardIdentifyAlias","GuardVersionType1","GuardVersionType2","GuardPrimitiveIndex","GuardPrimitives",
 				"PayloadHead","PayloadTag","PayloadFlags","PayloadFeatures","PayloadVersion","OuterSeed","PayloadHash","PayloadIndex","PayloadDecoded","PayloadByte","PayloadKey",
 				"EnvelopePos","EnvelopeRead32","EnvelopeRealLength","EnvelopeEntropyLength","EnvelopeRecordCount","EnvelopeDataCount","EnvelopeEntropyCount","EnvelopeNonce","EnvelopeDigest","EnvelopeTag","EnvelopeExpected",
 				"EnvelopeHash","EnvelopeIndex","EnvelopeDataRecords","EnvelopeEntropyRecords","EnvelopeDataLength","EnvelopeEntropySeenLength","EnvelopeKind","EnvelopeOrdinal","EnvelopeLength","EnvelopeRecord",
@@ -943,7 +959,10 @@ local Unpack = unpack or table.unpack;
 local ToNumber = tonumber;");
 
 			if (settings.AntiDump)
-				vm += T(AntiDumpGenerator.GenerateRuntimeGuard(37 + r.Next(36), (uint) r.Next(1, int.MaxValue)));
+				vm += T(AntiDumpGenerator.GenerateRuntimeGuard(
+					37 + r.Next(36),
+					(uint) r.Next(1, int.MaxValue),
+					_context.Binder.AttestationToken));
 
 			// 数据切片:base92 字符串拆成 2-6 小段,以 local <随机名>='段' 形式散布在产物各处,
 			// 最后统一拼接 —— 视觉上与代码交织,不再是一整块孤立的"数据区"
@@ -1004,7 +1023,7 @@ local ToNumber = tonumber;");
         BlockCount = gBits32();
         Chunk[11] = BlockCount;
         Chunk[12] = gBits32();
-        InitialRouteToken = gBits32();
+        InitialRouteToken = U32(BitXOR(gBits32(), OuterSeed));
 	        for BlockIndex = 1, BlockCount do
 	            local BlockStart = gBits32();
 	            local Count = gBits32();
@@ -1256,6 +1275,7 @@ local function GetInstruction(Chunk, Index, Flow)
     local EntryState;
     if not CurrentBlock then
         if Index ~= 1 then error('invalid protected payload', 0); end;
+        __IB2_FIRST_BLOCK_CHECK__
         EntryState = U32(BitXOR(Chunk[12], InitialFlowKey(Chunk[5], Chunk[6], Chunk[7])));
     elseif CurrentBlock ~= Block or Index ~= LastIndex + 1 then
         if Index ~= Block[1] then error('invalid protected payload', 0); end;
@@ -1304,6 +1324,7 @@ end;";
 				blockRuntime = blockRuntime
 					.Replace("__IB2_DECODE_TARGET__", "local Instrs = {};")
 					.Replace("__IB2_DECODE_FINALIZE__", "return Instrs;")
+					.Replace("__IB2_FIRST_BLOCK_CHECK__", "if GuardProbe(true) then Chunk[2], Chunk[15], Flow[4] = {}, {}, nil; return GuardDecoy(); end;")
 					.Replace("__IB2_CACHE_SEQUENTIAL__", "local IsSequential = CurrentBlock ~= nil and CurrentBlock == Block and Index == LastIndex + 1;")
 						.Replace("__IB2_INSTRUCTION_LOOKUP__", @"local FlowCache = Flow[4];
     if not IsSequential or not FlowCache or FlowCache[1] ~= Block or FlowCache[2] ~= EntryState then
@@ -1323,13 +1344,16 @@ end;";
 				blockRuntime = blockRuntime
 					.Replace("__IB2_DECODE_TARGET__", "local Instrs = Chunk[1];")
 					.Replace("__IB2_DECODE_FINALIZE__", "Block[3], Block[4], Block[7], Block[9] = nil, nil, nil, nil; Chunk[11] = Chunk[11] - 1; if Chunk[11] == 0 then Chunk[9], Chunk[15] = nil, nil; end;")
+					.Replace("__IB2_FIRST_BLOCK_CHECK__", "")
 					.Replace("__IB2_CACHE_SEQUENTIAL__", "")
 					.Replace("__IB2_INSTRUCTION_LOOKUP__", "local Inst = Chunk[1][Index]; if Inst then return Inst; end; DecodeInstructionBlock(Chunk, Block, EntryState); Inst = Chunk[1][Index]; if not Inst then error('invalid protected payload', 0); end; return Inst;");
 			}
 			vm += T(blockRuntime);
 
 			string loopRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2);
-			loopRuntime = loopRuntime.Replace("__IB2_GUARD_CHECK__", settings.AntiDump ? "if GuardProbe(false) then return GuardDecoy(); end;" : "");
+			loopRuntime = loopRuntime.Replace("__IB2_GUARD_CHECK__", settings.AntiDump
+				? "if GuardProbe(false) then Instr, Proto, Args, Vararg, Lupvals, Stk, Flow[4] = nil, nil, nil, nil, nil, nil, nil; return GuardDecoy(); end;"
+				: "");
 			vm += T(loopRuntime);
 
 			if (settings.Noise)
@@ -1437,7 +1461,8 @@ end;";
 				const string rootDeserialize = "local Root = Deserialize();";
 				if (!finalRuntime.Contains(rootDeserialize))
 					throw new InvalidOperationException("VM root deserialization anchor is missing.");
-				finalRuntime = finalRuntime.Replace(rootDeserialize, rootDeserialize + "\nif GuardProbe(true) then return GuardDecoy; end;");
+				finalRuntime = finalRuntime.Replace(rootDeserialize,
+					rootDeserialize + "\nif GuardProbe(true) then Root, ByteString = nil, nil; return GuardDecoy(); end;");
 			}
 			vm += T(finalRuntime);
 

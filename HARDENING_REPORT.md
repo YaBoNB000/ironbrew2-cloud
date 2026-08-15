@@ -1,7 +1,7 @@
 # IronBrew2 加固实施报告
 
 日期：2026-08-15  
-本轮基线：`main` / `928c9c75aa8d660cdf460027856257e2dbec65ed`
+本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）
 
 ## 1. 实施原则
 
@@ -126,28 +126,31 @@
 - 仍需要 `System.Random` 接口的代码生成器、控制流及可选变换，改为使用 CSPRNG seed，避免同一时钟窗口产生相同序列。
 - 清理了不再使用的旧 XOR key 和全局常量映射字段。
 
-### 2.11 Luau/Roblox 反调试与 AntiDump
+### 2.11 strict executor-only attestation 与 AntiDump
 
-本轮在上一版 VM-integrated guard 基础上，筛选吸收了附件 `反调试v5.4.txt` 中可移植的分层探针、快照、provenance 和多信号评分思路；没有照搬其破坏性或高误报行为。
+本轮把上一版“可选 capability + 加权评分 + 有限诱饵”改为默认 fail-closed 的 generic executor attestation。目标不是绑定某个执行器品牌，而是要求 Roblox host、executor primitive 和 debug inspector 同时满足完整行为契约。
 
-- 删除旧 AntiDump/Defense 前置 Lua bytecode 注入；防护直接生成在 VM 内。强制检查分别位于 guard 定义后的启动阶段和 root prototype 反序列化之后，四种 dispatch wrapper 再执行周期检查。
-- VM 快照 `string`、`table`、`math`、raw/meta、转换、调用和 unpack 等关键原语，同时捕获 `getgenv` capability provider、`debug.gethook`、`debug.getinfo`/`debug.info`、`iscclosure` 与 `islclosure` 的身份。
-- 轻量层检查库/原语身份、debug API 身份和活动 hook；重探针才交叉验证多个已知 C closure 与本地 Lua canary 的 C/L classifier 结果，并用 debug source provenance 进行独立复核。
-- 行为 canary 在受保护调用中验证 raw table 读写、metatable、`next`、`rawequal`、`select`、字符串和数值转换语义，不修改全局状态。身份、provenance、capability 与行为异常按权重累计，阈值为 6；单个低置信异常不会自动等同于命中。
-- guard 维护 epoch、LCG 状态与对应 seal；seal 不一致会立即 sticky 命中。每次实际探针更新状态并计算下一次 interval+jitter，替代可预测的固定 `counter % N` 周期，同时不使用容易受机器负载影响的绝对时序阈值。
-- capability 不存在时保持普通 Lua 5.1 兼容；`getgc`、`hookfunction`、文件 API 或 load API 仅仅存在不会触发。正常 capability 环境也不得修改 executor global。
-- 检测命中后不输出阻断原因，也不抛出可识别的专用错误，而是在当前 invocation 执行固定上限的诱饵计算后静默返回。没有网络/文件探测、后台线程或 registry 深扫，也没有无限循环、递归崩溃、大内存分配或全局 API 覆盖。
-- guard 触发状态在当前 VM 运行期保持，避免通过首次检查后再安装 hook；全部新增 guard 局部名都进入生成器 identifier map，每次构建继续随机化。
-- 指令驻留防 dump 与上述 guard 同属 `AntiDump` 固定开关：共享 Chunk 的随机化 instruction 槽不积累明文，当前 invocation 的随机化 FlowCache 槽最多保留一个已认证块；跨块后替换，重入时从 opaque manifest/capsule/body 重建。
-- `DefenseGenerator` 仅保留为空的兼容 shim，`AggressiveDefense` 也不再恢复旧 API hook 或 registry 扫描行为。
+- 防护直接生成在 VM 内。`identifyexecutor()` 是必需信号，必须两次稳定返回 1–128 字节的非空名称，版本类型和值也必须稳定；若存在 `getexecutorname` 或 `executorname` 别名，名称必须一致。代码不包含名称或版本白名单。
+- 所有准入项为硬性 AND，不再使用权重、阈值或 quorum。必须具备稳定 `getgenv()`、`checkcaller()==true`、`iscclosure`/`islclosure`、`newcclosure`、`loadstring`、`typeof`、Roblox `game`/`Instance`/`Vector3`/`task`，以及 `debug.getconstants`、`getupvalues`、`getproto`/`getprotos`、`setupvalue` 和 `debug.info`/`getinfo`。
+- Roblox host challenge 实际调用 `game:GetService("Players")`、`Vector3.new()` 和 `typeof`，并核对 `Instance.new` 及 `task.wait`/`spawn`/`defer`；不是只检查全局名是否存在。
+- closure/provenance challenge 区分已知 native primitive、本地 Lua closure、`loadstring` 产生的 Lua closure与 `newcclosure` 包装结果。`string.byte` 等 19 个关键 primitive 及 debug inspector 必须表现为 native source，本地 probe 必须表现为 Lua source。
+- 每次生成独立的 constant、upvalue 修改/恢复、child proto 调用、动态 loadstring 和 newcclosure 输入。debug API 必须返回并操作真实 challenge 值；成功值按顺序合成随机 transcript，只有完整 transcript 才恢复本次构建的 attestation token。
+- VM 启动时快照 `string`、`table`、`math`、raw/meta、转换、调用、unpack、capability provider 和全部 debug/executor primitive。后续检查要求身份不变、`getgenv()` 返回同一环境且无活动 debug hook。
+- guard 维护 attestation、epoch、状态和 seal；seal 不一致、token 异常或任一检查失败都会 sticky 命中并把 token 清零。状态驱动 interval+jitter 调度，不依赖绝对时间。
+- 强制检查发生在 guard 启动、root prototype 反序列化后和首个 block 进入前；四种 dispatch wrapper 继续周期复检。中途失败时尽量清除当前 invocation 可达的 `Root`/payload body、instruction/proto/args/vararg/upvalue/stack 和 FlowCache 引用。
+- 失败后不打印、不抛专用阻断错误，也不返回。当前线程进入每次构建随机化的 6–10 状态位混合图并永久执行；状态量固定，内存为 O(1)，不 yield、不联网、不探测文件、不启动后台任务、不扫描 registry、不覆盖 executor global，也不持续分配内存。外部 executor/Roblox watchdog 仍可能终止该忙循环。
+- 指令驻留防 dump 继续由 `AntiDump` 控制：共享 Chunk instruction 槽不积累明文，当前 invocation 的随机化 FlowCache 最多保留一个已认证块；跨块后替换，重入时从 opaque manifest/capsule/body 重建。
+- `DefenseGenerator` 仅保留空兼容 shim；`AggressiveDefense` 不恢复旧全局 hook、后台扫描或破坏性内存逻辑。
 
-这些机制提高动态收集成本，但不是服务端反作弊。所有探针、阈值和诱饵都在客户端，有能力的分析者可以 patch guard、伪造 capability/provenance 返回值，或在 accessor/handler 内收集每个临时块。
+这些检查比只信任 `identifyexecutor()` 或 API stub 更严格，但客户端不存在不可伪造的 executor oracle。完整模拟所有契约的宿主，或能 patch 已交付 guard/handler 的分析者，仍可绕过或采集临时块。
 
-### 2.12 EnvironmentLock
+### 2.12 EnvironmentLock 与 payload/flow 绑定
 
-- salt 与最终序列化 seed 的关系已核对：开启时头部写 salt，构建端和运行端都以相同 fingerprint 派生 seed；关闭时头部直接写随机 seed。
-- 完整性验证使用最终 seed，因此错误环境会在正文恢复前失败。
-- EnvironmentLock 是独立、严格的 Roblox 环境锁，固定 CLI 配置不启用它。若库调用方显式开启，预期 fingerprint 和算法仍随客户端交付，可被有能力的攻击者 patch。
+- 固定 CLI 配置和 `ObfuscationSettings` 默认值现在都启用 `EnvironmentLock`；`EnvironmentLock && !AntiDump` 会在生成阶段被拒绝。普通 Lua、普通 Luau 和 Studio 不再执行真实 payload。
+- 每次构建生成独立 salt 与非零 attestation token。构建端以 `Hash(decimal(salt) + "|" + decimal(token))` 得到 `_context.XorSeed`；运行端只有严格 challenge 完成后才能从 transcript 恢复相同 token 并派生同一 seed。
+- header 在锁定模式仅写 salt。最终 seed用于 outer envelope/tag 与正文恢复，并额外进入 initial flow key、edge transition key、flow verifier、完整 block manifest tag和 initial route token 解封；因此通过结果与 payload seed、root/首块 route 及认证域共同绑定。
+- 对返回 signed 32-bit 结果的 `bit.bxor`，initial route 解封显式执行 `U32(BitXOR(gBits32(), OuterSeed))`，与其余 v4 读路径保持无符号一致。
+- salt、token、seed 派生和 guard 都随客户端交付；这里的“绑定”用于提高离线恢复和单点 patch 成本，不应描述成秘密、服务端信任根或无法绕过的硬件证明。库调用方仍保留显式关闭锁的兼容路径，但不属于唯一 CLI 配置。
 
 ### 2.13 line info 与 Linux 工具链
 
@@ -157,7 +160,7 @@
 
 ### 2.14 单一 CLI 配置
 
-CLI、Windows 拖放脚本和 GitHub Actions 均取消强度档位，统一使用原 `mid` 的稳定行为：
+CLI、Windows 拖放脚本和 GitHub Actions 均取消强度档位，统一使用 strict executor-only 固定行为：
 
 | 设置 | 固定值 |
 |---|---:|
@@ -168,12 +171,12 @@ CLI、Windows 拖放脚本和 GitHub Actions 均取消强度档位，统一使�
 | handler / 双 handler dispatch leaf 结构多态 | 开 |
 | ControlFlow | 开 |
 | DEFLATE | 开 |
-| AntiDump（capability guard / 静默诱饵 / invocation-local 指令缓存） | 开 |
-| EnvironmentLock | 关 |
+| AntiDump（hard-AND executor attestation / sticky non-returning O(1) sink / invocation-local 指令缓存） | 开 |
+| EnvironmentLock（attestation token → payload/flow binding） | 开 |
 | Mutation / SuperOperator / 源码字符串转换 | 关 |
 | AggressiveDefense / Noise | 关 |
 
-CLI 只接受 `<input.lua>` 和可选的 `--line-info`；旧 `--strength` 与旧覆盖开关会作为未知参数拒绝。`ObfuscationSettings` 构造器默认值也已同步到同一行为，避免非 CLI 调用回退到旧的环境 gate。
+CLI 只接受 `<input.lua>` 和可选的 `--line-info`；旧 `--strength` 与旧覆盖开关会作为未知参数拒绝。`ObfuscationSettings` 构造器默认值也已同步启用 AntiDump + EnvironmentLock，避免非 CLI 调用回退到普通 Lua 可执行路径。
 
 ## 3. 自动化测试
 
@@ -218,11 +221,12 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | 单块、畸形 companion/SETLIST/Closure prototype 安全回退且无部分 route metadata | 通过 |
 | basic-block 进入时认证与 invocation-local 单块临时解码 | 通过 |
 | root 的随机化 instruction 槽不积累明文；constant store 保持 opaque capsule；已执行/未执行 block 的 opaque body 均保留 | 通过 |
-| 无 capability / 模拟 Luau capability 的正常输出 | 通过 |
-| wrapped `string.byte`、`rawset`、`debug.getinfo`、活动 `debug` hook、矛盾 `iscclosure`/`islclosure` 的静默诱饵（0 bytes 输出） | 通过 |
-| guard 启动、root 反序列化后、jittered dispatch 三阶段调用 | 通过 |
+| trusted generic executor shim 的正常输出及原脚本语义差分 | 通过 |
+| 普通 Lua、primitive/raw/debug hook、活动 debug hook、classifier/identity spoof、缺失 debug contract | 通过；均由外部 2 秒 timeout 终止，终止前 stdout/stderr 为 0 bytes |
+| guard 启动、root 反序列化后、首块进入前与 jittered dispatch 四阶段调用 | 通过 |
+| attestation-derived outer seed、flow/integrity/route binding 的静态递归恢复 | 通过 |
 | 新增 guard 局部名随机化，最终输出无稳定 `Guard*` 标识符 | 通过 |
-| executor `hookfunction`、`getgenv` 与 closure classifier 等全局能力不被修改 | 通过 |
+| executor global/capability provider 不被修改 | 通过 |
 | block body、完整 manifest、初始 state、dispatcher state、缺失 edge、wrapped edge state 的反序列化后篡改 | 通过，均拒绝 |
 | 分支/循环/递归/table constructor 与块级常量引用 | 通过 |
 | `SETLIST C==0` 后继 data word（测试侧 patch Lua 5.1 chunk） | 通过 |
@@ -241,7 +245,8 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 - `tests/semantic.lua`
 - `tests/closure_boundary.lua`
 - `tests/lazy_blocks.lua`
-- `tests/anti_debug_runner.lua`
+- `tests/executor_runner.lua`（可信正路径与严格失败模式 shim）
+- `tests/anti_debug_runner.lua`（兼容入口）
 - `tests/cfg_regression/Program.cs`
 - `tests/luac_setlist_c0_wrapper.py`（仅测试时构造 `SETLIST C==0` data word）
 - `tests/line_error.lua`
@@ -254,7 +259,7 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 
 `.github/workflows/ci.yml` 在 push、pull request 和手动触发时运行：
 
-- `ubuntu-24.04` 安装 .NET 8 与 PUC Lua 5.1，以 `IB2_RANDOM_RUNS=20` 执行完整 Linux 差分、authenticated entropy envelope、每 block columnar IR/字段角色排列、CFG、AntiDump/反调试、临时 block cache、篡改拒绝和泄漏检查套件；
+- `ubuntu-24.04` 安装 .NET 8 与 PUC Lua 5.1，以 `IB2_RANDOM_RUNS=20` 执行完整 Linux 差分、authenticated entropy envelope、每 block columnar IR/字段角色排列、CFG、strict executor attestation、外部 timeout 失败路径、临时 block cache、篡改拒绝和泄漏检查套件；
 - 独立 Release publish 矩阵覆盖 `linux-x64`、`win-x64` 和 `osx-arm64`，分别使用当前 GitHub-hosted Linux、Windows 与 macOS runner；
 - build matrix 使用 framework-dependent publish 和 `ContinuousIntegrationBuild=true`，验证三个目标 RID 均能完成 Release 编译；
 - 按当前范围不上传 CI Artifact、不调整现有云端混淆产物策略，也不增加仓库内二进制工具校验。
@@ -263,15 +268,15 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 
 ## 4. 仍存在的边界
 
-1. 这是客户端混淆，不是密码学保密。seed、fingerprint、VM、prototype banks、entropy envelope 派生和校验逻辑最终都在攻击者可执行的客户端中；state coupling 能阻止无脑裁剪，却不能阻止分析者同步 patch/重实现客户端验证器。
-2. 字段 schema、常量 tag 与 opcode bank 按 prototype 变化，block mask 和 edge wrapping 再依赖 CFG entry state；但所有派生、guard、v4 验证逻辑与该次 runtime slot ABI 仍在客户端。有能力的分析者可以 patch capability 探针，或 hook dispatch、`GetProto`、`GetInstruction`、handler 与随机化 FlowCache 槽收集执行路径、临时常量和指令块。
+1. 这是客户端混淆，不是密码学保密。salt、attestation token、seed、VM、prototype banks、entropy envelope 派生和校验逻辑最终都在攻击者可执行的客户端中；state coupling 能阻止无脑裁剪，却不能阻止分析者同步 patch/重实现客户端验证器。
+2. 字段 schema、常量 tag 与 opcode bank 按 prototype 变化，block mask、edge wrapping 和完整性域再依赖 CFG entry state 与 attestation-derived binding；但所有派生、guard、v4 验证逻辑与该次 runtime slot ABI 仍在客户端。有能力的分析者可以完整模拟 executor contract、patch guard，或 hook dispatch、`GetProto`、`GetInstruction`、handler 与随机化 FlowCache 槽收集执行路径、临时常量和指令块。
 3. root prototype 的 schema、opaque constant capsules 和 block framing 仍在启动时恢复，但常量值只在引用它的完整 block manifest 认证后进入一次 block decode 的 invocation-local cache。默认 AntiDump 模式不会在共享 Chunk 表累积明文常量或指令；不过 capsule、索引和恢复算法都留在客户端，分析者仍可 hook capsule decode 或逐块触发执行来收集值。
 4. CFG state 是客户端执行一致性与反静态批量恢复机制，不是不可伪造的 CFI 信任根。修改 VM、跳过 verifier，或在每个临时块进入 handler 前主动收集，仍可绕过本地保护。
 5. 当前每个 block 使用一个固定 entry state；多前驱通过不同 wrapped edge 恢复同一目标状态。尚未实现按 predecessor 产生多版本 block 或动态 state merge。
 6. 自动 dispatcher 已按 prototype 启用，但它复用随机物理 block 和 VM route token，不是把原 Lua 指令复制成多版本 block；客户端仍可在 route 解析后观测真实 PC。
 7. Mutation/SuperOperator 没有被本轮宣告为稳定；IR-native superoperator 及更大差分语料仍是后续工作，固定配置继续关闭它们。
 8. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持；“Luau/Roblox 优先”目前仅指 capability-gated 运行时防护。
-9. 活动合法调试 hook 会按反调试策略进入静默诱饵；恶意宿主也可以一致伪造 `iscclosure` / `islclosure`、debug provenance 或原语身份。分层评分与 capability gate 用于减少误报，但无法同时保证对所有定制执行器零误报。
+9. 活动合法调试 hook 会进入无限静默 sink。准入是 hard-AND，因此缺失某项 inspector 或行为差异的真实执行器也会被拒绝；本实现不承诺覆盖所有定制执行器或零误报。恶意宿主若一致伪造 closure/debug/provenance/host 全部契约，客户端无法从根本上区分。
 10. CI 已覆盖 Linux 完整语义回归和 Linux/Windows/macOS Release publish；自动测试已验证 64–96 KiB 随机区及 basE91 前的载荷范围，但尚未在 Windows/macOS 上运行 Lua 语义套件，也尚未完成大程序下 envelope 解码时间、峰值内存和最终文本体积基准。
 
 后续工作按 `HARDENING_PLAN.md` 的剩余候选继续：IR-native superoperator、Luau 原生前端，以及性能、内存和体积基准。

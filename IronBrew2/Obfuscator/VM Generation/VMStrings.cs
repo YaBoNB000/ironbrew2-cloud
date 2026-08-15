@@ -370,13 +370,13 @@ local function FieldKey32(I, Slot, K1, K2, K3)
 end;
 
 local function InitialFlowKey(K1, K2, K3)
-    local Value = (K1 * 65537 + K2 * 257 + K3 + 1831565813) % 4294967296;
+    local Value = (K1 * 65537 + K2 * 257 + K3 + 1831565813 + OuterSeed) % 4294967296;
     return (Value * 1664525 + 1013904223) % 4294967296;
 end;
 
 local function FlowKey(EntryState, FromPC, ToPC, K1, K2, K3)
     local Value = (EntryState * 1664525 + FromPC * 257 + ToPC * 65537
-        + K1 * 251 + K2 * 17 + K3 + 1831565813) % 4294967296;
+        + K1 * 251 + K2 * 17 + K3 + 1831565813 + OuterSeed) % 4294967296;
     return (Value * 1664525 + 1013904223) % 4294967296;
 end;
 
@@ -419,7 +419,7 @@ local function ComputePrototypeIntegrity(Body, K1, K2, K3)
 end;
 
 local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteToken, References, ConstCapsules, Verifier, SuccessorRecords, K1, K2, K3)
-    local Hash = (BitXOR(EntryState, 2135587861) * 31 + BlockStart) % 4294967296;
+    local Hash = (BitXOR(BitXOR(EntryState, 2135587861), OuterSeed) * 31 + BlockStart) % 4294967296;
     Hash = (Hash * 31 + Count) % 4294967296;
     Hash = (Hash * 31 + K1) % 4294967296;
     Hash = (Hash * 31 + K2) % 4294967296;

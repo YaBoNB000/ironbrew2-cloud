@@ -255,22 +255,22 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return state;
 		}
 
-		private static uint InitialFlowKey(ushort k1, ushort k2, ushort k3)
+		private static uint InitialFlowKey(ushort k1, ushort k2, ushort k3, uint binding)
 		{
-			uint value = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3 + FlowDomain);
+			uint value = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3 + FlowDomain + binding);
 			return unchecked(value * 1664525u + 1013904223u);
 		}
 
-		private static uint FlowKey(uint entryState, int fromPc, int toPc, ushort k1, ushort k2, ushort k3)
+		private static uint FlowKey(uint entryState, int fromPc, int toPc, ushort k1, ushort k2, ushort k3, uint binding)
 		{
 			uint value = unchecked(entryState * 1664525u + (uint)fromPc * 257u +
 			                       (uint)toPc * 65537u + (uint)k1 * 251u +
-			                       (uint)k2 * 17u + k3 + FlowDomain);
+			                       (uint)k2 * 17u + k3 + FlowDomain + binding);
 			return unchecked(value * 1664525u + 1013904223u);
 		}
 
-		private static uint FlowVerifier(uint entryState, int blockStart, ushort k1, ushort k2, ushort k3) =>
-			FlowKey(entryState, blockStart, blockStart ^ 0x5A5A, k1, k2, k3);
+		private static uint FlowVerifier(uint entryState, int blockStart, ushort k1, ushort k2, ushort k3, uint binding) =>
+			FlowKey(entryState, blockStart, blockStart ^ 0x5A5A, k1, k2, k3, binding);
 
 		private static ushort BlockFieldMask(uint entryState, int pc, int slot, ushort k1, ushort k2, ushort k3)
 		{
@@ -307,9 +307,10 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 		private static uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
 			uint routeToken, IReadOnlyList<int> constantReferences, IReadOnlyList<byte[]> constantCapsules,
-			uint verifier, IReadOnlyList<KeyValuePair<int, uint>> successors, ushort k1, ushort k2, ushort k3)
+			uint verifier, IReadOnlyList<KeyValuePair<int, uint>> successors, ushort k1, ushort k2, ushort k3,
+			uint binding)
 		{
-			uint hash = HashWord(entryState ^ BlockIntegrityDomain, (uint)start);
+			uint hash = HashWord(entryState ^ BlockIntegrityDomain ^ binding, (uint)start);
 			hash = HashWord(hash, (uint)count);
 			hash = HashWord(hash, k1);
 			hash = HashWord(hash, k2);
@@ -660,8 +661,10 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 					case ChunkStep.Instructions:
 						WriteUInt32Local((uint)chunk.Instructions.Count);
 						WriteUInt32Local((uint)instructionBlocks.Count);
-						WriteUInt32Local(blockStates[controlFlow.EntryBlock] ^ InitialFlowKey(k1, k2, k3));
-						WriteUInt32Local(dispatcherFlattened ? blockRoutes[controlFlow.EntryBlock] : 0u);
+						WriteUInt32Local(blockStates[controlFlow.EntryBlock] ^ InitialFlowKey(k1, k2, k3, _context.XorSeed));
+						// Store the first route under the attestation-derived binding. In the
+						// non-dispatcher case seed^seed decodes back to the zero sentinel.
+						WriteUInt32Local((dispatcherFlattened ? blockRoutes[controlFlow.EntryBlock] : 0u) ^ _context.XorSeed);
 						foreach (ControlFlowBlock block in instructionBlocks)
 						{
 							int start = block.Start;
@@ -698,18 +701,19 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 									throw new InvalidOperationException("Invalid block constant reference.");
 
 							uint routeToken = dispatcherFlattened ? blockRoutes[block] : 0u;
-							uint verifier = FlowVerifier(entryState, start + 1, k1, k2, k3);
+							uint verifier = FlowVerifier(entryState, start + 1, k1, k2, k3, _context.XorSeed);
 							var successorRecords = new List<KeyValuePair<int, uint>>();
 							foreach (ControlFlowBlock successor in block.Successors.OrderBy(value => value.Start))
 							{
 								int successorStart = successor.Start + 1;
 								uint wrappedState = blockStates[successor] ^
-								                    FlowKey(entryState, block.EndExclusive, successorStart, k1, k2, k3);
+								                    FlowKey(entryState, block.EndExclusive, successorStart, k1, k2, k3, _context.XorSeed);
 								successorRecords.Add(new KeyValuePair<int, uint>(successorStart, wrappedState));
 							}
 							byte[] encodedBlockBody = blockBody.ToArray();
 							uint blockTag = ComputeBlockIntegrity(encodedBlockBody, entryState, start + 1, count,
-								routeToken, constantReferences, constantCapsules, verifier, successorRecords, k1, k2, k3);
+								routeToken, constantReferences, constantCapsules, verifier, successorRecords, k1, k2, k3,
+								_context.XorSeed);
 
 							WriteUInt32Local((uint)(start + 1));
 							WriteUInt32Local((uint)count);

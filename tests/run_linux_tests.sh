@@ -44,11 +44,21 @@ obfuscate() {
     "$LUAC" -p "$output"
 }
 
+run_executor() {
+    "$LUA" tests/executor_runner.lua trusted "$1"
+}
+
+run_executor_mode() {
+    local mode=$1
+    local script=$2
+    "$LUA" tests/executor_runner.lua "$mode" "$script"
+}
+
 obfuscate "$WORK/fixed.lua"
 cp "$ROOT/temp/t2.lua" "$WORK/fixed-vm.lua"
 python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
-"$LUA" "$WORK/fixed.lua" > "$WORK/fixed.out"
+run_executor "$WORK/fixed.lua" > "$WORK/fixed.out"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
 
@@ -58,13 +68,13 @@ echo "PASS single fixed configuration"
 obfuscate "$WORK/entropy-second.lua"
 python3 tests/verify_v4_payload.py "$WORK/fixed.lua" --compare "$WORK/entropy-second.lua" --tamper-dir "$WORK"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua" --compare "$ROOT/temp/t2.lua"
-"$LUA" "$WORK/entropy-second.lua" > "$WORK/entropy-second.out"
+run_executor "$WORK/entropy-second.lua" > "$WORK/entropy-second.out"
 cmp "$WORK/baseline.out" "$WORK/entropy-second.out"
 for entropy_case in modify delete reorder; do
     entropy_file="$WORK/entropy-$entropy_case.lua"
     "$LUAC" -p "$entropy_file"
     set +e
-    "$LUA" "$entropy_file" > "$WORK/entropy-$entropy_case.stdout" 2> "$WORK/entropy-$entropy_case.stderr"
+    run_executor "$entropy_file" > "$WORK/entropy-$entropy_case.stdout" 2> "$WORK/entropy-$entropy_case.stderr"
     entropy_code=$?
     set -e
     [[ $entropy_code -ne 0 ]]
@@ -80,7 +90,7 @@ for payload_case in prototype-tag block-manifest column-framing column-consumpti
     payload_file="$WORK/payload-$payload_case.lua"
     "$LUAC" -p "$payload_file"
     set +e
-    "$LUA" "$payload_file" > "$WORK/payload-$payload_case.stdout" 2> "$WORK/payload-$payload_case.stderr"
+    run_executor "$payload_file" > "$WORK/payload-$payload_case.stdout" 2> "$WORK/payload-$payload_case.stderr"
     payload_code=$?
     set -e
     [[ $payload_code -ne 0 ]]
@@ -88,16 +98,28 @@ for payload_case in prototype-tag block-manifest column-framing column-consumpti
 done
 echo "PASS v4 prototype, block-manifest, column framing/consumption and constant-capsule tamper rejection"
 
-# Capability-gated Luau/executor probes must accept untouched native primitives,
-# preserve executor globals, and silently select the decoy route for active hooks,
-# wrapped debug/raw primitives, or mutually inconsistent closure classifiers.
-"$LUA" tests/anti_debug_runner.lua capabilities "$WORK/fixed.lua" > "$WORK/anti-debug-capabilities.out"
-cmp "$WORK/baseline.out" "$WORK/anti-debug-capabilities.out"
-for mode in primitive-hook raw-hook debug-api-hook debug-hook capability-spoof; do
-    "$LUA" tests/anti_debug_runner.lua "$mode" "$WORK/fixed.lua" > "$WORK/anti-debug-$mode.out"
-    [[ ! -s "$WORK/anti-debug-$mode.out" ]]
+# The trusted test executor must pass every hard-AND contract. Plain Lua,
+# partial API surfaces, unstable identity and hooked primitives must remain
+# silent and non-returning until an external timeout terminates the tight sink.
+run_executor "$WORK/fixed.lua" > "$WORK/executor-trusted.out"
+cmp "$WORK/baseline.out" "$WORK/executor-trusted.out"
+
+set +e
+timeout 2s "$LUA" "$WORK/fixed.lua" > "$WORK/executor-plain.stdout" 2> "$WORK/executor-plain.stderr"
+plain_code=$?
+set -e
+[[ $plain_code -eq 124 && ! -s "$WORK/executor-plain.stdout" && ! -s "$WORK/executor-plain.stderr" ]]
+
+for mode in primitive-hook raw-hook debug-api-hook debug-hook classifier-spoof identity-spoof missing-debug; do
+    set +e
+    timeout 2s "$LUA" tests/executor_runner.lua "$mode" "$WORK/fixed.lua" \
+        > "$WORK/executor-$mode.stdout" 2> "$WORK/executor-$mode.stderr"
+    executor_code=$?
+    set -e
+    [[ $executor_code -eq 124 ]]
+    [[ ! -s "$WORK/executor-$mode.stdout" && ! -s "$WORK/executor-$mode.stderr" ]]
 done
-echo "PASS staged anti-debug scoring, provenance checks and silent decoy routing"
+echo "PASS strict executor contract and silent non-returning O(1) decoy sink"
 
 # Verify the unminified generated VM contains all three guard checkpoints and
 # that stable implementation identifiers do not survive name randomization.
@@ -110,16 +132,16 @@ source = Path(sys.argv[1]).read_text("latin1")
 final_source = Path(sys.argv[2]).read_text("latin1")
 root = re.search(
     r"local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*"
-    r"if\s+([A-Za-z_]\w*)\(true\)\s+then\s+return\s+([A-Za-z_]\w*);\s*end;",
+    r"if\s+([A-Za-z_]\w*)\(true\)\s+then\s+[^\n]*return\s+([A-Za-z_]\w*)\(\);\s*end;",
     source,
 )
 if not root:
-    raise SystemExit("post-deserialize forced guard not found")
+    raise SystemExit("post-deserialize forced guard/sink call not found")
 probe = root.group(2)
 if not re.search(r"local\s+function\s+" + re.escape(probe) + r"\s*\(", source):
     raise SystemExit("guard definition not found")
-if len(re.findall(r"\b" + re.escape(probe) + r"\s*\(true\)", source)) < 2:
-    raise SystemExit("startup and post-deserialize forced guards not both present")
+if len(re.findall(r"\b" + re.escape(probe) + r"\s*\(true\)", source)) < 3:
+    raise SystemExit("startup, post-deserialize and first-block forced guards are not all present")
 if not re.search(r"\b" + re.escape(probe) + r"\s*\(false\)", source):
     raise SystemExit("periodic dispatch guard not found")
 leaked = re.search(r"\bGuard[A-Za-z0-9_]*", source + "\n" + final_source)
@@ -147,7 +169,7 @@ from runtime_layout import derive_runtime_layout
 chunk_slots = derive_runtime_layout(source)["chunk"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
-    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
+    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
     r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -163,7 +185,7 @@ source = source[:match.end(1)] + probe + source[match.end(1):]
 Path(sys.argv[2]).write_text(source, "latin1")
 PY
 "$LUAC" -p "$WORK/automatic-dispatch.lua"
-"$LUA" "$WORK/automatic-dispatch.lua" > "$WORK/automatic-dispatch.out"
+run_executor "$WORK/automatic-dispatch.lua" > "$WORK/automatic-dispatch.out"
 cmp "$WORK/baseline.out" "$WORK/automatic-dispatch.out"
 echo "PASS automatic dispatcher selection without source markers"
 
@@ -185,7 +207,7 @@ from runtime_layout import derive_runtime_layout
 chunk_slots = derive_runtime_layout(source)["chunk"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
-    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
+    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
     r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -198,7 +220,7 @@ Path(sys.argv[2]).write_text(source, "latin1")
 PY
 "$LUAC" -p "$WORK/dispatcher-fallback-obfuscated.lua"
 "$LUAC" -p "$WORK/dispatcher-fallback-instrumented.lua"
-"$LUA" "$WORK/dispatcher-fallback-instrumented.lua" > "$WORK/dispatcher-fallback.out"
+run_executor "$WORK/dispatcher-fallback-instrumented.lua" > "$WORK/dispatcher-fallback.out"
 cmp "$WORK/dispatcher-fallback-baseline.out" "$WORK/dispatcher-fallback.out"
 echo "PASS unsupported dispatcher shape falls back without partial metadata"
 
@@ -206,7 +228,7 @@ echo "PASS unsupported dispatcher shape falls back without partial metadata"
 for ((i = 1; i <= RANDOM_RUNS; i++)); do
     obfuscate "$WORK/random.lua"
     python3 tests/runtime_layout.py "$ROOT/temp/t2.lua" > "$WORK/runtime-layout-$i.out"
-    "$LUA" "$WORK/random.lua" > "$WORK/random.out"
+    run_executor "$WORK/random.lua" > "$WORK/random.out"
     cmp -s "$WORK/baseline.out" "$WORK/random.out"
 done
 echo "PASS randomized opcode handlers and non-identity runtime layouts: $RANDOM_RUNS/$RANDOM_RUNS"
@@ -229,7 +251,7 @@ chunk_slots = layout["chunk"]
 block_slots = layout["block"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
-    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
+    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
     r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -275,7 +297,7 @@ for flow_case in block-body initial-state dispatcher-state missing-edge wrapped-
     flow_file="$WORK/flow-$flow_case.lua"
     "$LUAC" -p "$flow_file"
     set +e
-    "$LUA" "$flow_file" > "$WORK/flow-$flow_case.stdout" 2> "$WORK/flow-$flow_case.stderr"
+    run_executor "$flow_file" > "$WORK/flow-$flow_case.stdout" 2> "$WORK/flow-$flow_case.stderr"
     flow_code=$?
     set -e
     [[ $flow_code -ne 0 ]]
@@ -291,7 +313,7 @@ rm -rf temp out.lua
 "$DOTNET" "$CLI" tests/closure_boundary.lua > "$WORK/closure-boundary-build.log"
 mv out.lua "$WORK/closure-boundary.lua"
 "$LUAC" -p "$WORK/closure-boundary.lua"
-"$LUA" "$WORK/closure-boundary.lua" > "$WORK/closure-boundary.out"
+run_executor "$WORK/closure-boundary.lua" > "$WORK/closure-boundary.out"
 cmp "$WORK/closure-boundary-baseline.out" "$WORK/closure-boundary.out"
 echo "PASS Closure pseudo instructions across flow blocks"
 
@@ -303,7 +325,7 @@ rm -rf temp out.lua
 "$DOTNET" "$CLI" tests/lazy_blocks.lua > "$WORK/lazy-build.log"
 mv out.lua "$WORK/lazy.lua"
 "$LUAC" -p "$WORK/lazy.lua"
-"$LUA" "$WORK/lazy.lua" > "$WORK/lazy.out"
+run_executor "$WORK/lazy.lua" > "$WORK/lazy.out"
 cmp "$WORK/lazy-baseline.out" "$WORK/lazy.out"
 python3 - "$ROOT/temp/t2.lua" "$WORK/lazy-instrumented.lua" <<'PY'
 from pathlib import Path
@@ -318,7 +340,7 @@ chunk_slots = layout["chunk"]
 block_slots = layout["block"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
-    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
+    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
     r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -339,7 +361,7 @@ source = source[:match.end(1)] + probe + source[match.end(1):]
 Path(sys.argv[2]).write_text(source, "latin1")
 PY
 "$LUAC" -p "$WORK/lazy-instrumented.lua"
-"$LUA" "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
+run_executor "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
 grep -Eq '^lazy-blocks:[1-9][0-9]*:executed-constant:37$' "$WORK/lazy-instrumented.out"
 echo "PASS ephemeral instruction/constant cache and opaque block retention"
 
@@ -355,7 +377,7 @@ IB2_REAL_LUAC="$LUAC" PATH="$WORK/setlist-bin:$PATH" \
     "$DOTNET" "$CLI" "$WORK/setlist-c0.lua" > "$WORK/setlist-c0-build.log"
 mv out.lua "$WORK/setlist-c0-obfuscated.lua"
 "$LUAC" -p "$WORK/setlist-c0-obfuscated.lua"
-"$LUA" "$WORK/setlist-c0-obfuscated.lua" > "$WORK/setlist-c0-obfuscated.out"
+run_executor "$WORK/setlist-c0-obfuscated.lua" > "$WORK/setlist-c0-obfuscated.out"
 cmp "$WORK/setlist-c0-baseline.out" "$WORK/setlist-c0-obfuscated.out"
 echo "PASS SETLIST C=0 data-word semantics"
 
@@ -375,7 +397,7 @@ rm -rf temp out.lua
 mv out.lua "$WORK/line.lua"
 "$LUAC" -p "$WORK/line.lua"
 set +e
-"$LUA" "$WORK/line.lua" > "$WORK/line.stdout" 2> "$WORK/line.stderr"
+run_executor "$WORK/line.lua" > "$WORK/line.stdout" 2> "$WORK/line.stderr"
 line_code=$?
 set -e
 [[ $line_code -ne 0 ]]
@@ -383,7 +405,7 @@ grep -q 'ERROR IN IRONBREW SCRIPT \[LINE 4\]' "$WORK/line.stderr"
 echo "PASS nested line-info reporting"
 
 # Simulate LuaJIT's signed 32-bit bit.bxor result.
-"$LUA" tests/signed_bit_runner.lua "$WORK/fixed.lua" > "$WORK/signed-bit.out"
+run_executor_mode signed-bit "$WORK/fixed.lua" > "$WORK/signed-bit.out"
 cmp "$WORK/baseline.out" "$WORK/signed-bit.out"
 echo "PASS signed bit.bxor compatibility"
 
@@ -422,7 +444,7 @@ Path(sys.argv[2]).write_text(source, "latin1")
 PY
 "$LUAC" -p "$WORK/tampered.lua"
 set +e
-"$LUA" "$WORK/tampered.lua" > "$WORK/tamper.stdout" 2> "$WORK/tamper.stderr"
+run_executor "$WORK/tampered.lua" > "$WORK/tamper.stdout" 2> "$WORK/tamper.stderr"
 tamper_code=$?
 set -e
 [[ $tamper_code -ne 0 ]]

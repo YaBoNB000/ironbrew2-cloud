@@ -20,10 +20,10 @@ namespace IronBrew2.Obfuscator
 		// was removed; this flag no longer injects executor hooks or background scans.
 		public bool AggressiveDefense;
 		public bool Noise;
-		// Optional strict Roblox fingerprint binding. This is independent of AntiDump
-		// and remains opt-in because it intentionally rejects non-Roblox runtimes.
+		// Strict brand-neutral Roblox executor attestation. The fixed profile requires
+		// this together with AntiDump; plain Lua/Luau and Studio enter the silent sink.
 		public bool EnvironmentLock;
-		// Watermark used only by the optional strict EnvironmentLock implementation.
+		// Watermark retained for source compatibility.
 		public string Watermark;
 		
 		public ObfuscationSettings()
@@ -44,7 +44,7 @@ namespace IronBrew2.Obfuscator
 			AntiDump = true;
 			AggressiveDefense = false;
 			Noise = false;
-			EnvironmentLock = false;
+			EnvironmentLock = true;
 			Watermark = "Protected by IOI obf";
 		}
 	}

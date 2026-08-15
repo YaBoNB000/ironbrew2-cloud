@@ -15,15 +15,15 @@
 - 显式 CFG、invocation-local Flow、合法 successor edge、包装目标 state 与目标块入口验证：开启
 - 安全 prototype 自动 route-state dispatcher flattening；不满足准入条件时原子回退：开启
 - handler 安全分段/等价模板与双 handler dispatch leaf 结构多态：开启
-- **AntiDump：开启**（Luau/Roblox capability 探针、静默诱饵、invocation-local 临时指令缓存）
-- EnvironmentLock、AggressiveDefense、Noise：关闭
-- Mutation、SuperOperator、源码字符串转换：关闭
+- **AntiDump：开启**（hard-AND executor attestation、sticky non-returning sink、invocation-local 临时指令缓存）
+- **EnvironmentLock：开启**（attestation token 绑定 payload seed、flow、route 与 block 认证域）
+- AggressiveDefense、Noise、Mutation、SuperOperator、源码字符串转换：关闭
 
-这里的 AntiDump 不再是旧版“要求存在某个执行器 API，否则明确报错”的前置 bytecode 块。防护代码现在直接位于生成 VM 内：普通 Lua 环境可以兼容运行；宿主提供能力时，VM 才使用 `debug.gethook`、`debug.getinfo`/`debug.info`、`iscclosure` 和 `islclosure`。当前实现采用分层探针：先做快照身份与 capability provider 一致性检查，再在重探针中交叉验证 C/L closure 分类、debug source provenance，并用 raw table/string/select 等无副作用行为 canary 检查语义。各信号按权重聚合，达到高置信阈值后 sticky 命中，进入无输出、有限计算的诱饵路径，不显示“blocked”错误。
+防护代码直接位于生成 VM 内，当前唯一配置为 executor-only。`identifyexecutor()` 必须稳定返回非空身份，但不检查品牌白名单；准入还必须同时通过 `getgenv`/`checkcaller`、Roblox host 行为、C/L closure classifier、`newcclosure`、`loadstring`、debug constants/upvalues/proto/setupvalue、关键 primitive provenance、快照身份和随机 transcript。全部条件为硬性 AND，不使用评分或 quorum。普通 Lua/Luau、Studio、简单 API stub 和中途被替换的环境都不执行真实 payload。
 
-guard 自身维护带 seal 的运行状态；seal 不一致会直接命中。该状态同时驱动 LCG 式抖动调度，避免固定的 `counter % N` 周期。强制检查分别发生在 VM guard 启动和 root prototype 反序列化之后，dispatch 中继续按 interval+jitter 复检；所有 guard 局部名仍经过每次构建的随机化。
+guard 自身维护 attestation 与带 seal 的运行状态；seal 不一致会 sticky 命中。该状态驱动 interval+jitter 调度，避免固定周期。强制检查分别发生在 VM guard 启动、root prototype 反序列化后与首块进入前，dispatch 中继续复检；所有 guard 局部名仍经过每次构建随机化。正确 transcript 恢复每构建 token，并参与 serializer seed、初始/边 flow key、verifier、block manifest 与 initial route。
 
-旧 `AggressiveDefense` 的全局 API 删除/替换、registry 后台扫描、联网/文件探测、绝对时序判断、无限循环和大内存分配均未恢复。生成脚本不会修改 `getgenv()` 中的 `hookfunction`、文件 API 或 load API，也不会启动常驻扫描任务。`AggressiveDefense` 字段仅为源码兼容保留，不再注入这些行为。
+失败后不显示“blocked”错误、不输出也不返回，而是在当前线程进入每构建随机化的 non-yielding 位混合无限状态图。该 sink 仅使用固定 O(1) 状态，不持续分配内存。旧 `AggressiveDefense` 的全局 API 删除/替换、registry 后台扫描、联网/文件探测、后台任务、递归崩溃和大内存分配均未恢复；生成脚本也不会修改 executor global。
 
 ## VM / payload 耦合的防 dump 路径
 
@@ -35,8 +35,8 @@ guard 自身维护带 seal 的运行状态；seal 不一致会直接命中。该
 6. 默认 AntiDump 模式不把已执行块写入共享 instruction table。当前 invocation 的随机化 FlowCache 槽只保存当前块；跨块、跳转、自环或其他非顺序转移会替换该缓存。
 7. opaque capsule、manifest 和 body 被保留，块重入时重新认证、重新恢复常量与指令；因此不会随执行路径增长而累积共享明文全集。
 8. Chunk 15、Block 9、Flow 4、FlowCache 3 个逻辑槽在每次构建映射到四组完整非 identity 物理槽；constructor、alias、helper 与 handler 使用同一 build-wide ABI。
-9. guard 在启动、root 反序列化后及 dispatch 周期三个阶段检查捕获的库/关键原语、debug/closure provenance 与行为 canary；周期由密封状态产生抖动。中途命中同样从当前 VM invocation 静默返回诱饵结果。
-10. 关闭 AntiDump 的库级调用仍可使用共享 lazy cache 路径，但唯一固定 CLI 配置默认开启上述临时缓存。
+9. guard 在启动、root 反序列化后、首块进入前及 dispatch 周期四处检查 primitive 快照、executor/debug contract 与 provenance；周期由密封状态产生抖动。中途命中会先清除当前 invocation 的明文引用，再进入不返回的固定内存 sink。
+10. 关闭 AntiDump 的库级调用仍可使用共享 lazy cache 路径，但唯一固定 CLI 配置同时开启 AntiDump 与 EnvironmentLock。
 
 该设计会以块重入时重复认证/解码换取更小的明文驻留窗口，属于安全与性能的明确取舍。
 
@@ -54,7 +54,7 @@ guard 自身维护带 seal 的运行状态；seal 不一致会直接命中。该
 ## 当前安全边界
 
 - 这是客户端混淆，不是密码学保密。guard、decoy、校验、密钥派生和 VM 最终都交付给客户端，有能力的分析者仍可 patch 探针或 hook dispatch。
-- capability 探针采用高置信信号并避免“API 存在即判定”；但宿主可伪造 `iscclosure` 等结果，合法调试 hook 也会按反调试策略进入诱饵。
+- executor 准入不是“API 存在即通过”，而是全部能力与行为契约 hard-AND；但宿主仍可一致伪造全部结果，合法调试 hook 也会按策略进入无限 sink，无法承诺所有执行器零误报。
 - 临时缓存阻止正常执行路径在共享 prototype 表中累积明文常量/指令全集，但攻击者仍可 hook capsule decode、`GetInstruction`、handler 或随机化 FlowCache 槽收集当前块。
 - 顶层、entropy envelope、prototype、complete block manifest 与 capsule 多层完整性/状态检查可确定性拒绝简单篡改和 record 裁剪；但校验与派生算法随客户端交付，不是服务端信任根。
 - runtime slot ABI 每次变化会破坏固定槽位工具，但布局可从单个生成 VM 恢复，不能被视作秘密。
@@ -71,4 +71,4 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua5.1 LUAC=/path/to/luac5.1 \
   tests/run_linux_tests.sh
 ```
 
-测试覆盖固定配置语义差分、20 次随机生成、64–96 KiB 规模与 Shannon entropy、跨次 entropy 独立性、envelope 完整恢复、在重算外层 tag 后修改/删除/重排 record 的拒绝、v4 prototype/complete block manifest/constant capsule 三类可重封装内层篡改拒绝、四组完整非 identity runtime slot permutation、跨构建 ABI 变化及 block aliases 一致性、Luau/executor capability 正常与篡改模拟、静默诱饵、三阶段探针、名称随机化、executor 全局不被修改、共享 instruction table 不积累明文、constant store 保持 opaque capsule、显式 CFG、dispatcher 准入/回退、Closure/SETLIST 边界、line info、有符号 bit、flow/block 篡改拒绝及明文字符串扫描。
+测试覆盖 trusted executor shim 下的固定配置语义差分、20 次随机生成、64–96 KiB 规模与 Shannon entropy、跨次 entropy 独立性、envelope 完整恢复、在重算外层 tag 后修改/删除/重排 record 的拒绝、v4 prototype/complete block manifest/constant capsule 三类可重封装内层篡改拒绝、四组完整非 identity runtime slot permutation、跨构建 ABI 变化及 block aliases 一致性、plain Lua 与多种 executor contract 失败模式的外部 timeout/零输出、四处 guard 检查、名称随机化、executor global 不变、共享 instruction table 不积累明文、constant store 保持 opaque capsule、显式 CFG、dispatcher 准入/回退、Closure/SETLIST 边界、line info、有符号 bit、flow/block 篡改拒绝及明文字符串扫描。
