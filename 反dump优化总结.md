@@ -8,6 +8,7 @@
 
 - ControlFlow、字节码 DEFLATE：开启
 - v3 payload、prototype-local 字段 schema / 常量 tag / opcode bank、block-state 字段编码和分层完整性检查：开启
+- 每次 64–96 KiB authenticated/state-coupled entropy envelope（feature 15）：开启
 - 子 prototype 按 `OP_CLOSURE` 首次访问延迟恢复：开启
 - 显式 CFG、invocation-local Flow、合法 successor edge、包装目标 state 与目标块入口验证：开启
 - 安全 prototype 自动 route-state dispatcher flattening；不满足准入条件时原子回退：开启
@@ -24,18 +25,20 @@ guard 自身维护带 seal 的运行状态；seal 不一致会直接命中。该
 
 ## VM / payload 耦合的防 dump 路径
 
-1. 指令仍以经过 entry-state 掩码和块级完整性认证的 opaque block body 存放。
-2. 默认 AntiDump 模式不再把已执行块写入共享的 `Chunk[1]` 明文 instruction table。
-3. `GetInstruction` 只在当前 closure invocation 的 `Flow[4]` 中保存当前块的解码结果；跨块、跳转、自环或其他非顺序转移会替换该缓存。
-4. opaque body、最小常量引用和 body tag 被保留，以便块再次进入时重新认证、重新解码；因此不会随着执行路径增长而累积一份共享明文指令全集。
-5. guard 在启动、root 反序列化后及 dispatch 周期三个阶段检查捕获的库/关键原语、debug/closure provenance 与行为 canary；周期由密封状态产生抖动。中途命中同样从当前 VM invocation 静默返回诱饵结果。
-6. 关闭 AntiDump 的库级调用仍可使用原共享 lazy cache 路径，但唯一固定 CLI 配置默认开启上述临时缓存。
+1. 真实序列化 body 在 DEFLATE 后先由全量 entropy digest 派生的状态流掩码，再拆成 data records，与 64–96 KiB CSPRNG entropy records 交错；VM 必须验证 envelope tag/framing/digest 并恢复全部 data records 后才能 inflate。
+2. entropy digest 覆盖所有 logical entropy records，envelope tag 覆盖物理顺序；随机区即使位于真实数据之后也会改变内层 mask state，不能作为尾部 padding 直接删除。
+3. 指令仍以经过 entry-state 掩码和块级完整性认证的 opaque block body 存放。
+4. 默认 AntiDump 模式不再把已执行块写入共享的 `Chunk[1]` 明文 instruction table。
+5. `GetInstruction` 只在当前 closure invocation 的 `Flow[4]` 中保存当前块的解码结果；跨块、跳转、自环或其他非顺序转移会替换该缓存。
+6. opaque body、最小常量引用和 body tag 被保留，以便块再次进入时重新认证、重新解码；因此不会随着执行路径增长而累积一份共享明文指令全集。
+7. guard 在启动、root 反序列化后及 dispatch 周期三个阶段检查捕获的库/关键原语、debug/closure provenance 与行为 canary；周期由密封状态产生抖动。中途命中同样从当前 VM invocation 静默返回诱饵结果。
+8. 关闭 AntiDump 的库级调用仍可使用原共享 lazy cache 路径，但唯一固定 CLI 配置默认开启上述临时缓存。
 
 该设计会以块重入时重复认证/解码换取更小的明文驻留窗口，属于安全与性能的明确取舍。
 
-## 已保留的体积与结构优化
+## 当前体积与结构取舍
 
-1. 字节码正文在加密前使用 DEFLATE，生成结果再以 basE91 表示；加密后的高熵数据不再重复套用收益为负的 LZW。
+1. 真实字节码正文先使用 DEFLATE，再加入 64–96 KiB 认证 entropy envelope、外层 streaming XOR 和 basE91。高熵区不再重复套用收益为负的 LZW；固定随机区及约 1.23 倍 basE91 展开是明确接受的体积成本。
 2. VM 模板只包含实际需要的 opcode handler。
 3. 字符串常量由外层 payload 加密和 prototype/常量索引相关的内层编码保护，不启用会放大体积且影响闭包语义的源码级解密函数。
 4. 父 prototype 只保留子 prototype 的长度分帧 opaque slice；子指令和常量在 closure 首次创建时恢复。
@@ -49,7 +52,7 @@ guard 自身维护带 seal 的运行状态；seal 不一致会直接命中。该
 - 这是客户端混淆，不是密码学保密。guard、decoy、校验、密钥派生和 VM 最终都交付给客户端，有能力的分析者仍可 patch 探针或 hook dispatch。
 - capability 探针采用高置信信号并避免“API 存在即判定”；但宿主可伪造 `iscclosure` 等结果，合法调试 hook 也会按反调试策略进入诱饵。
 - 临时缓存阻止正常执行路径在共享 prototype 表中累积明文全集，但攻击者仍可 hook `GetInstruction`、handler 或 `Flow[4]` 收集当前块。
-- 顶层与 block 两级完整性检查可确定性拒绝简单篡改，但校验算法随客户端交付，不是服务端信任根。
+- 顶层、entropy envelope 与 block 三级完整性/状态检查可确定性拒绝简单篡改和 record 裁剪；但校验与派生算法随客户端交付，不是服务端信任根。
 - 当前每个目标 block 对所有合法 predecessor 使用同一 entry state；尚未做 predecessor-specific 多版本或动态 state merge。
 - 前端仍由 Lua 5.1 `luac` 产生 bytecode；本轮“Luau/Roblox 优先”指运行时 capability 防护，不等同于已经支持全部 Luau 专有源语法。
 - IR-native superoperator 仍是独立候选项目，固定配置继续关闭 Mutation/SuperOperator。
@@ -63,4 +66,4 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua5.1 LUAC=/path/to/luac5.1 \
   tests/run_linux_tests.sh
 ```
 
-测试覆盖固定配置语义差分、20 次随机生成、Luau/executor capability 正常模拟、`string.byte`/`rawset`/`debug.getinfo` 包装模拟、活动 `debug` hook、互相矛盾的 closure classifier、静默诱饵无输出、启动/反序列化后/dispatch 三阶段探针、guard 名称随机化、executor 全局不被修改、共享 `Chunk[1]` 不积累明文指令、opaque block 保留、显式 CFG、dispatcher 准入/回退、Closure/SETLIST 边界、line info、有符号 bit、payload 与 flow/block 篡改拒绝及明文字符串扫描。
+测试覆盖固定配置语义差分、20 次随机生成、64–96 KiB 规模与 Shannon entropy、跨次 entropy 独立性、envelope 完整恢复、在重算外层 tag 后修改/删除/重排 record 的拒绝、Luau/executor capability 正常模拟、`string.byte`/`rawset`/`debug.getinfo` 包装模拟、活动 `debug` hook、互相矛盾的 closure classifier、静默诱饵无输出、启动/反序列化后/dispatch 三阶段探针、guard/envelope 名称随机化、executor 全局不被修改、共享 `Chunk[1]` 不积累明文指令、opaque block 保留、显式 CFG、dispatcher 准入/回退、Closure/SETLIST 边界、line info、有符号 bit、payload 与 flow/block 篡改拒绝及明文字符串扫描。

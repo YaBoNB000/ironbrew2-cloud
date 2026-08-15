@@ -64,6 +64,17 @@
 
 当前验收：v3 指令不能只按 PC 独立解码；缺失 edge、被修改的初始/边状态、dispatcher state、错误目标入口和 block body 篡改都会以 `invalid protected payload` 拒绝。CFG 结构测试覆盖循环/自环、comparison companion、FORPREP/FORLOOP、skip-next、data word 和 24 条分页；运行测试覆盖无 marker 自动命中、单块及畸形 prototype 安全回退、递归 invocation、跨块 Closure 伪指令与合法多分支执行。自动 dispatcher flattening 已完成，IR-native superoperator 仍是后续独立项目。
 
+### Phase 3.25：认证且状态耦合的高熵 envelope（已完成）
+
+- [x] 在真实 body 完成 DEFLATE 后、外层 streaming XOR 前加入 v3 feature bit 3 的 entropy envelope；固定配置 feature 值由 `7` 升为 `15`。
+- [x] 每次输出使用操作系统 CSPRNG 生成独立的 64–96 KiB entropy，并随机切分为 12–20 个 records；真实压缩流切分为 4–8 个 data records，两类 record 强制交错后再随机物理排序。
+- [x] entropy digest 绑定 seed、nonce、总长度、logical ordinal、record 长度与每个 entropy byte，并参与真实 body 的内层流状态派生；随机区不是可删除的尾部 padding。
+- [x] 独立 envelope tag 覆盖固定头、全部 record framing、物理顺序与 record bytes；VM 在 inflate 前严格验证版本/features、长度上限、record 数量、kind、ordinal 唯一性、总长度、终止位置、digest 和 tag。
+- [x] envelope runtime 的新增局部标识符全部进入每次构建的 identifier map。
+- [x] verifier 会完整恢复 envelope 和真实 DEFLATE body，检查熵值与跨次独立性；测试在重新计算外层 tag 后分别修改、删除和重排 entropy record，三种情况均被 VM 拒绝。
+
+当前验收：每次生成的随机区严格位于 65,536–98,304 bytes，测试样本 Shannon entropy 不低于 7.95 bits/byte；record 删除、修改或重排不能作为无影响 padding 操作。该机制提高静态载荷分析和直接裁剪成本，但全部派生与验证代码仍交付客户端，不宣称服务端密码学信任根。
+
 ### Phase 3.5：Luau 反调试与防 dump（已完成）
 
 - [x] 移除旧前置 guard 的“必须存在执行器 API，否则明确报错”行为，将能力探针直接嵌入生成 VM。
@@ -82,8 +93,8 @@
 - [x] 文档明确当前源码前端为 Lua 5.1；Luau 原生前端仍是后续候选。
 - [ ] Luau 专用构建使用 `buffer` 读取和原地解码。
 - [ ] 自适应压缩：小 payload 不携带 inflater，大 payload 再用 DEFLATE。
-- [x] CLI、批处理和云端工作流统一为单一稳定配置：ControlFlow/DEFLATE/AntiDump 开启，EnvironmentLock/AggressiveDefense 关闭。
-- [ ] 为固定配置建立真实性能和体积基准。
+- [x] CLI、批处理和云端工作流统一为单一稳定配置：ControlFlow/DEFLATE/AntiDump/64–96 KiB authenticated entropy envelope 开启，EnvironmentLock/AggressiveDefense 关闭。
+- [ ] 为固定配置建立大型程序真实性能、内存和体积基准（当前已自动检查 envelope 的固定增量与熵值）。
 - [x] 提供本地 Linux 语义差分、随机 seed 和篡改测试脚本。
 - [x] 将 Linux Lua 5.1 完整回归接入 CI，并增加 Linux x64、Windows x64、macOS arm64 的 Release publish 构建矩阵。
 - 不实施（当前明确不需要）：云端仅上传短期 Artifact、敏感源码/产物策略和额外二进制工具校验。

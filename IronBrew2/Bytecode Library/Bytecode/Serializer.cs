@@ -16,10 +16,25 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private const byte FormatVersion = 3;
 		private const byte BasicBlockFeature = 2;
 		private const byte DispatcherFlatteningFeature = 4;
+		private const byte EntropyEnvelopeFeature = 8;
 		private const int MaxBlockInstructions = DispatcherFlatteningPlanner.MaxBlockInstructions;
+		private const int EntropyMinBytes = 64 * 1024;
+		private const int EntropyMaxBytes = 96 * 1024;
+		private const byte EntropyRecordKind = 0xA7;
+		private const byte DataRecordKind = 0x5C;
 		private const uint IntegrityDomain = 0xA5C31F27u;
 		private const uint BlockIntegrityDomain = 0x7F4A7C15u;
 		private const uint FlowDomain = 0x6D2B79F5u;
+		private const uint EnvelopeIntegrityDomain = 0xC4D29A6Bu;
+		private const uint EntropyDigestDomain = 0x91E10DA5u;
+		private const uint EnvelopeMaskDomain = 0x3A75C9EFu;
+
+		private sealed class EntropyRecord
+		{
+			public byte Kind { get; init; }
+			public ushort Ordinal { get; init; }
+			public byte[] Data { get; init; }
+		}
 
 		private readonly ObfuscationContext _context;
 		private readonly ObfuscationSettings _settings;
@@ -33,25 +48,29 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 		/// <summary>
 		/// v3 顶层格式（固定 9 字节头）：
-		///   head/salt 4B | integrity tag 4B | version+flags 1B | encrypted body
-		/// K1/K2/K3 不再出现在明文头，而是每个 prototype 独立生成并放入加密正文。
+		///   head/salt 4B | integrity tag 4B | version+flags 1B | encrypted envelope
+		/// 压缩后的真实 body 被拆为多个 data records，并与 64–96 KiB CSPRNG entropy
+		/// records 交错。entropy digest 同时派生内层 body mask；物理 record 顺序由独立
+		/// envelope tag 认证，因此删除、修改或重排 record 都不能退化为可移除 padding。
+		/// K1/K2/K3 不再出现在明文头，而是每个 prototype 独立生成并放入保护正文。
 		/// </summary>
 		public byte[] SerializeLChunk(Chunk chunk)
 		{
 			byte[] plain = SerializeBody(chunk);
 			byte[] payload = _settings.BytecodeCompress ? Deflate(plain) : plain;
+			byte[] envelope = WrapEntropyEnvelope(payload, _context.XorSeed);
 
 			uint state = _context.XorSeed;
-			byte[] encrypted = new byte[payload.Length];
-			for (int i = 0; i < payload.Length; i++)
+			byte[] encrypted = new byte[envelope.Length];
+			for (int i = 0; i < envelope.Length; i++)
 			{
-				encrypted[i] = (byte)(payload[i] ^ (byte)(state >> 24));
+				encrypted[i] = (byte)(envelope[i] ^ (byte)(state >> 24));
 				state = unchecked(state * 1664525u + 1013904223u);
 			}
 
 			uint head = _settings.EnvironmentLock ? _context.Binder.Salt : _context.XorSeed;
 			byte flags = (byte)((FormatVersion << 4) | BasicBlockFeature | DispatcherFlatteningFeature |
-			                    (_settings.BytecodeCompress ? 1 : 0));
+			                    EntropyEnvelopeFeature | (_settings.BytecodeCompress ? 1 : 0));
 			// Bind both the format/feature byte and encrypted body. This is tamper/corruption
 			// detection, not a client-side cryptographic trust root.
 			uint integrity = ComputeIntegrity(encrypted, _context.XorSeed, flags);
@@ -70,6 +89,139 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			foreach (byte value in encrypted)
 				hash = unchecked(hash * 31u + value);
 			return hash;
+		}
+
+		private static byte[] WrapEntropyEnvelope(byte[] payload, uint seed)
+		{
+			if (payload == null || payload.Length == 0)
+				throw new InvalidOperationException("Cannot envelope an empty protected payload.");
+
+			int entropyLength = RandomNumberGenerator.GetInt32(EntropyMinBytes, EntropyMaxBytes + 1);
+			byte[] entropy = RandomNumberGenerator.GetBytes(entropyLength);
+			uint nonce = NextState32();
+
+			List<byte[]> entropyParts = SplitRandom(entropy, RandomNumberGenerator.GetInt32(12, 21));
+			List<byte[]> dataParts = SplitRandom(payload, RandomNumberGenerator.GetInt32(4, 9));
+			uint entropyDigest = ComputeEntropyDigest(entropyParts, seed, nonce, entropyLength);
+
+			uint maskState = seed ^ nonce ^ entropyDigest ^ EnvelopeMaskDomain ^ (uint)payload.Length;
+			byte[] maskedPayload = new byte[payload.Length];
+			for (int index = 0; index < payload.Length; index++)
+			{
+				maskedPayload[index] = (byte)(payload[index] ^ (byte)(maskState >> 24));
+				maskState = unchecked(maskState * 1664525u + 1013904223u);
+			}
+			dataParts = SplitAtLengths(maskedPayload, dataParts.Select(part => part.Length));
+
+			var records = new List<EntropyRecord>(entropyParts.Count + dataParts.Count);
+			for (int index = 0; index < entropyParts.Count; index++)
+				records.Add(new EntropyRecord {Kind = EntropyRecordKind, Ordinal = (ushort)(index + 1), Data = entropyParts[index]});
+			for (int index = 0; index < dataParts.Count; index++)
+				records.Add(new EntropyRecord {Kind = DataRecordKind, Ordinal = (ushort)(index + 1), Data = dataParts[index]});
+			ShuffleEntropyRecords(records);
+
+			// 8 x u32 fields. The final field is patched with a keyed envelope tag.
+			var envelope = new List<byte>(32 + records.Count * 7 + entropyLength + payload.Length);
+			WriteUInt32(envelope, (uint)payload.Length);
+			WriteUInt32(envelope, (uint)entropyLength);
+			WriteUInt32(envelope, (uint)records.Count);
+			WriteUInt32(envelope, (uint)dataParts.Count);
+			WriteUInt32(envelope, (uint)entropyParts.Count);
+			WriteUInt32(envelope, nonce);
+			WriteUInt32(envelope, entropyDigest);
+			WriteUInt32(envelope, 0u);
+			foreach (EntropyRecord record in records)
+			{
+				envelope.Add(record.Kind);
+				WriteUInt16(envelope, record.Ordinal);
+				WriteUInt32(envelope, (uint)record.Data.Length);
+				envelope.AddRange(record.Data);
+			}
+
+			byte[] result = envelope.ToArray();
+			uint tag = ComputeEnvelopeIntegrity(result, seed);
+			WriteUInt32(result, 28, tag);
+			return result;
+		}
+
+		private static List<byte[]> SplitRandom(byte[] data, int requestedCount)
+		{
+			int count = Math.Max(1, Math.Min(requestedCount, data.Length));
+			if (count == 1)
+				return new List<byte[]> {data.ToArray()};
+
+			var cuts = new HashSet<int>();
+			while (cuts.Count < count - 1)
+				cuts.Add(RandomNumberGenerator.GetInt32(1, data.Length));
+			var lengths = new List<int>(count);
+			int previous = 0;
+			foreach (int cut in cuts.OrderBy(value => value))
+			{
+				lengths.Add(cut - previous);
+				previous = cut;
+			}
+			lengths.Add(data.Length - previous);
+			return SplitAtLengths(data, lengths);
+		}
+
+		private static List<byte[]> SplitAtLengths(byte[] data, IEnumerable<int> lengths)
+		{
+			var result = new List<byte[]>();
+			int offset = 0;
+			foreach (int length in lengths)
+			{
+				var part = new byte[length];
+				Buffer.BlockCopy(data, offset, part, 0, length);
+				result.Add(part);
+				offset += length;
+			}
+			if (offset != data.Length)
+				throw new InvalidOperationException("Invalid entropy envelope split.");
+			return result;
+		}
+
+		private static uint ComputeEntropyDigest(IReadOnlyList<byte[]> records, uint seed, uint nonce, int totalLength)
+		{
+			uint hash = unchecked((seed ^ EntropyDigestDomain) * 31u + nonce);
+			hash = unchecked(hash * 31u + (uint)totalLength);
+			hash = unchecked(hash * 31u + (uint)records.Count);
+			for (int index = 0; index < records.Count; index++)
+			{
+				byte[] record = records[index];
+				hash = unchecked(hash * 31u + (uint)(index + 1));
+				hash = unchecked(hash * 31u + (uint)record.Length);
+				foreach (byte value in record)
+					hash = unchecked(hash * 31u + value);
+			}
+			return hash;
+		}
+
+		private static uint ComputeEnvelopeIntegrity(byte[] envelope, uint seed)
+		{
+			uint hash = unchecked((seed ^ EnvelopeIntegrityDomain) * 31u);
+			for (int index = 0; index < envelope.Length; index++)
+			{
+				// Bytes 28..31 hold the tag itself and are intentionally omitted.
+				if (index >= 28 && index < 32) continue;
+				hash = unchecked(hash * 31u + envelope[index]);
+			}
+			return hash;
+		}
+
+		private static void ShuffleEntropyRecords(List<EntropyRecord> records)
+		{
+			int transitions;
+			do
+			{
+				for (int index = records.Count - 1; index > 0; index--)
+				{
+					int swapIndex = RandomNumberGenerator.GetInt32(index + 1);
+					(records[index], records[swapIndex]) = (records[swapIndex], records[index]);
+				}
+				transitions = 0;
+				for (int index = 1; index < records.Count; index++)
+					if (records[index - 1].Kind != records[index].Kind) transitions++;
+			} while (transitions < 2);
 		}
 
 		private static ushort NextKey16() =>
@@ -175,6 +327,14 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			output.Add((byte)(value >> 8));
 			output.Add((byte)(value >> 16));
 			output.Add((byte)(value >> 24));
+		}
+
+		private static void WriteUInt32(byte[] output, int offset, uint value)
+		{
+			output[offset] = (byte)value;
+			output[offset + 1] = (byte)(value >> 8);
+			output[offset + 2] = (byte)(value >> 16);
+			output[offset + 3] = (byte)(value >> 24);
 		}
 
 		/// <summary>raw DEFLATE（RFC 1951）。</summary>

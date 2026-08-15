@@ -16,17 +16,22 @@
 `Serializer.cs` 与 `VMStrings.cs` 已同步切换到 v3 格式：
 
 ```text
-4B head/salt | 4B integrity tag | 1B version+feature flags | encrypted body
+4B head/salt | 4B outer integrity tag | 1B version+feature flags | encrypted entropy envelope
 ```
 
 - 高 4 位为格式版本，目前必须为 `3`；v2/旧 Release 产物会被新版 VM 明确拒绝。
-- 低位 bit 0 表示 DEFLATE，bit 1 表示 basic-block lazy decode，bit 2 表示 route-state dispatcher framing；当前 VM 要求 bit 1/2 存在，未知 feature bits 会被拒绝。
-- 顶层完整性值绑定格式/feature 字节、加密正文和运行 seed，并在解密、解压及反序列化前验证。
+- 低位 bit 0 表示 DEFLATE，bit 1 表示 basic-block lazy decode，bit 2 表示 route-state dispatcher framing，新增 bit 3 表示 authenticated entropy envelope。固定配置四项全部开启，因此 feature 值为 `15`。
+- 顶层完整性值绑定格式/feature 字节、整个加密 envelope 和运行 seed，并在外层解密前验证。
+- 真实序列化 body 先按现有配置做 raw DEFLATE，再以由 entropy digest、nonce、seed、真实长度和独立 domain 派生的内层流状态逐字节掩码；恢复正文不再只依赖原有外层 XOR。
+- 每次构建由操作系统 CSPRNG 独立生成 64–96 KiB entropy，随机切分为 12–20 个 records；掩码后的真实压缩流切成 4–8 个 data records。两类 record 使用各自 logical ordinal，物理顺序以 CSPRNG 打乱，并要求至少发生两次类型转换以保持交错。
+- envelope 固定头记录真实/entropy 总长度、total/data/entropy record 数、nonce、entropy digest 和 envelope tag。每个 record 另有 kind、ordinal、长度 framing 和 bytes。
+- entropy digest 绑定 seed、nonce、总长度、record 数、每个 logical ordinal/长度和全部 entropy bytes，并直接参与内层真实 body mask 的初始状态。即使某个 entropy record 位于最后，它仍会改变真实流恢复状态，因此随机区不是可裁掉的尾部 padding。
+- 独立 envelope tag 绑定固定头（排除 tag 自身）、全部 record framing、record bytes 和物理顺序。VM 在 inflate 前还严格检查长度范围/终态、record 数、kind、ordinal 唯一性、logical 总长度和 digest。
 - v3 另为每个 opaque instruction block 写入绑定入口状态、块起点/长度、prototype keys 与 body bytes 的完整性 tag；从 opaque body 解码前认证该块。
-- 修改加密 payload、已反序列化后的 block body 或 flow metadata 都会以 `invalid protected payload` 失败。
+- 修改加密 payload、删除/修改/重排 entropy record、篡改已反序列化后的 block body 或 flow metadata 都会以 `invalid protected payload` 失败。
 - K1/K2 不再位于固定明文头。
 
-这些完整性机制用于检测损坏和提高直接 patch 成本；算法和验证代码都交付给客户端，因此不是不可伪造的服务端信任根。
+上述 envelope 在 basE91 前固定新增 65,536–98,304 bytes entropy，另有少量 framing；生成 Lua 的实际文本增量还包含 basE91 约 1.23 倍展开。这是当前唯一配置有意接受的保护/体积取舍。完整性机制用于检测损坏和提高直接 patch/裁剪成本；算法、seed（默认未锁环境时）和验证代码都交付给客户端，因此不是不可伪造的服务端信任根。
 
 ### 2.2 每 prototype 的指令、字段与 opcode bank
 
@@ -95,7 +100,7 @@
 
 ### 2.8 随机源
 
-- prototype keys、salt、XOR seed、shuffle 和随机选择改用操作系统 CSPRNG。
+- prototype keys、salt、XOR seed、64–96 KiB entropy、envelope nonce/record split/物理 shuffle 和随机选择改用操作系统 CSPRNG。
 - 仍需要 `System.Random` 接口的代码生成器、控制流及可选变换，改为使用 CSPRNG seed，避免同一时钟窗口产生相同序列。
 - 清理了不再使用的旧 XOR key 和全局常量映射字段。
 
@@ -135,6 +140,7 @@ CLI、Windows 拖放脚本和 GitHub Actions 均取消强度档位，统一使�
 | 设置 | 固定值 |
 |---|---:|
 | v3 schema / prototype keys / block-state 字段编码 / 常量内层编码 / 分层完整性检查 | 开 |
+| 64–96 KiB authenticated/state-coupled entropy envelope（feature bit 3） | 开 |
 | child prototype / CFG basic-block 两级按需恢复、自动 route-state dispatcher 与合法 edge/state 验证 | 开 |
 | handler / 双 handler dispatch leaf 结构多态 | 开 |
 | ControlFlow | 开 |
@@ -166,7 +172,11 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | 检查 | 结果 |
 |---|---|
 | Release build | 通过，0 warnings / 0 errors |
-| Release 生成 payload header | 通过，version 3 / features 7（DEFLATE + block flow + dispatcher） |
+| Release 生成 payload header | 通过，version 3 / features 15（DEFLATE + block flow + dispatcher + entropy envelope） |
+| entropy envelope 规模/熵值/完整恢复 | 通过，每次 64–96 KiB，Shannon entropy ≥ 7.95 bits/byte，真实 DEFLATE body 可恢复 |
+| 两次生成 entropy/nonce/digest 独立 | 通过 |
+| 重新计算外层 tag 后修改、删除、重排 entropy record | 通过，三种均由 envelope 层拒绝 |
+| 新增 envelope runtime 局部名随机化 | 通过，输出无稳定 `Payload*` / `Envelope*` 标识符 |
 | 固定配置与原脚本差分 | 通过 |
 | 固定配置随机构建 | 20/20 通过 |
 | 旧 `--strength` 参数拒绝 | 通过，退出码 2 |
@@ -214,7 +224,7 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 
 `.github/workflows/ci.yml` 在 push、pull request 和手动触发时运行：
 
-- `ubuntu-24.04` 安装 .NET 8 与 PUC Lua 5.1，以 `IB2_RANDOM_RUNS=20` 执行完整 Linux 差分、CFG、AntiDump/反调试、临时 block cache、篡改拒绝和泄漏检查套件；
+- `ubuntu-24.04` 安装 .NET 8 与 PUC Lua 5.1，以 `IB2_RANDOM_RUNS=20` 执行完整 Linux 差分、authenticated entropy envelope、CFG、AntiDump/反调试、临时 block cache、篡改拒绝和泄漏检查套件；
 - 独立 Release publish 矩阵覆盖 `linux-x64`、`win-x64` 和 `osx-arm64`，分别使用当前 GitHub-hosted Linux、Windows 与 macOS runner；
 - build matrix 使用 framework-dependent publish 和 `ContinuousIntegrationBuild=true`，验证三个目标 RID 均能完成 Release 编译；
 - 按当前范围不上传 CI Artifact、不调整现有云端混淆产物策略，也不增加仓库内二进制工具校验。
@@ -223,7 +233,7 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 
 ## 4. 仍存在的边界
 
-1. 这是客户端混淆，不是密码学保密。seed、fingerprint、VM、prototype banks 和校验逻辑最终都在攻击者可执行的客户端中。
+1. 这是客户端混淆，不是密码学保密。seed、fingerprint、VM、prototype banks、entropy envelope 派生和校验逻辑最终都在攻击者可执行的客户端中；state coupling 能阻止无脑裁剪，却不能阻止分析者同步 patch/重实现客户端验证器。
 2. 字段 schema、常量 tag 与 opcode bank 按 prototype 变化，block mask 和 edge wrapping 再依赖 CFG entry state；但所有派生、guard 与验证逻辑仍在客户端。有能力的分析者可以 patch capability 探针，或 hook dispatch、`GetProto`、`GetInstruction`、handler 与当前 `Flow[4]` 收集执行路径和临时块。
 3. root prototype 的 schema、常量值和 block framing 仍在启动时恢复；延迟的是 instruction block body。默认 AntiDump 模式不会在共享 `Chunk[1]` 累积明文指令，但相关 opaque block 仍持有重解码所需的最小常量引用，并不是逐次常量使用时才恢复。
 4. CFG state 是客户端执行一致性与反静态批量恢复机制，不是不可伪造的 CFI 信任根。修改 VM、跳过 verifier，或在每个临时块进入 handler 前主动收集，仍可绕过本地保护。
@@ -232,6 +242,6 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 7. Mutation/SuperOperator 没有被本轮宣告为稳定；IR-native superoperator 及更大差分语料仍是后续工作，固定配置继续关闭它们。
 8. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持；“Luau/Roblox 优先”目前仅指 capability-gated 运行时防护。
 9. 活动合法调试 hook 会按反调试策略进入静默诱饵；恶意宿主也可以一致伪造 `iscclosure` / `islclosure`、debug provenance 或原语身份。分层评分与 capability gate 用于减少误报，但无法同时保证对所有定制执行器零误报。
-10. CI 已覆盖 Linux 完整语义回归和 Linux/Windows/macOS Release publish；尚未在 Windows/macOS 上运行 Lua 语义套件，也尚未完成大程序、性能、内存和体积基准。
+10. CI 已覆盖 Linux 完整语义回归和 Linux/Windows/macOS Release publish；自动测试已验证 64–96 KiB 随机区及 basE91 前的载荷范围，但尚未在 Windows/macOS 上运行 Lua 语义套件，也尚未完成大程序下 envelope 解码时间、峰值内存和最终文本体积基准。
 
 后续工作按 `HARDENING_PLAN.md` 的剩余候选继续：IR-native superoperator、Luau 原生前端，以及性能、内存和体积基准。

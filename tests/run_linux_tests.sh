@@ -50,6 +50,25 @@ python3 tests/verify_v3_payload.py "$WORK/fixed.lua"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
 
+# Every generation must carry 64–96 KiB of independently generated high-entropy
+# records. The verifier authenticates the envelope, restores its real body and
+# checks record interleaving, entropy and state-derived inner masking.
+obfuscate "$WORK/entropy-second.lua"
+python3 tests/verify_v3_payload.py "$WORK/fixed.lua" --compare "$WORK/entropy-second.lua" --tamper-dir "$WORK"
+"$LUA" "$WORK/entropy-second.lua" > "$WORK/entropy-second.out"
+cmp "$WORK/baseline.out" "$WORK/entropy-second.out"
+for entropy_case in modify delete reorder; do
+    entropy_file="$WORK/entropy-$entropy_case.lua"
+    "$LUAC" -p "$entropy_file"
+    set +e
+    "$LUA" "$entropy_file" > "$WORK/entropy-$entropy_case.stdout" 2> "$WORK/entropy-$entropy_case.stderr"
+    entropy_code=$?
+    set -e
+    [[ $entropy_code -ne 0 ]]
+    grep -Fq 'invalid protected payload' "$WORK/entropy-$entropy_case.stderr"
+done
+echo "PASS entropy record modification, deletion and reordering rejection after outer-tag recomputation"
+
 # Capability-gated Luau/executor probes must accept untouched native primitives,
 # preserve executor globals, and silently select the decoy route for active hooks,
 # wrapped debug/raw primitives, or mutually inconsistent closure classifiers.
@@ -87,8 +106,11 @@ if not re.search(r"\b" + re.escape(probe) + r"\s*\(false\)", source):
 leaked = re.search(r"\bGuard[A-Za-z0-9_]*", source + "\n" + final_source)
 if leaked:
     raise SystemExit("stable guard identifier leaked: " + leaked.group(0))
+envelope_leak = re.search(r"\b(?:Payload|Envelope)[A-Z][A-Za-z0-9_]*", source + "\n" + final_source)
+if envelope_leak:
+    raise SystemExit("stable entropy-envelope identifier leaked: " + envelope_leak.group(0))
 PY
-echo "PASS startup, post-deserialize and jittered dispatch guards with randomized names"
+echo "PASS guard and entropy-envelope runtime identifiers are randomized"
 
 # semantic.lua contains no IB_MAX_CFLOW markers. Assert that its root prototype
 # was nevertheless selected and received a complete random route-state map.

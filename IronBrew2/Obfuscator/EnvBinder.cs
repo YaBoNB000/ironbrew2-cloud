@@ -29,7 +29,7 @@ namespace IronBrew2.Obfuscator
         public string SeedDeriveLua { get; private set; }
 
         /// <summary>EnvironmentLock 关闭时用：直接以头部值为种子（兼容 plain Lua 测试）。</summary>
-        public const string PlainSeedLua = "local Xs = __ib2Head;";
+        public const string PlainSeedLua = "local Xs = PayloadHead;";
 
         public EnvBinder()
         {
@@ -94,7 +94,7 @@ local function __ib2Probe()
     error(__ib2Watermark .. ' | dump blocked', 0)
 end
 -- seed = Hash(Salt .. '|' .. fingerprint). Matches C# side only in a real env.
-local __ib2SeedStr = tostring(__ib2Head) .. '|' .. tostring(__ib2Probe())
+local __ib2SeedStr = tostring(PayloadHead) .. '|' .. tostring(__ib2Probe())
 local Xs = 0
 for __ib2i = 1, #__ib2SeedStr do
     Xs = (Xs * 31 + Byte(__ib2SeedStr, __ib2i)) % 4294967296

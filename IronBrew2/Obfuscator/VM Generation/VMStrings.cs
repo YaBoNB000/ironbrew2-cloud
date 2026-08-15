@@ -156,38 +156,141 @@ local function inflate(d)
 end;
 
 -- v3 固定头：head/salt 4B | integrity 4B | version+flags 1B。
--- 每个 prototype 的 K1/K2/K3 位于加密 body，不再泄露在明文头。
-local __ib2Head = Byte(ByteString, 1, 1)
+-- feature bit 8 表示认证 entropy envelope；固定配置必须同时带 block、dispatcher 与 envelope。
+local PayloadHead = Byte(ByteString, 1, 1)
          + Byte(ByteString, 2, 2) * 256
          + Byte(ByteString, 3, 3) * 65536
          + Byte(ByteString, 4, 4) * 16777216;
-local __ib2Tag = Byte(ByteString, 5, 5)
+local PayloadTag = Byte(ByteString, 5, 5)
          + Byte(ByteString, 6, 6) * 256
          + Byte(ByteString, 7, 7) * 65536
          + Byte(ByteString, 8, 8) * 16777216;
-local __ib2Flags = Byte(ByteString, 9, 9);
-local __ib2Features = __ib2Flags % 16;
-local __ib2Version = (__ib2Flags - __ib2Features) / 16;
-if __ib2Version ~= 3 or __ib2Features < 6 or __ib2Features > 7 then error('invalid protected payload', 0); end;
+local PayloadFlags = Byte(ByteString, 9, 9);
+local PayloadFeatures = PayloadFlags % 16;
+local PayloadVersion = (PayloadFlags - PayloadFeatures) / 16;
+if PayloadVersion ~= 3 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
 __IB2_SEED__
+local OuterSeed = Xs;
 
--- 在解密前验证密文，检测损坏和直接 patch。客户端校验不是不可绕过的信任根。
-local __ib2Hash = (BitXOR(Xs, 2781028135) * 31 + __ib2Flags) % 4294967296;
-for __ib2i = 10, #ByteString do
-	__ib2Hash = (__ib2Hash * 31 + Byte(ByteString, __ib2i, __ib2i)) % 4294967296;
+-- 在解密前验证整个密文；随后 envelope 再独立认证 record framing 与物理顺序。
+local PayloadHash = (BitXOR(Xs, 2781028135) * 31 + PayloadFlags) % 4294967296;
+for PayloadIndex = 10, #ByteString do
+	PayloadHash = (PayloadHash * 31 + Byte(ByteString, PayloadIndex, PayloadIndex)) % 4294967296;
 end;
-if __ib2Hash ~= __ib2Tag then error('invalid protected payload', 0); end;
+if PayloadHash ~= PayloadTag then error('invalid protected payload', 0); end;
 
--- 整体流式 XOR 解密(第 10 字节起) → body
-local __ib2Dec = {};
-for __ib2i = 10, #ByteString do
-	local __ib2b = Byte(ByteString, __ib2i, __ib2i);
-	local __ib2k = (Xs - Xs % 16777216) / 16777216;
+-- 整体流式 XOR 解密(第 10 字节起) → authenticated entropy envelope。
+local PayloadDecoded = {};
+for PayloadIndex = 10, #ByteString do
+	local PayloadByte = Byte(ByteString, PayloadIndex, PayloadIndex);
+	local PayloadKey = (Xs - Xs % 16777216) / 16777216;
 	Xs = (Xs * 1664525 + 1013904223) % 4294967296;
-	__ib2Dec[__ib2i - 9] = Char(BitXOR(__ib2b, __ib2k));
+	PayloadDecoded[PayloadIndex - 9] = Char(BitXOR(PayloadByte, PayloadKey));
 end
-ByteString = Concat(__ib2Dec);
-if gBit(__ib2Features, 1, 1) == 1 then
+ByteString = Concat(PayloadDecoded);
+PayloadDecoded = nil;
+
+-- Envelope header: real length | entropy length | total/data/entropy counts |
+-- nonce | entropy digest | envelope tag. Records are kind:u8, ordinal:u16,
+-- length:u32, bytes. Real data and CSPRNG entropy records are physically shuffled.
+local EnvelopePos = 1;
+local function EnvelopeRead32()
+	if EnvelopePos + 3 > #ByteString then error('invalid protected payload', 0); end;
+	local W, X, Y, Z = Byte(ByteString, EnvelopePos, EnvelopePos + 3);
+	EnvelopePos = EnvelopePos + 4;
+	return W + X * 256 + Y * 65536 + Z * 16777216;
+end;
+local EnvelopeRealLength = EnvelopeRead32();
+local EnvelopeEntropyLength = EnvelopeRead32();
+local EnvelopeRecordCount = EnvelopeRead32();
+local EnvelopeDataCount = EnvelopeRead32();
+local EnvelopeEntropyCount = EnvelopeRead32();
+local EnvelopeNonce = EnvelopeRead32();
+local EnvelopeDigest = EnvelopeRead32();
+local EnvelopeTag = EnvelopeRead32();
+local EnvelopeExpected = 32 + EnvelopeRecordCount * 7 + EnvelopeRealLength + EnvelopeEntropyLength;
+if EnvelopeRealLength < 1 or EnvelopeRealLength > 67108864
+or EnvelopeEntropyLength < 65536 or EnvelopeEntropyLength > 98304
+or EnvelopeDataCount < 1 or EnvelopeDataCount > 32
+or EnvelopeEntropyCount < 8 or EnvelopeEntropyCount > 64
+or EnvelopeRecordCount ~= EnvelopeDataCount + EnvelopeEntropyCount
+or EnvelopeNonce == 0 or EnvelopeExpected ~= #ByteString then error('invalid protected payload', 0); end;
+
+local EnvelopeHash = (BitXOR(OuterSeed, 3302136427) * 31) % 4294967296;
+for EnvelopeIndex = 1, #ByteString do
+	if EnvelopeIndex < 29 or EnvelopeIndex > 32 then
+		EnvelopeHash = (EnvelopeHash * 31 + Byte(ByteString, EnvelopeIndex, EnvelopeIndex)) % 4294967296;
+	end;
+end;
+if EnvelopeHash ~= EnvelopeTag then error('invalid protected payload', 0); end;
+
+local EnvelopeDataRecords = {};
+local EnvelopeEntropyRecords = {};
+local EnvelopeDataLength = 0;
+local EnvelopeEntropySeenLength = 0;
+for EnvelopeIndex = 1, EnvelopeRecordCount do
+	if EnvelopePos + 6 > #ByteString then error('invalid protected payload', 0); end;
+	local EnvelopeKind = Byte(ByteString, EnvelopePos, EnvelopePos);
+	local EnvelopeOrdinal = Byte(ByteString, EnvelopePos + 1, EnvelopePos + 1)
+		+ Byte(ByteString, EnvelopePos + 2, EnvelopePos + 2) * 256;
+	local EnvelopeLength = Byte(ByteString, EnvelopePos + 3, EnvelopePos + 3)
+		+ Byte(ByteString, EnvelopePos + 4, EnvelopePos + 4) * 256
+		+ Byte(ByteString, EnvelopePos + 5, EnvelopePos + 5) * 65536
+		+ Byte(ByteString, EnvelopePos + 6, EnvelopePos + 6) * 16777216;
+	EnvelopePos = EnvelopePos + 7;
+	if EnvelopeLength < 1 or EnvelopePos + EnvelopeLength - 1 > #ByteString then error('invalid protected payload', 0); end;
+	local EnvelopeRecord = Sub(ByteString, EnvelopePos, EnvelopePos + EnvelopeLength - 1);
+	EnvelopePos = EnvelopePos + EnvelopeLength;
+	if EnvelopeKind == 92 then
+		if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeDataCount or EnvelopeDataRecords[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
+		EnvelopeDataRecords[EnvelopeOrdinal] = EnvelopeRecord;
+		EnvelopeDataLength = EnvelopeDataLength + EnvelopeLength;
+	elseif EnvelopeKind == 167 then
+		if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeEntropyCount or EnvelopeEntropyRecords[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
+		EnvelopeEntropyRecords[EnvelopeOrdinal] = EnvelopeRecord;
+		EnvelopeEntropySeenLength = EnvelopeEntropySeenLength + EnvelopeLength;
+	else
+		error('invalid protected payload', 0);
+	end;
+end;
+if EnvelopePos ~= #ByteString + 1 or EnvelopeDataLength ~= EnvelopeRealLength
+or EnvelopeEntropySeenLength ~= EnvelopeEntropyLength then error('invalid protected payload', 0); end;
+
+-- Digest entropy in logical ordinal order. Every entropy byte contributes to
+-- the state that masks the real stream, even when its record appears later.
+local EntropyHash = (BitXOR(OuterSeed, 2447445413) * 31 + EnvelopeNonce) % 4294967296;
+EntropyHash = (EntropyHash * 31 + EnvelopeEntropyLength) % 4294967296;
+EntropyHash = (EntropyHash * 31 + EnvelopeEntropyCount) % 4294967296;
+for EnvelopeIndex = 1, EnvelopeEntropyCount do
+	local EnvelopeRecord = EnvelopeEntropyRecords[EnvelopeIndex];
+	if EnvelopeRecord == nil then error('invalid protected payload', 0); end;
+	EntropyHash = (EntropyHash * 31 + EnvelopeIndex) % 4294967296;
+	EntropyHash = (EntropyHash * 31 + #EnvelopeRecord) % 4294967296;
+	for EnvelopeByteIndex = 1, #EnvelopeRecord do
+		EntropyHash = (EntropyHash * 31 + Byte(EnvelopeRecord, EnvelopeByteIndex, EnvelopeByteIndex)) % 4294967296;
+	end;
+end;
+if EntropyHash ~= EnvelopeDigest then error('invalid protected payload', 0); end;
+
+local EnvelopeState = BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), 980797935), EnvelopeRealLength) % 4294967296;
+local EnvelopeBody = {};
+local EnvelopeBodyIndex = 0;
+for EnvelopeIndex = 1, EnvelopeDataCount do
+	local EnvelopeRecord = EnvelopeDataRecords[EnvelopeIndex];
+	if EnvelopeRecord == nil then error('invalid protected payload', 0); end;
+	for EnvelopeByteIndex = 1, #EnvelopeRecord do
+		EnvelopeBodyIndex = EnvelopeBodyIndex + 1;
+		local EnvelopeKey = (EnvelopeState - EnvelopeState % 16777216) / 16777216;
+		EnvelopeBody[EnvelopeBodyIndex] = Char(BitXOR(Byte(EnvelopeRecord, EnvelopeByteIndex, EnvelopeByteIndex), EnvelopeKey));
+		EnvelopeState = (EnvelopeState * 1664525 + 1013904223) % 4294967296;
+	end;
+end;
+if EnvelopeBodyIndex ~= EnvelopeRealLength then error('invalid protected payload', 0); end;
+ByteString = Concat(EnvelopeBody);
+EnvelopeBody = nil;
+EnvelopeDataRecords = nil;
+EnvelopeEntropyRecords = nil;
+if gBit(PayloadFeatures, 1, 1) == 1 then
 	ByteString = inflate(ByteString);
 end
 local Pos = 1;
