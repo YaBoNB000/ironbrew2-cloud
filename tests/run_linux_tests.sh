@@ -51,15 +51,44 @@ cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
 
 # Capability-gated Luau/executor probes must accept untouched native primitives,
-# preserve executor globals, and silently select the decoy route for either an
-# active debug hook or a primitive replaced by a Lua closure.
+# preserve executor globals, and silently select the decoy route for active hooks,
+# wrapped debug/raw primitives, or mutually inconsistent closure classifiers.
 "$LUA" tests/anti_debug_runner.lua capabilities "$WORK/fixed.lua" > "$WORK/anti-debug-capabilities.out"
 cmp "$WORK/baseline.out" "$WORK/anti-debug-capabilities.out"
-"$LUA" tests/anti_debug_runner.lua primitive-hook "$WORK/fixed.lua" > "$WORK/anti-debug-primitive.out"
-[[ ! -s "$WORK/anti-debug-primitive.out" ]]
-"$LUA" tests/anti_debug_runner.lua debug-hook "$WORK/fixed.lua" > "$WORK/anti-debug-hook.out"
-[[ ! -s "$WORK/anti-debug-hook.out" ]]
-echo "PASS capability-gated anti-debug probes and silent decoy routing"
+for mode in primitive-hook raw-hook debug-api-hook debug-hook capability-spoof; do
+    "$LUA" tests/anti_debug_runner.lua "$mode" "$WORK/fixed.lua" > "$WORK/anti-debug-$mode.out"
+    [[ ! -s "$WORK/anti-debug-$mode.out" ]]
+done
+echo "PASS staged anti-debug scoring, provenance checks and silent decoy routing"
+
+# Verify the unminified generated VM contains all three guard checkpoints and
+# that stable implementation identifiers do not survive name randomization.
+python3 - "$ROOT/temp/t2.lua" "$WORK/fixed.lua" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1]).read_text("latin1")
+final_source = Path(sys.argv[2]).read_text("latin1")
+root = re.search(
+    r"local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*"
+    r"if\s+([A-Za-z_]\w*)\(true\)\s+then\s+return\s+([A-Za-z_]\w*);\s*end;",
+    source,
+)
+if not root:
+    raise SystemExit("post-deserialize forced guard not found")
+probe = root.group(2)
+if not re.search(r"local\s+function\s+" + re.escape(probe) + r"\s*\(", source):
+    raise SystemExit("guard definition not found")
+if len(re.findall(r"\b" + re.escape(probe) + r"\s*\(true\)", source)) < 2:
+    raise SystemExit("startup and post-deserialize forced guards not both present")
+if not re.search(r"\b" + re.escape(probe) + r"\s*\(false\)", source):
+    raise SystemExit("periodic dispatch guard not found")
+leaked = re.search(r"\bGuard[A-Za-z0-9_]*", source + "\n" + final_source)
+if leaked:
+    raise SystemExit("stable guard identifier leaked: " + leaked.group(0))
+PY
+echo "PASS startup, post-deserialize and jittered dispatch guards with randomized names"
 
 # semantic.lua contains no IB_MAX_CFLOW markers. Assert that its root prototype
 # was nevertheless selected and received a complete random route-state map.
@@ -71,6 +100,7 @@ import sys
 source = Path(sys.argv[1]).read_text("latin1")
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
     r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -105,6 +135,7 @@ import sys
 source = Path(sys.argv[1]).read_text("latin1")
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
     r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -142,6 +173,7 @@ source = Path(sys.argv[1]).read_text("latin1")
 out_dir = Path(sys.argv[2])
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
     r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -213,6 +245,7 @@ import sys
 source = Path(sys.argv[1]).read_text("latin1")
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+return\s+[A-Za-z_]\w*;\s*end;\s*)?"
     r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)

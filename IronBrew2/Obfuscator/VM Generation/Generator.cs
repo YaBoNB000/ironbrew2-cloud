@@ -648,7 +648,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 
 			// ==== P1: 模板标识符随机化(每次混淆生成不同的 VM 结构名)====
 			string[] identKeys = {
-				"ByteString","InstrPoint","GetFEnv","Setmetatable","ToNumber","ConstCount","Deserialize",
+				"ByteString","InstrPoint","GetFEnv","Setmetatable","Getmetatable","RawGet","RawSet","RawEqual","Next","ToNumber","ToString","ConstCount","Deserialize",
 				"Wrap","Upvalues","NewProto","Indexes","Concat","Insert","LDExp","Select","Unpack",
 				"BitXOR","gBits32","gBits8","gBits16","gFloat","gSizet","gString","gInt","Byte","Char","Sub",
 				"gBit","Instrs","Functions","Lines","Consts","Instr","Proto","Params","Top","Vararg","Args",
@@ -660,11 +660,16 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier",
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
 				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
-					"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
-					"Type","GuardString","GuardTable","GuardMath","GuardDebug","GuardGetHook","GuardEnvOK","GuardEnvironment",
-					"GuardIsC","GuardIsL","GuardCounter","GuardTripped","GuardProbe","Force","GuardHookOK","GuardHook",
-					"GuardOK1","GuardOK2","GuardOK3","GuardOK4","GuardC1","GuardC2","GuardC3","GuardC4",
-					"GuardL1","GuardL2","GuardL3","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential"
+				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
+				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetHook","GuardGetInfo","GuardInfo","GuardInspector",
+				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardGetGenV",
+				"GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
+				"GuardEpoch","GuardState","GuardSeal","GuardTripped","GuardLuaProbe","GuardProbeValue","GuardNativeSource","GuardFunction",
+				"GuardSourceOK","GuardSource","GuardProbe","Force","GuardScore","GuardHeavy","GuardHookOK","GuardHook",
+				"GuardCurrentIsC","GuardCurrentIsL","GuardNativeMisses","GuardOK1","GuardOK2","GuardOK3","GuardOK4",
+				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
+				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
+				"GuardBehaviorKey","GuardFirstKey","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential"
 				};
 			string[] luaKws = {"and","break","do","else","elseif","end","false","for","function","if","in","local","nil","not","or","repeat","return","then","true","until","while"};
 			var idents = new Dictionary<string,string>();
@@ -815,9 +820,15 @@ local Insert       = table.insert;
 local LDExp        = math.ldexp;
 local GetFEnv      = getfenv or function() return _G end;
 local Setmetatable = setmetatable;
+local Getmetatable = getmetatable;
+local RawGet       = rawget;
+local RawSet       = rawset;
+local RawEqual     = rawequal;
+local Next         = next;
 local Select       = select;
 local PCall        = pcall;
 local Type         = type;
+local ToString     = tostring;
 
 local Unpack = unpack or table.unpack;
 local ToNumber = tonumber;");
@@ -1192,7 +1203,15 @@ end;";
 			}
 
 			vm += GetStr(Enumerable.Range(0, virtuals.Count).ToList());
-			vm += T(settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP3_LI_R : VMStrings.VMP3_LI) : (useRepeat ? VMStrings.VMP3_R : VMStrings.VMP3));
+			string finalRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP3_LI_R : VMStrings.VMP3_LI) : (useRepeat ? VMStrings.VMP3_R : VMStrings.VMP3);
+			if (settings.AntiDump)
+			{
+				const string rootDeserialize = "local Root = Deserialize();";
+				if (!finalRuntime.Contains(rootDeserialize))
+					throw new InvalidOperationException("VM root deserialization anchor is missing.");
+				finalRuntime = finalRuntime.Replace(rootDeserialize, rootDeserialize + "\nif GuardProbe(true) then return GuardDecoy; end;");
+			}
+			vm += T(finalRuntime);
 
 			vm = vm.Replace("OP_ENUM", "1")
 				.Replace("OP_A", "2")

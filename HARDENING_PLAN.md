@@ -67,13 +67,15 @@
 ### Phase 3.5：Luau 反调试与防 dump（已完成）
 
 - [x] 移除旧前置 guard 的“必须存在执行器 API，否则明确报错”行为，将能力探针直接嵌入生成 VM。
-- [x] 捕获关键原语和库表身份；宿主提供时使用 `debug.gethook`、`iscclosure`、`islclosure` 检查活动调试 hook 与 Lua closure 替换。
-- [x] 检测采用高置信组合，不因 `getgc`、`hookfunction` 等 dump API 仅仅存在就拒绝正常执行。
-- [x] 启动期和 dispatch 周期检查均与 VM invocation 相连；命中后静默进入有限计算诱饵，不显示阻断错误。
+- [x] 捕获关键原语、库表、`getgenv` capability provider 及 debug inspector 身份；宿主提供时使用 `debug.gethook`、`debug.getinfo`/`debug.info`、`iscclosure`、`islclosure` 检查活动 hook、Lua closure 替换和来源一致性。
+- [x] 将快照身份、closure classifier 交叉验证、debug source provenance 与无副作用行为 canary 分层执行，并按权重聚合；不因 `getgc`、`hookfunction` 等 dump API 仅仅存在就拒绝正常执行。
+- [x] guard 状态使用轻量 seal 检查自身一致性，并以状态更新产生 interval+jitter 调度；避免固定取模周期和绝对时间阈值。
+- [x] 启动、root prototype 反序列化后和 dispatch 周期三阶段检查均与 VM invocation 相连；命中后 sticky 静默进入有限计算诱饵，不显示阻断错误。
+- [x] 所有新增 guard 局部名纳入生成器随机化，避免新增稳定 `Guard*` 名称成为输出签名。
 - [x] 默认 AntiDump 路径不再把已执行块写入共享 instruction table；每个 invocation 只缓存当前明文块，非顺序转移后替换，重入时重新认证/解码 opaque body。
 - [x] 删除全局 API hook、registry 后台扫描、无限循环和大内存“自毁”；兼容字段 `AggressiveDefense` 不再注入这些行为。
 - [x] 唯一固定 CLI 配置和 `ObfuscationSettings` 默认值均启用 AntiDump；严格 Roblox `EnvironmentLock` 仍保持独立 opt-in。
-- [x] 自动测试覆盖无 capability 正常路径、模拟 Luau capability 正常路径、原语 hook、活动 debug hook、静默诱饵、全局 API 不变和共享指令表为空。
+- [x] 自动测试覆盖无 capability 正常路径、模拟 Luau capability 正常路径、string/raw/debug 原语包装、活动 debug hook、矛盾 closure classifier、三阶段探针、名称随机化、静默诱饵、全局 API 不变和共享指令表为空。
 
 ### Phase 4：Luau、性能和发布体系
 

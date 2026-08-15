@@ -16,9 +16,11 @@
 - EnvironmentLock、AggressiveDefense、Noise：关闭
 - Mutation、SuperOperator、源码字符串转换：关闭
 
-这里的 AntiDump 不再是旧版“要求存在某个执行器 API，否则明确报错”的前置 bytecode 块。防护代码现在直接位于生成 VM 内：普通 Lua 环境可以兼容运行；宿主若提供 `debug.gethook`、`iscclosure` 或 `islclosure`，VM 才使用这些能力检查活动调试 hook 和被 Lua closure 替换的关键原语。检测命中后进入无输出、有限计算的诱饵路径，不显示“blocked”错误。
+这里的 AntiDump 不再是旧版“要求存在某个执行器 API，否则明确报错”的前置 bytecode 块。防护代码现在直接位于生成 VM 内：普通 Lua 环境可以兼容运行；宿主提供能力时，VM 才使用 `debug.gethook`、`debug.getinfo`/`debug.info`、`iscclosure` 和 `islclosure`。当前实现采用分层探针：先做快照身份与 capability provider 一致性检查，再在重探针中交叉验证 C/L closure 分类、debug source provenance，并用 raw table/string/select 等无副作用行为 canary 检查语义。各信号按权重聚合，达到高置信阈值后 sticky 命中，进入无输出、有限计算的诱饵路径，不显示“blocked”错误。
 
-旧 `AggressiveDefense` 的全局 API 删除/替换、registry 后台扫描、无限循环和大内存分配已经移除。生成脚本不会修改 `getgenv()` 中的 `hookfunction`、文件 API 或 load API，也不会启动常驻扫描任务。`AggressiveDefense` 字段仅为源码兼容保留，不再注入这些行为。
+guard 自身维护带 seal 的运行状态；seal 不一致会直接命中。该状态同时驱动 LCG 式抖动调度，避免固定的 `counter % N` 周期。强制检查分别发生在 VM guard 启动和 root prototype 反序列化之后，dispatch 中继续按 interval+jitter 复检；所有 guard 局部名仍经过每次构建的随机化。
+
+旧 `AggressiveDefense` 的全局 API 删除/替换、registry 后台扫描、联网/文件探测、绝对时序判断、无限循环和大内存分配均未恢复。生成脚本不会修改 `getgenv()` 中的 `hookfunction`、文件 API 或 load API，也不会启动常驻扫描任务。`AggressiveDefense` 字段仅为源码兼容保留，不再注入这些行为。
 
 ## VM / payload 耦合的防 dump 路径
 
@@ -26,7 +28,7 @@
 2. 默认 AntiDump 模式不再把已执行块写入共享的 `Chunk[1]` 明文 instruction table。
 3. `GetInstruction` 只在当前 closure invocation 的 `Flow[4]` 中保存当前块的解码结果；跨块、跳转、自环或其他非顺序转移会替换该缓存。
 4. opaque body、最小常量引用和 body tag 被保留，以便块再次进入时重新认证、重新解码；因此不会随着执行路径增长而累积一份共享明文指令全集。
-5. 运行中 guard 按随机间隔从 dispatch 检查捕获的 `string`、`table`、`math` 与关键原语身份。中途命中同样从当前 VM invocation 静默返回诱饵结果。
+5. guard 在启动、root 反序列化后及 dispatch 周期三个阶段检查捕获的库/关键原语、debug/closure provenance 与行为 canary；周期由密封状态产生抖动。中途命中同样从当前 VM invocation 静默返回诱饵结果。
 6. 关闭 AntiDump 的库级调用仍可使用原共享 lazy cache 路径，但唯一固定 CLI 配置默认开启上述临时缓存。
 
 该设计会以块重入时重复认证/解码换取更小的明文驻留窗口，属于安全与性能的明确取舍。
@@ -61,4 +63,4 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua5.1 LUAC=/path/to/luac5.1 \
   tests/run_linux_tests.sh
 ```
 
-测试覆盖固定配置语义差分、20 次随机生成、Luau/executor capability 正常模拟、关键原语 Lua-hook 模拟、活动 `debug` hook 模拟、静默诱饵无输出、executor 全局不被修改、共享 `Chunk[1]` 不积累明文指令、opaque block 保留、显式 CFG、dispatcher 准入/回退、Closure/SETLIST 边界、line info、有符号 bit、payload 与 flow/block 篡改拒绝及明文字符串扫描。
+测试覆盖固定配置语义差分、20 次随机生成、Luau/executor capability 正常模拟、`string.byte`/`rawset`/`debug.getinfo` 包装模拟、活动 `debug` hook、互相矛盾的 closure classifier、静默诱饵无输出、启动/反序列化后/dispatch 三阶段探针、guard 名称随机化、executor 全局不被修改、共享 `Chunk[1]` 不积累明文指令、opaque block 保留、显式 CFG、dispatcher 准入/回退、Closure/SETLIST 边界、line info、有符号 bit、payload 与 flow/block 篡改拒绝及明文字符串扫描。

@@ -101,15 +101,20 @@
 
 ### 2.9 Luau/Roblox 反调试与 AntiDump
 
-- 删除旧 AntiDump/Defense 前置 Lua bytecode 注入；防护现在直接生成在 VM 内，首次检查位于 payload 解压和反序列化之前，四种 dispatch wrapper 也按随机间隔复检。
-- VM 捕获关键 `string`、`table`、`math` 库及 `unpack`、`setmetatable` 等原语身份。宿主提供 capability 时，再通过 `debug.gethook` 检查活动 hook，并通过 `iscclosure` / `islclosure` 检查关键原语是否被 Lua closure 替换。
-- capability 不存在时保持普通 Lua 5.1 兼容；`getgc`、`hookfunction`、文件 API 或 load API 仅仅存在不会触发。测试 runner 同时确认生成代码不删除、不替换 executor 的 `hookfunction`。
-- 检测命中后不输出阻断原因，也不抛出可识别的专用错误，而是在当前 invocation 执行有界诱饵计算后静默返回。没有后台扫描、无限循环、大内存分配或全局环境破坏。
-- guard 触发状态在当前 VM 运行期保持，避免通过首次检查后再安装 hook；周期和部分关键 helper 边界都会观察该状态。
+本轮在上一版 VM-integrated guard 基础上，筛选吸收了附件 `反调试v5.4.txt` 中可移植的分层探针、快照、provenance 和多信号评分思路；没有照搬其破坏性或高误报行为。
+
+- 删除旧 AntiDump/Defense 前置 Lua bytecode 注入；防护直接生成在 VM 内。强制检查分别位于 guard 定义后的启动阶段和 root prototype 反序列化之后，四种 dispatch wrapper 再执行周期检查。
+- VM 快照 `string`、`table`、`math`、raw/meta、转换、调用和 unpack 等关键原语，同时捕获 `getgenv` capability provider、`debug.gethook`、`debug.getinfo`/`debug.info`、`iscclosure` 与 `islclosure` 的身份。
+- 轻量层检查库/原语身份、debug API 身份和活动 hook；重探针才交叉验证多个已知 C closure 与本地 Lua canary 的 C/L classifier 结果，并用 debug source provenance 进行独立复核。
+- 行为 canary 在受保护调用中验证 raw table 读写、metatable、`next`、`rawequal`、`select`、字符串和数值转换语义，不修改全局状态。身份、provenance、capability 与行为异常按权重累计，阈值为 6；单个低置信异常不会自动等同于命中。
+- guard 维护 epoch、LCG 状态与对应 seal；seal 不一致会立即 sticky 命中。每次实际探针更新状态并计算下一次 interval+jitter，替代可预测的固定 `counter % N` 周期，同时不使用容易受机器负载影响的绝对时序阈值。
+- capability 不存在时保持普通 Lua 5.1 兼容；`getgc`、`hookfunction`、文件 API 或 load API 仅仅存在不会触发。正常 capability 环境也不得修改 executor global。
+- 检测命中后不输出阻断原因，也不抛出可识别的专用错误，而是在当前 invocation 执行固定上限的诱饵计算后静默返回。没有网络/文件探测、后台线程或 registry 深扫，也没有无限循环、递归崩溃、大内存分配或全局 API 覆盖。
+- guard 触发状态在当前 VM 运行期保持，避免通过首次检查后再安装 hook；全部新增 guard 局部名都进入生成器 identifier map，每次构建继续随机化。
 - 指令驻留防 dump 与上述 guard 同属 `AntiDump` 固定开关：共享 `Chunk[1]` 不积累明文，当前 invocation 的 `Flow[4]` 最多保留一个已认证块，跨块后替换，重入时从 opaque body 重建。
 - `DefenseGenerator` 仅保留为空的兼容 shim，`AggressiveDefense` 也不再恢复旧 API hook 或 registry 扫描行为。
 
-这些机制提高动态收集成本，但不是服务端反作弊。所有探针和诱饵都在客户端，有能力的分析者可以 patch guard、伪造 capability 返回值，或在 accessor/handler 内收集每个临时块。
+这些机制提高动态收集成本，但不是服务端反作弊。所有探针、阈值和诱饵都在客户端，有能力的分析者可以 patch guard、伪造 capability/provenance 返回值，或在 accessor/handler 内收集每个临时块。
 
 ### 2.10 EnvironmentLock
 
@@ -175,8 +180,10 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | basic-block 进入时认证与 invocation-local 单块临时解码 | 通过 |
 | root `Chunk[1]` 不积累明文，opaque body 在已执行/未执行 block 中均保留 | 通过 |
 | 无 capability / 模拟 Luau capability 的正常输出 | 通过 |
-| primitive Lua-hook / 活动 `debug` hook 的静默诱饵（0 bytes 输出） | 通过 |
-| executor `hookfunction` 等全局能力不被修改 | 通过 |
+| wrapped `string.byte`、`rawset`、`debug.getinfo`、活动 `debug` hook、矛盾 `iscclosure`/`islclosure` 的静默诱饵（0 bytes 输出） | 通过 |
+| guard 启动、root 反序列化后、jittered dispatch 三阶段调用 | 通过 |
+| 新增 guard 局部名随机化，最终输出无稳定 `Guard*` 标识符 | 通过 |
+| executor `hookfunction`、`getgenv` 与 closure classifier 等全局能力不被修改 | 通过 |
 | block body、初始 state、dispatcher state、缺失 edge、wrapped edge state 的反序列化后篡改 | 通过，均拒绝 |
 | 分支/循环/递归/table constructor 与块级常量引用 | 通过 |
 | `SETLIST C==0` 后继 data word（测试侧 patch Lua 5.1 chunk） | 通过 |
@@ -224,7 +231,7 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 6. 自动 dispatcher 已按 prototype 启用，但它复用随机物理 block 和 VM route token，不是把原 Lua 指令复制成多版本 block；客户端仍可在 route 解析后观测真实 PC。
 7. Mutation/SuperOperator 没有被本轮宣告为稳定；IR-native superoperator 及更大差分语料仍是后续工作，固定配置继续关闭它们。
 8. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持；“Luau/Roblox 优先”目前仅指 capability-gated 运行时防护。
-9. 活动合法调试 hook 会按反调试策略进入静默诱饵；恶意宿主也可以伪造 `iscclosure` / `islclosure` 返回值。探针只采用高置信信号以减少误报，但无法同时保证对所有定制执行器零误报。
+9. 活动合法调试 hook 会按反调试策略进入静默诱饵；恶意宿主也可以一致伪造 `iscclosure` / `islclosure`、debug provenance 或原语身份。分层评分与 capability gate 用于减少误报，但无法同时保证对所有定制执行器零误报。
 10. CI 已覆盖 Linux 完整语义回归和 Linux/Windows/macOS Release publish；尚未在 Windows/macOS 上运行 Lua 语义套件，也尚未完成大程序、性能、内存和体积基准。
 
 后续工作按 `HARDENING_PLAN.md` 的剩余候选继续：IR-native superoperator、Luau 原生前端，以及性能、内存和体积基准。
