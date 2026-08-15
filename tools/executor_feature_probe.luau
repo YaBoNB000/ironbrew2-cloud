@@ -1,7 +1,8 @@
 -- IronBrew2 strict executor feature probe
 -- Run this file by itself in the executor, not through the obfuscator.
--- It reads capabilities, mutates/restores private probe upvalues, and saves the report
--- as IronBrew2_executor_probe.txt through writefile when that API is available.
+-- It reads capabilities, mutates/restores private probe upvalues, saves the report
+-- as IronBrew2_executor_probe.txt, verifies it with readfile when available, and copies
+-- the same report to the clipboard when setclipboard/toclipboard is available.
 -- It does not use the network, hooks, getgc, background tasks, or infinite loops.
 
 local Output = {}
@@ -486,7 +487,8 @@ for _, name in ipairs({
     "hookfunction", "hookmetamethod", "getgc", "getreg", "getregistry",
     "getconnections", "getsenv", "getrenv", "gethui", "cloneref",
     "clonefunction", "isexecutorclosure", "is_synapse_function", "isourclosure",
-    "writefile", "appendfile", "makefolder",
+    "writefile", "readfile", "isfile", "appendfile", "makefolder",
+    "setclipboard", "toclipboard",
     "request", "http_request", "syn", "crypt", "Drawing"
 }) do
     emit("inventory", name, true, Type(lookup(name)))
@@ -574,12 +576,14 @@ contract("primitive_snapshot_stability", SnapshotStable,
 
 Output[#Output + 1] = "IB2PROBE|summary|executor|INFO|name=" .. escape(Name1)
     .. ",version=" .. escape(Version1)
+local StrictSummaryLine
 if #Failures == 0 then
-    Output[#Output + 1] = "IB2PROBE|summary|strict_contract|PASS|all mirrored checks passed"
+    StrictSummaryLine = "IB2PROBE|summary|strict_contract|PASS|all mirrored checks passed"
 else
-    Output[#Output + 1] = "IB2PROBE|summary|strict_contract|FAIL|failure_count=" .. #Failures
+    StrictSummaryLine = "IB2PROBE|summary|strict_contract|FAIL|failure_count=" .. #Failures
         .. ",failures=" .. escape(table.concat(Failures, ","))
 end
+Output[#Output + 1] = StrictSummaryLine
 Output[#Output + 1] = "IB2PROBE|summary|notice|INFO|This is a diagnostic approximation; do not use executor name as an allow-list."
 
 local ReportPath = "IronBrew2_executor_probe.txt"
@@ -589,12 +593,46 @@ local SaveOK, SaveError = call(WriteFile, ReportPath, Report)
 local SaveLine
 if SaveOK then
     SaveLine = "IB2PROBE|output|workspace_file|OK|path=" .. escape(ReportPath)
+        .. ",bytes=" .. #Report
 else
     SaveLine = "IB2PROBE|output|workspace_file|FAIL|path=" .. escape(ReportPath)
         .. ",writefile_type=" .. escape(Type(WriteFile)) .. ",error=" .. escape(SaveError)
+end
+
+local ReadFile = lookup("readfile")
+local VerifyLine
+if Type(ReadFile) == "function" then
+    local ReadOK, StoredReport = call(ReadFile, ReportPath)
+    local VerifyOK = ReadOK and StoredReport == Report
+    VerifyLine = "IB2PROBE|output|workspace_verify|" .. (VerifyOK and "OK" or "FAIL")
+        .. "|read_ok=" .. escape(ReadOK) .. ",bytes="
+        .. (Type(StoredReport) == "string" and #StoredReport or 0)
+        .. (VerifyOK and ",content=exact" or ",content=mismatch")
+else
+    VerifyLine = "IB2PROBE|output|workspace_verify|SKIP|readfile is unavailable"
+end
+
+local SetClipboard = lookup("setclipboard")
+local ClipboardAPI = "setclipboard"
+if Type(SetClipboard) ~= "function" then
+    SetClipboard = lookup("toclipboard")
+    ClipboardAPI = "toclipboard"
+end
+local ClipboardOK, ClipboardError = call(SetClipboard, Report)
+local ClipboardLine
+if ClipboardOK then
+    ClipboardLine = "IB2PROBE|output|clipboard|OK|api=" .. ClipboardAPI
+        .. ",bytes=" .. #Report .. "; paste the clipboard contents back to the developer"
+else
+    ClipboardLine = "IB2PROBE|output|clipboard|FAIL|api_type=" .. escape(Type(SetClipboard))
+        .. ",error=" .. escape(ClipboardError)
 end
 
 for index = 1, #Output do
     Print(Output[index])
 end
 Print(SaveLine)
+Print(VerifyLine)
+Print(ClipboardLine)
+-- Repeat the compact result last because some executor consoles retain only the tail.
+Print(StrictSummaryLine)
