@@ -1,7 +1,8 @@
 -- IronBrew2 strict executor feature probe
 -- Run this file by itself in the executor, not through the obfuscator.
--- It only reads capabilities and mutates/restores private probe upvalues.
--- It does not use the network, filesystem, hooks, getgc, background tasks, or infinite loops.
+-- It reads capabilities, mutates/restores private probe upvalues, and saves the report
+-- as IronBrew2_executor_probe.txt through writefile when that API is available.
+-- It does not use the network, hooks, getgc, background tasks, or infinite loops.
 
 local Output = {}
 local Failures = {}
@@ -484,7 +485,8 @@ contract("newcclosure_behavior", WrapPass,
 for _, name in ipairs({
     "hookfunction", "hookmetamethod", "getgc", "getreg", "getregistry",
     "getconnections", "getsenv", "getrenv", "gethui", "cloneref",
-    "clonefunction", "isexecutorclosure", "isexecutorclosure", "isourclosure",
+    "clonefunction", "isexecutorclosure", "is_synapse_function", "isourclosure",
+    "writefile", "appendfile", "makefolder",
     "request", "http_request", "syn", "crypt", "Drawing"
 }) do
     emit("inventory", name, true, Type(lookup(name)))
@@ -580,6 +582,19 @@ else
 end
 Output[#Output + 1] = "IB2PROBE|summary|notice|INFO|This is a diagnostic approximation; do not use executor name as an allow-list."
 
+local ReportPath = "IronBrew2_executor_probe.txt"
+local Report = table.concat(Output, "\n") .. "\n"
+local WriteFile = lookup("writefile")
+local SaveOK, SaveError = call(WriteFile, ReportPath, Report)
+local SaveLine
+if SaveOK then
+    SaveLine = "IB2PROBE|output|workspace_file|OK|path=" .. escape(ReportPath)
+else
+    SaveLine = "IB2PROBE|output|workspace_file|FAIL|path=" .. escape(ReportPath)
+        .. ",writefile_type=" .. escape(Type(WriteFile)) .. ",error=" .. escape(SaveError)
+end
+
 for index = 1, #Output do
     Print(Output[index])
 end
+Print(SaveLine)
