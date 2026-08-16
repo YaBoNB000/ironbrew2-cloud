@@ -20,9 +20,9 @@ end
 
 local function inspect_constants(value)
     if closure_kind(value) == "C" then error("C closures have no accessible constants") end
-    -- Lua 5.1 cannot expose an uncallable proto object. The harness associates
-    -- an uncallable Lua wrapper with its real child so the production guard can
-    -- validate both sUNC properties: inspectable constants and failed calls.
+    -- Lua 5.1 cannot expose an inactive proto object. The harness associates a
+    -- wrapper with its real child so constants inspection remains independent
+    -- from whether that executor representation is callable.
     local target = inactive_targets[value] or value
     local ok, result = pcall(target, 0)
     if ok and (type(result) == "number" or type(result) == "string" or type(result) == "boolean") then
@@ -53,6 +53,8 @@ local function inactive_proto(target)
     local wrapper
     if mode == "compat-representations" then
         wrapper = newproxy(true)
+    elseif mode == "wrong-callable-proto" then
+        wrapper = function() return -197843211 end
     else
         wrapper = function() error("inactive prototype") end
     end
@@ -199,7 +201,8 @@ elseif mode == "missing-debug" then
     debug.getprotos = nil
 elseif mode == "trusted" or mode == "no-alias" or mode == "compat-representations"
     or mode == "polluted-genv" or mode == "invalid-load" or mode == "callable-proto"
-    or mode == "c-debug-leak" or mode == "c-upvalue-leak" or mode == "canary-error" then
+    or mode == "c-debug-leak" or mode == "c-upvalue-leak" or mode == "wrong-callable-proto"
+    or mode == "canary-error" then
     -- Behavior for these modes is installed above before the generated chunk.
 else
     error("unknown executor harness mode: " .. tostring(mode))

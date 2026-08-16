@@ -394,8 +394,9 @@ local function GuardStrictChallenge()
         local GuardProtoConstantsOK, GuardProtoConstants = PCall(GuardGetConstants, GuardInactiveProto);
         if not GuardProtoConstantsOK
             or not GuardTableContains(GuardProtoConstants, __IB2_PROTO_CONSTANT__) then return false; end;
-        local GuardInactiveCallOK = PCall(GuardInactiveProto, __IB2_PROTO_INPUT__);
-        return not GuardInactiveCallOK;
+        local GuardInactiveCallOK, GuardInactiveCallResult = PCall(
+            GuardInactiveProto, __IB2_PROTO_INPUT__);
+        return not GuardInactiveCallOK or GuardInactiveCallResult == __IB2_PROTO_EXPECTED__;
     end;
 
     local GuardSawInactiveProto = false;

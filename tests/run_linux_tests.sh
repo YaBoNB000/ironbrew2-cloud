@@ -99,12 +99,13 @@ done
 echo "PASS v4 prototype, block-manifest, column framing/consumption and constant-capsule tamper rejection"
 
 # The trusted test executor must pass every hard-AND behavior contract. The
-# compatibility path also models proxy-backed globals, empty C-upvalue results
-# and userdata inactive-proto handles while preserving every behavioral check.
-# Non-standard identity aliases remain optional. Plain Lua, polluted executor
-# globals, callable inactive protos, exposed C upvalues, invalid loadstring/debug
-# behavior, partial API surfaces, unstable identity and hooked primitives must
-# remain silent and non-returning until an external timeout terminates the tight
+# compatibility paths also model proxy-backed globals, empty C-upvalue results,
+# userdata inactive-proto handles and callable inactive protos that execute the
+# expected child. Non-standard identity aliases remain optional. Plain Lua,
+# polluted executor globals, callable protos returning the wrong child result,
+# exposed C upvalues, invalid loadstring/debug behavior, partial API surfaces,
+# unstable identity and hooked primitives must remain silent and non-returning
+# until an external timeout terminates the tight
 # sink. An injected mid-canary getgenv failure separately verifies that both
 # writes are restored before the guard enters that sink.
 run_executor "$WORK/fixed.lua" > "$WORK/executor-trusted.out"
@@ -113,6 +114,8 @@ run_executor_mode no-alias "$WORK/fixed.lua" > "$WORK/executor-no-alias.out"
 cmp "$WORK/baseline.out" "$WORK/executor-no-alias.out"
 run_executor_mode compat-representations "$WORK/fixed.lua" > "$WORK/executor-compat-representations.out"
 cmp "$WORK/baseline.out" "$WORK/executor-compat-representations.out"
+run_executor_mode callable-proto "$WORK/fixed.lua" > "$WORK/executor-callable-proto.out"
+cmp "$WORK/baseline.out" "$WORK/executor-callable-proto.out"
 
 set +e
 timeout 2s "$LUA" "$WORK/fixed.lua" > "$WORK/executor-plain.stdout" 2> "$WORK/executor-plain.stderr"
@@ -120,7 +123,7 @@ plain_code=$?
 set -e
 [[ $plain_code -eq 124 && ! -s "$WORK/executor-plain.stdout" && ! -s "$WORK/executor-plain.stderr" ]]
 
-for mode in primitive-hook raw-hook debug-api-hook classifier-spoof identity-spoof version-number missing-debug polluted-genv invalid-load callable-proto c-debug-leak c-upvalue-leak; do
+for mode in primitive-hook raw-hook debug-api-hook classifier-spoof identity-spoof version-number missing-debug polluted-genv invalid-load wrong-callable-proto c-debug-leak c-upvalue-leak; do
     set +e
     timeout 2s "$LUA" tests/executor_runner.lua "$mode" "$WORK/fixed.lua" \
         > "$WORK/executor-$mode.stdout" 2> "$WORK/executor-$mode.stderr"
