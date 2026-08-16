@@ -69,13 +69,25 @@ local function sample(values)
     return "table(" .. count .. "){" .. TB.concat(parts, ",") .. "}"
 end
 
-local Rows, Failures = {}, {}
-local function add(code, passed, detail)
-    local status = passed and "OK" or "FAIL"
-    Rows[#Rows + 1] = {code, status, clean(detail, 420)}
-    if not passed then Failures[#Failures + 1] = code end
+local Failures = {}
+local function safePrint(line)
+    return PC(P, line)
 end
 
+local function add(code, passed, detail)
+    local status = passed and "OK" or "FAIL"
+    if not passed then Failures[#Failures + 1] = code end
+    local cleanOK, cleanDetail = PC(clean, detail, 420)
+    if not cleanOK then cleanDetail = "<detail-format-error>" end
+    safePrint("IB2P2|" .. code .. "|" .. status .. "|" .. cleanDetail)
+end
+
+-- Stream the begin marker before any executor function is touched. Every executor-facing
+-- call below uses call()/pcall, and this outer pcall guarantees a final FATAL/END record if
+-- an unexpected primitive or result shape still raises inside the diagnostic itself.
+safePrint("IB2P2|BEGIN|INFO|lua51-console-v2-protected")
+
+local function runProbe()
 -- Resolve the same two environments used by the production guard.
 local Base = T(_G) == "table" and _G or nil
 local GetFEnv = field(Base, "getfenv")
@@ -318,13 +330,15 @@ add("UPVAL", upvaluesOK and hasValue(upvalues, UPVALUE_ORIGINAL),
     .. ",values=" .. sample(upvalues))
 
 local setOK, setResult = call(SetupValue, UpvalueProbe, 1, UPVALUE_CHANGED)
-local changedValue = UpvalueProbe(0)
+local changedOK, changedValue = call(UpvalueProbe, 0)
 local restoreOK, restoreResult = call(SetupValue, UpvalueProbe, 1, UPVALUE_ORIGINAL)
-local restoredValue = UpvalueProbe(0)
-add("SETUP", setOK and restoreOK and changedValue == UPVALUE_CHANGED and restoredValue == UPVALUE_ORIGINAL,
-    "set=" .. atom(setOK) .. "/" .. atom(setResult) .. ",changed=" .. atom(changedValue)
+local restoredOK, restoredValue = call(UpvalueProbe, 0)
+add("SETUP", setOK and changedOK and restoreOK and restoredOK
+    and changedValue == UPVALUE_CHANGED and restoredValue == UPVALUE_ORIGINAL,
+    "set=" .. atom(setOK) .. "/" .. atom(setResult)
+    .. ",changed=" .. atom(changedOK) .. "/" .. atom(changedValue)
     .. ",restore=" .. atom(restoreOK) .. "/" .. atom(restoreResult)
-    .. ",restored=" .. atom(restoredValue))
+    .. ",restored=" .. atom(restoredOK) .. "/" .. atom(restoredValue))
 
 -- Prototype extraction behavior.
 local function firstFunction(value)
@@ -408,11 +422,14 @@ add("STABLE", #changed == 0 and getgenvReferenceSame and capSame,
     .. ",getgenv_ref=" .. atom(getgenvReferenceSame)
     .. ",call3=" .. atom(genOK3) .. ",cap_same=" .. atom(capSame))
 
--- Emit only this short report. There are no file or clipboard fallbacks.
-P("IB2P2|BEGIN|INFO|lua51-console-v1")
-for index = 1, #Rows do
-    local row = Rows[index]
-    P("IB2P2|" .. row[1] .. "|" .. row[2] .. "|" .. row[3])
 end
-P("IB2P2|END|" .. (#Failures == 0 and "PASS" or "FAIL")
+
+local probeOK, probeError = PC(runProbe)
+if not probeOK then
+    add("FATAL", false, probeError)
+end
+
+-- Emit the end marker even after a protected diagnostic failure. There are no file or
+-- clipboard fallbacks, so every successfully formatted record is streamed directly.
+safePrint("IB2P2|END|" .. (#Failures == 0 and "PASS" or "FAIL")
     .. "|count=" .. #Failures .. ",codes=" .. (#Failures == 0 and "none" or TB.concat(Failures, ",")))
