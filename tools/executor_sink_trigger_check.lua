@@ -1,9 +1,9 @@
 -- IronBrew2 executor silent-sink trigger check
 --
 -- Runs every runtime-observable condition used by the current production
--- executor gate. Every condition prints whether its failure would make the
--- generated payload enter the silent, non-yielding sink. No executor brand is
--- allowed or denied.
+-- executor gate, but prints only conditions that would make the generated
+-- payload enter the silent, non-yielding sink. No executor brand is allowed or
+-- denied. The final summary still counts all evaluated conditions.
 --
 -- This script never enters the production infinite sink itself. Challenges are
 -- protected and non-short-circuiting so all results are printed in one run.
@@ -56,7 +56,6 @@ end
 local function record(name, passed, detail)
     if passed then
         successCount = successCount + 1
-        Output0("[不会触发静默 sink] " .. name)
     else
         failureCount = failureCount + 1
         Output0("[会触发静默 sink] " .. name .. ": "

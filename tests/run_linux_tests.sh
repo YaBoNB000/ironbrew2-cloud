@@ -114,14 +114,17 @@ cmp "$WORK/baseline.out" "$WORK/executor-compat-representations.out"
 run_executor_mode callable-proto "$WORK/fixed.lua" > "$WORK/executor-callable-proto.out"
 cmp "$WORK/baseline.out" "$WORK/executor-callable-proto.out"
 
-# The standalone sink checker must print every condition without entering the
-# sink itself. Trusted, callable-proto and compatible representation shims have
-# no triggering line; a callable proto with the wrong result is reported while
-# the checker continues through its final summary.
+# The standalone sink checker evaluates every condition without entering the
+# sink itself, but prints only triggering conditions plus its final summary.
+# Trusted, callable-proto and compatible representation shims have no triggering
+# line; a callable proto with the wrong result is reported before the summary.
 for mode in trusted callable-proto compat-representations; do
     "$LUA" tests/executor_runner.lua "$mode" tools/executor_sink_trigger_check.lua \
         > "$WORK/sink-check-$mode.out"
     ! grep -q '^\[会触发静默 sink\]' "$WORK/sink-check-$mode.out"
+    ! grep -q '^\[不会触发静默 sink\]' "$WORK/sink-check-$mode.out"
+    grep -q '^逐项汇总: 不会触发静默 sink: 168 会触发静默 sink: 0$' \
+        "$WORK/sink-check-$mode.out"
     grep -q '^综合结论: 当前环境不会因上述 executor gate 条件进入静默 sink$' \
         "$WORK/sink-check-$mode.out"
 done
@@ -131,6 +134,7 @@ grep -q '^\[会触发静默 sink\] proto.getproto-inactive-contract:' \
     "$WORK/sink-check-wrong-callable.out"
 grep -q '^\[会触发静默 sink\] proto.getprotos-inactive-contract:' \
     "$WORK/sink-check-wrong-callable.out"
+! grep -q '^\[不会触发静默 sink\]' "$WORK/sink-check-wrong-callable.out"
 grep -q '^综合结论: 当前环境会进入静默 sink$' \
     "$WORK/sink-check-wrong-callable.out"
 echo "PASS standalone sink-trigger checker"
