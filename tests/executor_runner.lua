@@ -32,7 +32,11 @@ local function inspect_constants(value)
 end
 
 local function inspect_upvalues(value)
-    if closure_kind(value) == "C" then error("C closures have no accessible upvalues") end
+    if closure_kind(value) == "C" then
+        if mode == "compat-representations" then return {} end
+        if mode == "c-upvalue-leak" then return {197843211} end
+        error("C closures have no accessible upvalues")
+    end
     local values = {}
     local index = 1
     while true do
@@ -46,7 +50,12 @@ end
 
 local function inactive_proto(target)
     if mode == "callable-proto" then return target end
-    local wrapper = function() error("inactive prototype") end
+    local wrapper
+    if mode == "compat-representations" then
+        wrapper = newproxy(true)
+    else
+        wrapper = function() error("inactive prototype") end
+    end
     inactive_targets[wrapper] = target
     return wrapper
 end
@@ -188,12 +197,27 @@ elseif mode == "version-number" then
 elseif mode == "missing-debug" then
     debug.getproto = nil
     debug.getprotos = nil
-elseif mode == "trusted" or mode == "no-alias" or mode == "polluted-genv"
-    or mode == "invalid-load" or mode == "callable-proto" or mode == "c-debug-leak"
-    or mode == "canary-error" then
+elseif mode == "trusted" or mode == "no-alias" or mode == "compat-representations"
+    or mode == "polluted-genv" or mode == "invalid-load" or mode == "callable-proto"
+    or mode == "c-debug-leak" or mode == "c-upvalue-leak" or mode == "canary-error" then
     -- Behavior for these modes is installed above before the generated chunk.
 else
     error("unknown executor harness mode: " .. tostring(mode))
+end
+
+if mode == "compat-representations" then
+    -- Model real executors that expose APIs through the thread environment's
+    -- __index path rather than as raw getfenv keys.
+    local proxy_names = {
+        "getgenv", "identifyexecutor", "getexecutorname", "executorname", "checkcaller",
+        "iscclosure", "islclosure", "newcclosure", "loadstring", "typeof", "game",
+        "Instance", "Vector3", "task",
+    }
+    for _, name in ipairs(proxy_names) do
+        executor_environment[name] = rawget(_G, name)
+        rawset(_G, name, nil)
+    end
+    setmetatable(_G, {__index = executor_environment})
 end
 
 baseline_globals = {}

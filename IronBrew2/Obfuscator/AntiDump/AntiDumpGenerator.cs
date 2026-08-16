@@ -158,7 +158,17 @@ local GuardGetFEnvGlobal = getfenv;
 
 local GuardEnvOK, GuardEnvironment = PCall(GetFEnv);
 if not GuardEnvOK or Type(GuardEnvironment) ~= 'table' then GuardEnvironment = nil; end;
-local GuardGetGenV = GuardEnvironment and RawGet(GuardEnvironment, __KEY_GETGENV__);
+local function GuardEnvironmentRead(GuardReadEnvironment, GuardReadKey)
+    if Type(GuardReadEnvironment) ~= 'table' then return nil; end;
+    local GuardReadValue = RawGet(GuardReadEnvironment, GuardReadKey);
+    if GuardReadValue ~= nil then return GuardReadValue; end;
+    local GuardReadOK, GuardIndexedValue = PCall(function()
+        return GuardReadEnvironment[GuardReadKey];
+    end);
+    if GuardReadOK then return GuardIndexedValue; end;
+    return nil;
+end;
+local GuardGetGenV = GuardEnvironmentRead(GuardEnvironment, __KEY_GETGENV__);
 local GuardCapOK, GuardCapabilityEnvironment = false, nil;
 if Type(GuardGetGenV) == 'function' then
     GuardCapOK, GuardCapabilityEnvironment = PCall(GuardGetGenV);
@@ -166,8 +176,8 @@ end;
 if not GuardCapOK or Type(GuardCapabilityEnvironment) ~= 'table' then GuardCapabilityEnvironment = nil; end;
 
 local function GuardLookup(GuardLookupKey)
-    local GuardLookupValue = GuardCapabilityEnvironment and RawGet(GuardCapabilityEnvironment, GuardLookupKey);
-    if GuardLookupValue == nil and GuardEnvironment then GuardLookupValue = RawGet(GuardEnvironment, GuardLookupKey); end;
+    local GuardLookupValue = GuardEnvironmentRead(GuardCapabilityEnvironment, GuardLookupKey);
+    if GuardLookupValue == nil then GuardLookupValue = GuardEnvironmentRead(GuardEnvironment, GuardLookupKey); end;
     return GuardLookupValue;
 end;
 
@@ -204,7 +214,10 @@ local GuardUpvalue = __IB2_UPVALUE_EXPECTED__;
 
 local function GuardLuaProbe(GuardProbeValue) return GuardProbeValue; end;
 local function GuardConstantProbe() return __IB2_CONSTANT_EXPECTED__; end;
-local function GuardUpvalueProbe(GuardProbeValue) return (GuardUpvalue + GuardProbeValue) % 2147483647; end;
+local function GuardUpvalueProbe(GuardProbeValue)
+    GuardUpvalue = (GuardUpvalue + GuardProbeValue) % 2147483647;
+    return GuardUpvalue;
+end;
 local function GuardProtoProbe()
     local function GuardProtoChild(GuardProtoValue)
         return (GuardProtoValue + __IB2_PROTO_CONSTANT__) % 2147483647;
@@ -219,6 +232,10 @@ local function GuardTableContains(GuardValues, GuardExpected)
         if GuardValueItem == GuardExpected then return true; end;
     end;
     return false;
+end;
+
+local function GuardTableEmpty(GuardValues)
+    return Type(GuardValues) == 'table' and Next(GuardValues) == nil;
 end;
 
 local function GuardClassifies(GuardFunction, GuardExpectedC)
@@ -242,7 +259,7 @@ local function GuardCurrentIdentity()
         return false;
     end;
     if not GuardEnvironment or Type(GuardGetGenV) ~= 'function'
-        or RawGet(GuardEnvironment, __KEY_GETGENV__) ~= GuardGetGenV then return false; end;
+        or GuardEnvironmentRead(GuardEnvironment, __KEY_GETGENV__) ~= GuardGetGenV then return false; end;
     local GuardCurrentEnvOK, GuardCurrentEnvironment = PCall(GuardGetGenV);
     if not GuardCurrentEnvOK or GuardCurrentEnvironment ~= GuardCapabilityEnvironment then return false; end;
     if GuardLookup(__KEY_IDENTIFY__) ~= GuardIdentify
@@ -330,9 +347,10 @@ local function GuardStrictChallenge()
     if not GuardClassifies(GuardLuaProbe, false) then return false, 0; end;
 
     local GuardCConstantsOK = PCall(GuardGetConstants, Byte);
-    local GuardCUpvaluesOK = PCall(GuardGetUpvalues, Byte);
+    local GuardCUpvaluesOK, GuardCUpvalues = PCall(GuardGetUpvalues, Byte);
     local GuardCSetupOK = PCall(GuardSetupValue, Byte, 1, 0);
-    if GuardCConstantsOK or GuardCUpvaluesOK or GuardCSetupOK then return false, 0; end;
+    if GuardCConstantsOK or GuardCSetupOK
+        or (GuardCUpvaluesOK and not GuardTableEmpty(GuardCUpvalues)) then return false, 0; end;
     if Type(GuardGetProto) == 'function' then
         local GuardCProtoOK = PCall(GuardGetProto, Byte, 1);
         if GuardCProtoOK then return false, 0; end;
@@ -367,7 +385,12 @@ local function GuardStrictChallenge()
         or not GuardClassifies(GuardActiveProto, false) then return false, 0; end;
 
     local function GuardInactiveProtoOK(GuardInactiveProto)
-        if not GuardClassifies(GuardInactiveProto, false) then return false; end;
+        local GuardInactiveType = Type(GuardInactiveProto);
+        if GuardInactiveType == 'function' then
+            if not GuardClassifies(GuardInactiveProto, false) then return false; end;
+        elseif GuardInactiveType ~= 'userdata' then
+            return false;
+        end;
         local GuardProtoConstantsOK, GuardProtoConstants = PCall(GuardGetConstants, GuardInactiveProto);
         if not GuardProtoConstantsOK
             or not GuardTableContains(GuardProtoConstants, __IB2_PROTO_CONSTANT__) then return false; end;
@@ -429,8 +452,8 @@ local function GuardStrictChallenge()
     local GuardWrappedOK, GuardWrappedValue = PCall(GuardWrapped, -__IB2_C_INPUT__);
     if not GuardWrappedOK or GuardWrappedValue ~= __IB2_C_INPUT__
         or not GuardClassifies(GuardWrapped, true) then return false, 0; end;
-    local GuardWrappedUpvaluesOK = PCall(GuardGetUpvalues, GuardWrapped);
-    if GuardWrappedUpvaluesOK then return false, 0; end;
+    local GuardWrappedUpvaluesOK, GuardWrappedUpvalues = PCall(GuardGetUpvalues, GuardWrapped);
+    if GuardWrappedUpvaluesOK and not GuardTableEmpty(GuardWrappedUpvalues) then return false, 0; end;
     GuardTranscriptWord(__IB2_C_INPUT__);
 
     return true, GuardTranscript;

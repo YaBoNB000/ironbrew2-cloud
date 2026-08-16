@@ -309,10 +309,18 @@ local function rejected_call(api, ...)
     return true
 end
 
+local function no_exposed_values(api, target)
+    if not is_function(api) then return false, "API missing" end
+    local ok, values = PCall0(api, target)
+    if not ok then return true end
+    if value_type(values) == "table" and Next0(values) == nil then return true end
+    return false, "expected an error or empty table, got " .. value_type(values)
+end
+
 local cConstantsReject, cConstantsDetail = rejected_call(GetConstants0, Byte0)
 record("debug.C-getconstants-rejected", cConstantsReject, cConstantsDetail)
-local cUpvaluesReject, cUpvaluesDetail = rejected_call(GetUpvalues0, Byte0)
-record("debug.C-getupvalues-rejected", cUpvaluesReject, cUpvaluesDetail)
+local cUpvaluesProtected, cUpvaluesDetail = no_exposed_values(GetUpvalues0, Byte0)
+record("debug.C-getupvalues-protected", cUpvaluesProtected, cUpvaluesDetail)
 local cSetupReject, cSetupDetail = rejected_call(SetupValue0, Byte0, 1, 0)
 record("debug.C-setupvalue-rejected", cSetupReject, cSetupDetail)
 if is_function(GetProto0) then
@@ -345,7 +353,12 @@ local ATTESTATION_TOKEN = 737743981
 
 local function ConstantProbe() return 731245907 end
 local UpvalueValue = UPVALUE_EXPECTED
-local function UpvalueProbe(value) return (UpvalueValue + value) % 2147483647 end
+local function UpvalueProbe(value)
+    -- The assignment prevents Luau's optimizer from folding an apparently
+    -- immutable captured local into a constant, so this is a real upvalue.
+    UpvalueValue = (UpvalueValue + value) % 2147483647
+    return UpvalueValue
+end
 local function ProtoProbe()
     local function ProtoChild(value)
         return (value + 451278301) % 2147483647
@@ -394,8 +407,13 @@ local activeClass, activeClassDetail = classification_result(ActiveProto, false)
 record("proto.child-Luau-class", activeClass, activeClassDetail)
 
 local function inactive_proto_result(value)
-    local classOK, classDetail = classification_result(value, false)
-    if not classOK then return false, "classification: " .. safe_text(classDetail) end
+    local kind = value_type(value)
+    if kind == "function" then
+        local classOK, classDetail = classification_result(value, false)
+        if not classOK then return false, "classification: " .. safe_text(classDetail) end
+    elseif kind ~= "userdata" then
+        return false, "expected function/userdata handle, got " .. kind
+    end
     local inspectOK, protoConstants = PCall0(GetConstants0, value)
     if not inspectOK then return false, "getconstants raised" end
     if not table_contains(protoConstants, PROTO_CONSTANT) then return false, "child constant missing" end
@@ -499,8 +517,8 @@ record("newcclosure.forward-result", wrappedCallOK and wrappedValue == C_INPUT,
     "expected " .. C_INPUT .. ", got " .. safe_text(wrappedValue))
 local wrappedClass, wrappedClassDetail = classification_result(Wrapped, true)
 record("newcclosure.C-class", wrappedClass, wrappedClassDetail)
-local wrappedUpvaluesRejected, wrappedUpvaluesDetail = rejected_call(GetUpvalues0, Wrapped)
-record("newcclosure.getupvalues-rejected", wrappedUpvaluesRejected, wrappedUpvaluesDetail)
+local wrappedUpvaluesProtected, wrappedUpvaluesDetail = no_exposed_values(GetUpvalues0, Wrapped)
+record("newcclosure.getupvalues-protected", wrappedUpvaluesProtected, wrappedUpvaluesDetail)
 
 -- Diagnostic transcript/token equivalent to the generated hard-AND challenge.
 local function mix_word(state, value)
@@ -518,7 +536,8 @@ local challengeEvidence = constantsContain and upvaluesContain and setupOK and c
     and activeCallValue == PROTO_EXPECTED and activeClass and protoSurfaceEvidence
     and invalidOK and invalidFunction == nil and value_type(invalidError) == "string" and #invalidError >= 1
     and compileOK and loadedCallOK and loadedValue == LOAD_EXPECTED and loadedClass and loadedConstantEvidence
-    and wrapOK and wrappedCallOK and wrappedValue == C_INPUT and wrappedClass and wrappedUpvaluesRejected
+    and cUpvaluesProtected and wrapOK and wrappedCallOK and wrappedValue == C_INPUT
+    and wrappedClass and wrappedUpvaluesProtected
 record("attestation.transcript", challengeEvidence and transcript == TRANSCRIPT_EXPECTED,
     challengeEvidence and "transcript mismatch" or "one or more transcript-producing challenges failed")
 local diagnosticToken = (transcript + ATTESTATION_OFFSET) % 4294967296
