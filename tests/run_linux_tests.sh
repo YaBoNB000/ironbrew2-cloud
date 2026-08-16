@@ -98,11 +98,17 @@ for payload_case in prototype-tag block-manifest column-framing column-consumpti
 done
 echo "PASS v4 prototype, block-manifest, column framing/consumption and constant-capsule tamper rejection"
 
-# The trusted test executor must pass every hard-AND contract. Plain Lua,
-# partial API surfaces, unstable identity and hooked primitives must remain
-# silent and non-returning until an external timeout terminates the tight sink.
+# The trusted test executor must pass every hard-AND behavior contract, while
+# non-standard identity aliases remain optional. Plain Lua, polluted executor
+# globals, callable inactive protos, invalid loadstring/debug behavior, partial
+# API surfaces, unstable identity and hooked primitives must remain silent and
+# non-returning until an external timeout terminates the tight sink. An injected
+# mid-canary getgenv failure separately verifies that both writes are restored
+# before the guard enters that sink.
 run_executor "$WORK/fixed.lua" > "$WORK/executor-trusted.out"
 cmp "$WORK/baseline.out" "$WORK/executor-trusted.out"
+run_executor_mode no-alias "$WORK/fixed.lua" > "$WORK/executor-no-alias.out"
+cmp "$WORK/baseline.out" "$WORK/executor-no-alias.out"
 
 set +e
 timeout 2s "$LUA" "$WORK/fixed.lua" > "$WORK/executor-plain.stdout" 2> "$WORK/executor-plain.stderr"
@@ -110,7 +116,7 @@ plain_code=$?
 set -e
 [[ $plain_code -eq 124 && ! -s "$WORK/executor-plain.stdout" && ! -s "$WORK/executor-plain.stderr" ]]
 
-for mode in primitive-hook raw-hook debug-api-hook debug-hook classifier-spoof identity-spoof missing-debug; do
+for mode in primitive-hook raw-hook debug-api-hook classifier-spoof identity-spoof version-number missing-debug polluted-genv invalid-load callable-proto c-debug-leak; do
     set +e
     timeout 2s "$LUA" tests/executor_runner.lua "$mode" "$WORK/fixed.lua" \
         > "$WORK/executor-$mode.stdout" 2> "$WORK/executor-$mode.stderr"
@@ -119,7 +125,14 @@ for mode in primitive-hook raw-hook debug-api-hook debug-hook classifier-spoof i
     [[ $executor_code -eq 124 ]]
     [[ ! -s "$WORK/executor-$mode.stdout" && ! -s "$WORK/executor-$mode.stderr" ]]
 done
-echo "PASS strict executor contract and silent non-returning O(1) decoy sink"
+set +e
+timeout 2s "$LUA" tests/executor_runner.lua canary-error "$WORK/fixed.lua" \
+    > "$WORK/executor-canary-error.stdout" 2> "$WORK/executor-canary-error.stderr"
+canary_code=$?
+set -e
+[[ $canary_code -eq 42 ]]
+[[ ! -s "$WORK/executor-canary-error.stdout" && ! -s "$WORK/executor-canary-error.stderr" ]]
+echo "PASS strict executor contract, canary cleanup and silent non-returning O(1) decoy sink"
 
 # Verify the unminified generated VM contains all three guard checkpoints and
 # that stable implementation identifiers do not survive name randomization.
@@ -369,7 +382,8 @@ echo "PASS ephemeral instruction/constant cache and opaque block retention"
 # constructor. A test-only luac wrapper patches the one-element fixture after
 # source preprocessing and before IronBrew2 deserializes it.
 mkdir -p "$WORK/setlist-bin"
-ln -s "$ROOT/tests/luac_setlist_c0_wrapper.py" "$WORK/setlist-bin/luac"
+cp "$ROOT/tests/luac_setlist_c0_wrapper.py" "$WORK/setlist-bin/luac"
+chmod +x "$WORK/setlist-bin/luac"
 printf '%s\n' 'local t={123}; print("setlist-c0:" .. t[1])' > "$WORK/setlist-c0.lua"
 "$LUA" "$WORK/setlist-c0.lua" > "$WORK/setlist-c0-baseline.out"
 rm -rf temp out.lua

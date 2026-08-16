@@ -9,6 +9,8 @@ local native_getupvalue = assert(debug and debug.getupvalue)
 local native_setupvalue = assert(debug and debug.setupvalue)
 local native_byte = string.byte
 local native_rawset = rawset
+local native_loadstring = loadstring
+local inactive_targets = setmetatable({}, {__mode = "k"})
 
 local function closure_kind(value)
     if type(value) ~= "function" then return nil end
@@ -17,10 +19,12 @@ local function closure_kind(value)
 end
 
 local function inspect_constants(value)
-    -- The generated challenges use side-effect-free, zero-argument canaries.
-    -- Returning their observed primitive result mirrors an executor constants
-    -- API closely enough to exercise the cross-API contract under Lua 5.1.
-    local ok, result = pcall(value)
+    if closure_kind(value) == "C" then error("C closures have no accessible constants") end
+    -- Lua 5.1 cannot expose an uncallable proto object. The harness associates
+    -- an uncallable Lua wrapper with its real child so the production guard can
+    -- validate both sUNC properties: inspectable constants and failed calls.
+    local target = inactive_targets[value] or value
+    local ok, result = pcall(target, 0)
     if ok and (type(result) == "number" or type(result) == "string" or type(result) == "boolean") then
         return {result}
     end
@@ -28,6 +32,7 @@ local function inspect_constants(value)
 end
 
 local function inspect_upvalues(value)
+    if closure_kind(value) == "C" then error("C closures have no accessible upvalues") end
     local values = {}
     local index = 1
     while true do
@@ -39,16 +44,52 @@ local function inspect_upvalues(value)
     return values
 end
 
-local function inspect_proto(value)
-    local ok, result = pcall(value)
-    if ok and type(result) == "function" then return result end
-    return nil
+local function inactive_proto(target)
+    if mode == "callable-proto" then return target end
+    local wrapper = function() error("inactive prototype") end
+    inactive_targets[wrapper] = target
+    return wrapper
 end
 
-function getgenv() return _G end
+local function inspect_proto(value, activated)
+    if closure_kind(value) == "C" then error("C closures have no prototypes") end
+    local ok, result = pcall(value)
+    if not ok or type(result) ~= "function" then error("prototype not found") end
+    if activated then return {result} end
+    return inactive_proto(result)
+end
+
+local executor_environment = {}
+local baseline_globals
+local getgenv_calls = 0
+function getgenv()
+    getgenv_calls = getgenv_calls + 1
+    if mode == "polluted-genv" then return _G end
+    if mode == "canary-error" and getgenv_calls == 3 then
+        -- The first challenge writes its random canary to both environments
+        -- before this call. Observe the later sink from outside that challenge
+        -- and encode cleanup success only in the process status.
+        debug.sethook(function()
+            local clean = next(executor_environment) == nil
+            for key, value in pairs(_G) do
+                if baseline_globals[key] ~= value then clean = false break end
+            end
+            if clean then
+                for key, value in pairs(baseline_globals) do
+                    if _G[key] ~= value then clean = false break end
+                end
+            end
+            os.exit(clean and 42 or 43)
+        end, "", 10000)
+        error("injected getgenv failure")
+    end
+    return executor_environment
+end
 function identifyexecutor() return "Arena Test Executor", "1.0" end
-getexecutorname = identifyexecutor
-executorname = identifyexecutor
+if mode ~= "no-alias" then
+    getexecutorname = identifyexecutor
+    executorname = identifyexecutor
+end
 function checkcaller() return true end
 function iscclosure(value) return closure_kind(value) == "C" end
 function islclosure(value)
@@ -59,7 +100,16 @@ function islclosure(value)
 end
 function newcclosure(_) return math.abs end
 
--- Lua 5.1 already provides native loadstring.
+-- Lua 5.1 already provides native loadstring. The negative mode models an
+-- implementation that incorrectly throws instead of returning nil + message.
+if mode == "invalid-load" then
+    loadstring = function(source, chunkname)
+        local loaded, message = native_loadstring(source, chunkname)
+        if not loaded then error(message) end
+        return loaded
+    end
+end
+
 typeof = function(value)
     if type(value) == "table" and rawget(value, "__roblox_type") then
         return rawget(value, "__roblox_type")
@@ -84,12 +134,19 @@ task = {
 
 debug.getconstants = inspect_constants
 debug.getupvalues = inspect_upvalues
-debug.getproto = function(value) return inspect_proto(value) end
-debug.getprotos = function(value)
-    local result = inspect_proto(value)
-    return result and {result} or {}
+debug.getproto = function(value, _, activated) return inspect_proto(value, activated) end
+debug.getprotos = function(value) return {inspect_proto(value, false)} end
+debug.setupvalue = function(value, index, replacement)
+    if closure_kind(value) == "C" then error("C closure upvalues are protected") end
+    return native_setupvalue(value, index, replacement)
 end
-debug.setupvalue = native_setupvalue
+
+if mode == "c-debug-leak" then
+    debug.getconstants = function(value)
+        if closure_kind(value) == "C" then return {} end
+        return inspect_constants(value)
+    end
+end
 
 if mode == "signed-bit" then
     local function unsigned_bxor(left, right)
@@ -117,8 +174,6 @@ elseif mode == "raw-hook" then
     rawset = function(...) return native_rawset(...) end
 elseif mode == "debug-api-hook" then
     debug.getinfo = function(...) return native_getinfo(...) end
-elseif mode == "debug-hook" then
-    debug.sethook(function() end, "", 1)
 elseif mode == "classifier-spoof" then
     iscclosure = function() return true end
     islclosure = function() return false end
@@ -128,11 +183,20 @@ elseif mode == "identity-spoof" then
         counter = counter + 1
         return "Unstable Executor " .. counter, "1.0"
     end
+elseif mode == "version-number" then
+    identifyexecutor = function() return "Arena Test Executor", 1 end
 elseif mode == "missing-debug" then
     debug.getproto = nil
     debug.getprotos = nil
-elseif mode ~= "trusted" then
+elseif mode == "trusted" or mode == "no-alias" or mode == "polluted-genv"
+    or mode == "invalid-load" or mode == "callable-proto" or mode == "c-debug-leak"
+    or mode == "canary-error" then
+    -- Behavior for these modes is installed above before the generated chunk.
+else
     error("unknown executor harness mode: " .. tostring(mode))
 end
+
+baseline_globals = {}
+for key, value in pairs(_G) do baseline_globals[key] = value end
 
 dofile(path)

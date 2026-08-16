@@ -111,11 +111,13 @@ local function GuardDecoy(...)
 
         /// <summary>
         /// Builds strict, brand-neutral executor attestation. identifyexecutor is a
-        /// required stability signal, not a product allow-list. Admission additionally
-        /// requires Roblox host semantics, executor closure APIs, debug introspection,
-        /// private setupvalue/proto challenges, loadstring behavior and provenance
-        /// consistency. Any failure becomes sticky and enters a non-yielding O(1)-memory
-        /// state graph without printing or throwing a dedicated block message.
+        /// typed stability signal, never a product allow-list. Admission is based on
+        /// sUNC-style observable behavior: isolated executor globals, Roblox host
+        /// semantics, closure classification/wrapping, Luau compilation, debug
+        /// introspection/mutation, and inactive/active prototype rules. Exact debug
+        /// source strings and non-standard identity aliases are deliberately excluded.
+        /// Any failure becomes sticky and enters a non-yielding O(1)-memory state graph
+        /// without printing or throwing a dedicated block message.
         /// </summary>
         public static string GenerateRuntimeGuard(int probeInterval, uint decoySeed, uint attestationToken)
         {
@@ -170,8 +172,6 @@ local function GuardLookup(GuardLookupKey)
 end;
 
 local GuardIdentify = GuardLookup(__KEY_IDENTIFY__);
-local GuardIdentifyAlias = GuardLookup(__KEY_IDENTIFY_ALIAS__);
-local GuardExecutorNameAlias = GuardLookup(__KEY_EXECUTOR_NAME_ALIAS__);
 local GuardCheckCaller = GuardLookup(__KEY_CHECKCALLER__);
 local GuardIsC = GuardLookup(__KEY_ISC__);
 local GuardIsL = GuardLookup(__KEY_ISL__);
@@ -183,7 +183,6 @@ local GuardInstance = GuardLookup(__KEY_INSTANCE__);
 local GuardVector3 = GuardLookup(__KEY_VECTOR3__);
 local GuardTask = GuardLookup(__KEY_TASK__);
 
-local GuardGetHook = GuardDebug and RawGet(GuardDebug, __KEY_GETHOOK__);
 local GuardGetInfo = GuardDebug and RawGet(GuardDebug, __KEY_GETINFO__);
 local GuardInfo = GuardDebug and RawGet(GuardDebug, __KEY_INFO__);
 local GuardInspector = Type(GuardInfo) == 'function' and GuardInfo or GuardGetInfo;
@@ -222,18 +221,12 @@ local function GuardTableContains(GuardValues, GuardExpected)
     return false;
 end;
 
-local function GuardNativeSource(GuardFunction)
-    if Type(GuardFunction) ~= 'function' or Type(GuardInspector) ~= 'function' then return false, false; end;
-    if Type(GuardInfo) == 'function' then
-        local GuardSourceOK, GuardSource = PCall(GuardInfo, GuardFunction, 's');
-        if GuardSourceOK and Type(GuardSource) == 'string' then return true, GuardSource == '[C]'; end;
-    elseif Type(GuardGetInfo) == 'function' then
-        local GuardSourceOK, GuardSource = PCall(GuardGetInfo, GuardFunction, 'S');
-        if GuardSourceOK and Type(GuardSource) == 'table' and Type(GuardSource.what) == 'string' then
-            return true, GuardSource.what == 'C';
-        end;
-    end;
-    return false, false;
+local function GuardClassifies(GuardFunction, GuardExpectedC)
+    if Type(GuardFunction) ~= 'function' then return false; end;
+    local GuardCOK, GuardCResult = PCall(GuardIsC, GuardFunction);
+    local GuardLOK, GuardLResult = PCall(GuardIsL, GuardFunction);
+    return GuardCOK and GuardLOK and GuardCResult == GuardExpectedC
+        and GuardLResult == (not GuardExpectedC);
 end;
 
 local function GuardCurrentIdentity()
@@ -253,8 +246,6 @@ local function GuardCurrentIdentity()
     local GuardCurrentEnvOK, GuardCurrentEnvironment = PCall(GuardGetGenV);
     if not GuardCurrentEnvOK or GuardCurrentEnvironment ~= GuardCapabilityEnvironment then return false; end;
     if GuardLookup(__KEY_IDENTIFY__) ~= GuardIdentify
-        or GuardLookup(__KEY_IDENTIFY_ALIAS__) ~= GuardIdentifyAlias
-        or GuardLookup(__KEY_EXECUTOR_NAME_ALIAS__) ~= GuardExecutorNameAlias
         or GuardLookup(__KEY_CHECKCALLER__) ~= GuardCheckCaller
         or GuardLookup(__KEY_ISC__) ~= GuardIsC
         or GuardLookup(__KEY_ISL__) ~= GuardIsL
@@ -266,7 +257,6 @@ local function GuardCurrentIdentity()
         or GuardLookup(__KEY_VECTOR3__) ~= GuardVector3
         or GuardLookup(__KEY_TASK__) ~= GuardTask then return false; end;
     if not GuardDebug
-        or RawGet(GuardDebug, __KEY_GETHOOK__) ~= GuardGetHook
         or RawGet(GuardDebug, __KEY_GETINFO__) ~= GuardGetInfo
         or RawGet(GuardDebug, __KEY_INFO__) ~= GuardInfo
         or RawGet(GuardDebug, __KEY_GETCONSTANTS__) ~= GuardGetConstants
@@ -274,10 +264,6 @@ local function GuardCurrentIdentity()
         or RawGet(GuardDebug, __KEY_GETPROTO__) ~= GuardGetProto
         or RawGet(GuardDebug, __KEY_GETPROTOS__) ~= GuardGetProtos
         or RawGet(GuardDebug, __KEY_SETUPVALUE__) ~= GuardSetupValue then return false; end;
-    if Type(GuardGetHook) == 'function' then
-        local GuardHookOK, GuardHook = PCall(GuardGetHook);
-        if not GuardHookOK or GuardHook ~= nil then return false; end;
-    end;
     return true;
 end;
 
@@ -290,22 +276,30 @@ local function GuardStrictChallenge()
         or (Type(GuardGetProto) ~= 'function' and Type(GuardGetProtos) ~= 'function')
         or Type(GuardSetupValue) ~= 'function' then return false, 0; end;
 
+    if GuardCapabilityEnvironment == GuardEnvironment then return false, 0; end;
+    local GuardThreadOld = RawGet(GuardEnvironment, __KEY_ENV_CANARY__);
+    local GuardCapabilityOld = RawGet(GuardCapabilityEnvironment, __KEY_ENV_CANARY__);
+    local GuardThreadMarker, GuardCapabilityMarker = {}, {};
+    local GuardSeparated, GuardPersistent = false, false;
+    local GuardCanaryOK = PCall(function()
+        RawSet(GuardEnvironment, __KEY_ENV_CANARY__, GuardThreadMarker);
+        GuardSeparated = RawGet(GuardCapabilityEnvironment, __KEY_ENV_CANARY__) ~= GuardThreadMarker;
+        RawSet(GuardCapabilityEnvironment, __KEY_ENV_CANARY__, GuardCapabilityMarker);
+        local GuardRepeatOK, GuardRepeatEnvironment = PCall(GuardGetGenV);
+        GuardPersistent = GuardRepeatOK and GuardRepeatEnvironment == GuardCapabilityEnvironment
+            and RawGet(GuardRepeatEnvironment, __KEY_ENV_CANARY__) == GuardCapabilityMarker;
+    end);
+    local GuardThreadRestoreOK = PCall(RawSet, GuardEnvironment, __KEY_ENV_CANARY__, GuardThreadOld);
+    local GuardCapabilityRestoreOK = PCall(RawSet, GuardCapabilityEnvironment, __KEY_ENV_CANARY__, GuardCapabilityOld);
+    if not GuardCanaryOK or not GuardThreadRestoreOK or not GuardCapabilityRestoreOK
+        or not GuardSeparated or not GuardPersistent then return false, 0; end;
+
     local GuardIdOK1, GuardName1, GuardVersion1 = PCall(GuardIdentify);
     local GuardIdOK2, GuardName2, GuardVersion2 = PCall(GuardIdentify);
-    local GuardVersionType1, GuardVersionType2 = Type(GuardVersion1), Type(GuardVersion2);
     if not GuardIdOK1 or not GuardIdOK2 or Type(GuardName1) ~= 'string'
-        or #GuardName1 < 1 or #GuardName1 > 128 or GuardName1 ~= GuardName2
-        or (GuardVersionType1 ~= 'nil' and GuardVersionType1 ~= 'string' and GuardVersionType1 ~= 'number')
-        or GuardVersionType1 ~= GuardVersionType2 or ToString(GuardVersion1) ~= ToString(GuardVersion2) then return false, 0; end;
-    for GuardAliasIndex = 1, 2 do
-        local GuardAlias = GuardIdentifyAlias;
-        if GuardAliasIndex == 2 then GuardAlias = GuardExecutorNameAlias; end;
-        if GuardAlias ~= nil then
-            if Type(GuardAlias) ~= 'function' then return false, 0; end;
-            local GuardAliasOK, GuardAliasName = PCall(GuardAlias);
-            if not GuardAliasOK or GuardAliasName ~= GuardName1 then return false, 0; end;
-        end;
-    end;
+        or Type(GuardVersion1) ~= 'string' or Type(GuardVersion2) ~= 'string'
+        or #GuardName1 < 1 or #GuardName1 > 128 or #GuardVersion1 > 128
+        or GuardName1 ~= GuardName2 or GuardVersion1 ~= GuardVersion2 then return false, 0; end;
     local GuardCallerOK, GuardCaller = PCall(GuardCheckCaller);
     if not GuardCallerOK or GuardCaller ~= true then return false, 0; end;
 
@@ -325,27 +319,28 @@ local function GuardStrictChallenge()
     end);
     if not GuardHostOK or GuardHostResult ~= true then return false, 0; end;
 
-    local GuardClassOK1, GuardNativeByte = PCall(GuardIsC, Byte);
-    local GuardClassOK2, GuardLuaByte = PCall(GuardIsL, Byte);
-    local GuardClassOK3, GuardNativeProbe = PCall(GuardIsC, GuardLuaProbe);
-    local GuardClassOK4, GuardLuaProbeResult = PCall(GuardIsL, GuardLuaProbe);
-    if not GuardClassOK1 or not GuardClassOK2 or not GuardClassOK3 or not GuardClassOK4
-        or GuardNativeByte ~= true or GuardLuaByte ~= false
-        or GuardNativeProbe ~= false or GuardLuaProbeResult ~= true then return false, 0; end;
-
     local GuardPrimitives = {
         Byte, Char, Sub, Concat, Insert, LDExp, Select, PCall, Type, ToString,
-        ToNumber, RawGet, RawSet, RawEqual, Next, Setmetatable, Getmetatable, Unpack
+        ToNumber, RawGet, RawSet, RawEqual, Next, Setmetatable, Getmetatable, Unpack,
+        GuardInspector
     };
-    local GuardKnown, GuardNative;
     for GuardPrimitiveIndex = 1, #GuardPrimitives do
-        GuardKnown, GuardNative = GuardNativeSource(GuardPrimitives[GuardPrimitiveIndex]);
-        if not GuardKnown or not GuardNative then return false, 0; end;
+        if not GuardClassifies(GuardPrimitives[GuardPrimitiveIndex], true) then return false, 0; end;
     end;
-    GuardKnown, GuardNative = GuardNativeSource(GuardLuaProbe);
-    if not GuardKnown or GuardNative then return false, 0; end;
-    GuardKnown, GuardNative = GuardNativeSource(GuardInspector);
-    if not GuardKnown or not GuardNative then return false, 0; end;
+    if not GuardClassifies(GuardLuaProbe, false) then return false, 0; end;
+
+    local GuardCConstantsOK = PCall(GuardGetConstants, Byte);
+    local GuardCUpvaluesOK = PCall(GuardGetUpvalues, Byte);
+    local GuardCSetupOK = PCall(GuardSetupValue, Byte, 1, 0);
+    if GuardCConstantsOK or GuardCUpvaluesOK or GuardCSetupOK then return false, 0; end;
+    if Type(GuardGetProto) == 'function' then
+        local GuardCProtoOK = PCall(GuardGetProto, Byte, 1);
+        if GuardCProtoOK then return false, 0; end;
+    end;
+    if Type(GuardGetProtos) == 'function' then
+        local GuardCProtosOK = PCall(GuardGetProtos, Byte);
+        if GuardCProtosOK then return false, 0; end;
+    end;
 
     local GuardTranscript = __IB2_TRANSCRIPT_SEED__;
     local function GuardTranscriptWord(GuardTranscriptValue)
@@ -366,56 +361,76 @@ local function GuardStrictChallenge()
     if not GuardChangedOK or not GuardRestoreOK or GuardUpvalueProbe(0) ~= __IB2_UPVALUE_EXPECTED__ then return false, 0; end;
     GuardTranscriptWord(__IB2_UPVALUE_CHANGED__);
 
-    local GuardProtoCandidate = nil;
+    local GuardActiveProto = GuardProtoProbe();
+    local GuardActiveCallOK, GuardActiveCallResult = PCall(GuardActiveProto, __IB2_PROTO_INPUT__);
+    if not GuardActiveCallOK or GuardActiveCallResult ~= __IB2_PROTO_EXPECTED__
+        or not GuardClassifies(GuardActiveProto, false) then return false, 0; end;
+
+    local function GuardInactiveProtoOK(GuardInactiveProto)
+        if not GuardClassifies(GuardInactiveProto, false) then return false; end;
+        local GuardProtoConstantsOK, GuardProtoConstants = PCall(GuardGetConstants, GuardInactiveProto);
+        if not GuardProtoConstantsOK
+            or not GuardTableContains(GuardProtoConstants, __IB2_PROTO_CONSTANT__) then return false; end;
+        local GuardInactiveCallOK = PCall(GuardInactiveProto, __IB2_PROTO_INPUT__);
+        return not GuardInactiveCallOK;
+    end;
+
+    local GuardSawInactiveProto = false;
     if Type(GuardGetProto) == 'function' then
-        local GuardProtoOK, GuardProtoResult = PCall(GuardGetProto, GuardProtoProbe, 1, true);
-        if GuardProtoOK then
-            if Type(GuardProtoResult) == 'function' then GuardProtoCandidate = GuardProtoResult;
-            elseif Type(GuardProtoResult) == 'table' then
-                for GuardProtoKey, GuardProtoItem in Next, GuardProtoResult do
-                    if Type(GuardProtoItem) == 'function' then GuardProtoCandidate = GuardProtoItem; break; end;
+        local GuardProtoOK, GuardProtoResult = PCall(GuardGetProto, GuardProtoProbe, 1);
+        if not GuardProtoOK or not GuardInactiveProtoOK(GuardProtoResult) then return false, 0; end;
+        GuardSawInactiveProto = true;
+
+        local GuardActivatedOK, GuardActivated = PCall(GuardGetProto, GuardProtoProbe, 1, true);
+        if not GuardActivatedOK or Type(GuardActivated) ~= 'table' then return false, 0; end;
+        local GuardActivatedValid = false;
+        for GuardProtoKey, GuardProtoItem in Next, GuardActivated do
+            if GuardClassifies(GuardProtoItem, false) then
+                local GuardProtoCallOK, GuardProtoCallResult = PCall(GuardProtoItem, __IB2_PROTO_INPUT__);
+                if GuardProtoCallOK and GuardProtoCallResult == __IB2_PROTO_EXPECTED__ then
+                    GuardActivatedValid = true;
+                    break;
                 end;
             end;
         end;
+        if not GuardActivatedValid then return false, 0; end;
     end;
-    if not GuardProtoCandidate and Type(GuardGetProtos) == 'function' then
+    if Type(GuardGetProtos) == 'function' then
         local GuardProtosOK, GuardProtos = PCall(GuardGetProtos, GuardProtoProbe);
-        if GuardProtosOK and Type(GuardProtos) == 'table' then
-            for GuardProtoKey, GuardProtoItem in Next, GuardProtos do
-                if Type(GuardProtoItem) == 'function' then GuardProtoCandidate = GuardProtoItem; break; end;
-            end;
+        if not GuardProtosOK or Type(GuardProtos) ~= 'table' then return false, 0; end;
+        local GuardProtosValid = false;
+        for GuardProtoKey, GuardProtoItem in Next, GuardProtos do
+            if GuardInactiveProtoOK(GuardProtoItem) then GuardProtosValid = true; break; end;
         end;
+        if not GuardProtosValid then return false, 0; end;
+        GuardSawInactiveProto = true;
     end;
-    if Type(GuardProtoCandidate) ~= 'function' then return false, 0; end;
-    local GuardProtoCallOK, GuardProtoCallResult = PCall(GuardProtoCandidate, __IB2_PROTO_INPUT__);
-    local GuardProtoClassOK, GuardProtoIsL = PCall(GuardIsL, GuardProtoCandidate);
-    if not GuardProtoCallOK or GuardProtoCallResult ~= __IB2_PROTO_EXPECTED__
-        or not GuardProtoClassOK or GuardProtoIsL ~= true then return false, 0; end;
+    if not GuardSawInactiveProto then return false, 0; end;
     GuardTranscriptWord(__IB2_PROTO_EXPECTED__);
+
+    local GuardInvalidSource = Char(114,101,116,117,114,110,32,41);
+    local GuardInvalidOK, GuardInvalidFunction, GuardInvalidError = PCall(
+        GuardLoadString, GuardInvalidSource, __VALUE_INVALID_CHUNK__);
+    if not GuardInvalidOK or GuardInvalidFunction ~= nil or Type(GuardInvalidError) ~= 'string'
+        or #GuardInvalidError < 1 then return false, 0; end;
 
     local GuardLoadSource = Char(114,101,116,117,114,110,32) .. ToString(__IB2_LOAD_EXPECTED__);
     local GuardCompileOK, GuardLoaded = PCall(GuardLoadString, GuardLoadSource);
     if not GuardCompileOK or Type(GuardLoaded) ~= 'function' then return false, 0; end;
     local GuardLoadedOK, GuardLoadedValue = PCall(GuardLoaded);
-    local GuardLoadedCOK, GuardLoadedC = PCall(GuardIsC, GuardLoaded);
-    local GuardLoadedLOK, GuardLoadedL = PCall(GuardIsL, GuardLoaded);
     if not GuardLoadedOK or GuardLoadedValue ~= __IB2_LOAD_EXPECTED__
-        or not GuardLoadedCOK or not GuardLoadedLOK or GuardLoadedC ~= false or GuardLoadedL ~= true then return false, 0; end;
+        or not GuardClassifies(GuardLoaded, false) then return false, 0; end;
     local GuardLoadedConstantsOK, GuardLoadedConstants = PCall(GuardGetConstants, GuardLoaded);
     if not GuardLoadedConstantsOK or not GuardTableContains(GuardLoadedConstants, __IB2_LOAD_EXPECTED__) then return false, 0; end;
-    GuardKnown, GuardNative = GuardNativeSource(GuardLoaded);
-    if not GuardKnown or GuardNative then return false, 0; end;
     GuardTranscriptWord(__IB2_LOAD_EXPECTED__);
 
     local GuardWrapOK, GuardWrapped = PCall(GuardNewC, GuardCBody);
     if not GuardWrapOK or Type(GuardWrapped) ~= 'function' then return false, 0; end;
     local GuardWrappedOK, GuardWrappedValue = PCall(GuardWrapped, -__IB2_C_INPUT__);
-    local GuardWrappedCOK, GuardWrappedC = PCall(GuardIsC, GuardWrapped);
-    local GuardWrappedLOK, GuardWrappedL = PCall(GuardIsL, GuardWrapped);
     if not GuardWrappedOK or GuardWrappedValue ~= __IB2_C_INPUT__
-        or not GuardWrappedCOK or not GuardWrappedLOK or GuardWrappedC ~= true or GuardWrappedL ~= false then return false, 0; end;
-    GuardKnown, GuardNative = GuardNativeSource(GuardWrapped);
-    if not GuardKnown or not GuardNative then return false, 0; end;
+        or not GuardClassifies(GuardWrapped, true) then return false, 0; end;
+    local GuardWrappedUpvaluesOK = PCall(GuardGetUpvalues, GuardWrapped);
+    if GuardWrappedUpvaluesOK then return false, 0; end;
     GuardTranscriptWord(__IB2_C_INPUT__);
 
     return true, GuardTranscript;
@@ -487,9 +502,8 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__IB2_ATTESTATION_TOKEN__"] = attestationToken.ToString(),
                 ["__IB2_DECOY_GRAPH__"] = BuildDecoyGraph(decoySeed),
                 ["__KEY_GETGENV__"] = LuaChars("getgenv"),
+                ["__KEY_ENV_CANARY__"] = LuaChars(RN(14, 20)),
                 ["__KEY_IDENTIFY__"] = LuaChars("identifyexecutor"),
-                ["__KEY_IDENTIFY_ALIAS__"] = LuaChars("getexecutorname"),
-                ["__KEY_EXECUTOR_NAME_ALIAS__"] = LuaChars("executorname"),
                 ["__KEY_CHECKCALLER__"] = LuaChars("checkcaller"),
                 ["__KEY_ISC__"] = LuaChars("iscclosure"),
                 ["__KEY_ISL__"] = LuaChars("islclosure"),
@@ -500,7 +514,6 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__KEY_INSTANCE__"] = LuaChars("Instance"),
                 ["__KEY_VECTOR3__"] = LuaChars("Vector3"),
                 ["__KEY_TASK__"] = LuaChars("task"),
-                ["__KEY_GETHOOK__"] = LuaChars("gethook"),
                 ["__KEY_GETINFO__"] = LuaChars("getinfo"),
                 ["__KEY_INFO__"] = LuaChars("info"),
                 ["__KEY_GETCONSTANTS__"] = LuaChars("getconstants"),
@@ -509,7 +522,8 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__KEY_GETPROTOS__"] = LuaChars("getprotos"),
                 ["__KEY_SETUPVALUE__"] = LuaChars("setupvalue"),
                 ["__VALUE_PLAYERS__"] = LuaChars("Players"),
-                ["__VALUE_VECTOR3__"] = LuaChars("Vector3")
+                ["__VALUE_VECTOR3__"] = LuaChars("Vector3"),
+                ["__VALUE_INVALID_CHUNK__"] = LuaChars(RN(10, 16))
             };
             foreach (KeyValuePair<string, string> replacement in replacements)
                 guard = guard.Replace(replacement.Key, replacement.Value);
