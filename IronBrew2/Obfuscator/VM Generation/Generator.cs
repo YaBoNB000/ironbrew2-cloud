@@ -682,7 +682,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetInfo","GuardInfo","GuardInspector",
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardEnvironmentRead","GuardGetGenV",
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
-				"GuardEpoch","GuardState","GuardSeal","GuardTripped","GuardLuaProbe","GuardProbeValue","GuardFunction",
+				"GuardEpoch","GuardState","GuardSeal","GuardTripped","GuardFaultWord","GuardLuaProbe","GuardProbeValue","GuardFunction",
 				"GuardProbe","Force","GuardScore","GuardHeavy",
 				"GuardCurrentIsC","GuardCurrentIsL","GuardNativeMisses","GuardOK1","GuardOK2","GuardOK3","GuardOK4",
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
@@ -883,6 +883,36 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				}
 			}
 
+			string ApplyBuildDomains(string code)
+			{
+				BuildDomains domains = _context.Domains;
+				var replacements = new Dictionary<string, string>
+				{
+					["__IB2_DOMAIN_INTEGRITY__"] = domains.IntegrityDomain.ToString(),
+					["__IB2_DOMAIN_BLOCK_INTEGRITY__"] = domains.BlockIntegrityDomain.ToString(),
+					["__IB2_DOMAIN_FLOW__"] = domains.FlowDomain.ToString(),
+					["__IB2_DOMAIN_ENVELOPE_INTEGRITY__"] = domains.EnvelopeIntegrityDomain.ToString(),
+					["__IB2_DOMAIN_ENTROPY_DIGEST__"] = domains.EntropyDigestDomain.ToString(),
+					["__IB2_DOMAIN_ENVELOPE_MASK__"] = domains.EnvelopeMaskDomain.ToString(),
+					["__IB2_DOMAIN_CONSTANT_INTEGRITY__"] = domains.ConstantIntegrityDomain.ToString(),
+					["__IB2_DOMAIN_CONSTANT_MASK__"] = domains.ConstantMaskDomain.ToString(),
+					["__IB2_DOMAIN_PROTOTYPE_INTEGRITY__"] = domains.PrototypeIntegrityDomain.ToString(),
+					["__IB2_DOMAIN_OPCODE_PERMUTATION__"] = domains.OpcodePermutationDomain.ToString(),
+					["__IB2_DOMAIN_SCHEMA_PERMUTATION__"] = domains.SchemaPermutationDomain.ToString(),
+					["__IB2_DOMAIN_CONSTANT_TAG_PERMUTATION__"] = domains.ConstantTagPermutationDomain.ToString(),
+					["__IB2_DOMAIN_BLOCK_COLUMN__"] = domains.BlockColumnDomain.ToString(),
+					["__IB2_BLOCK_FIELD_STRIDE__"] = domains.BlockFieldStride.ToString(),
+					["__IB2_FLOW_VERIFIER_MASK__"] = domains.FlowVerifierMask.ToString(),
+					["__IB2_ENTROPY_RECORD_KIND__"] = domains.EntropyRecordKind.ToString(),
+					["__IB2_DATA_RECORD_KIND__"] = domains.DataRecordKind.ToString()
+				};
+				foreach (KeyValuePair<string, string> replacement in replacements)
+					code = code.Replace(replacement.Key, replacement.Value);
+				if (Regex.IsMatch(code, @"__IB2_(?:DOMAIN|BLOCK_FIELD|FLOW_VERIFIER|ENTROPY_RECORD|DATA_RECORD)"))
+					throw new InvalidOperationException("A per-build runtime domain placeholder was not replaced.");
+				return code;
+			}
+
 			string[] payloadRejectKeys = {"PayloadRejectA", "PayloadRejectB", "PayloadRejectC", "PayloadRejectD"};
 			string[] payloadRejectVoidKeys = {"PayloadRejectVoidA", "PayloadRejectVoidB", "PayloadRejectVoidC", "PayloadRejectVoidD"};
 			string[] payloadRejectCodeKeys = {"PayloadRejectCodeA", "PayloadRejectCodeB", "PayloadRejectCodeC", "PayloadRejectCodeD"};
@@ -939,6 +969,35 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				code = code.Replace("OP_B", ScrambleNumber(3));
 				code = code.Replace("OP_C", ScrambleNumber(4));
 				return code;
+			}
+
+			// Handler 语义实现多态：对最常见的 VM register 写回，在不改变
+			// operand 求值顺序的前提下，随机选择直接写回、结果暂存、destination
+			// 提前解析或 destination 延后解析的数据流。它改变的是 handler 的
+			// def-use graph，而不只是套一层无效控制流。
+			int semanticLocalSerial = 0;
+			string ApplySemanticPolymorphism(string code)
+			{
+				const string target = @"Stk\s*\[\s*Inst\s*\[\s*OP_A\s*\]\s*\]";
+				string pattern = @"(?<target>" + target + @")\s*=(?!=)\s*(?<value>[^;]+);";
+				return Regex.Replace(code, pattern, match =>
+				{
+					int variant = r.Next(4);
+					if (variant == 0)
+						return match.Value;
+
+					string value = match.Groups["value"].Value.Trim();
+					string serial = (semanticLocalSerial++).ToString();
+					string result = "_sv" + serial;
+					if (variant == 1)
+						return "local " + result + "=" + value + ";Stk[Inst[OP_A]]=" + result + ";";
+
+					string destination = "_sd" + serial;
+					if (variant == 2)
+						return "local " + destination + "=Inst[OP_A];local " + result + "=" + value + ";Stk[" + destination + "]=" + result + ";";
+
+					return "local " + result + "=" + value + ";local " + destination + "=Inst[OP_A];Stk[" + destination + "]=" + result + ";";
+				});
 			}
 
 			// Handler 结构多态：先用词法 statement splitter 找到安全边界，再从
@@ -1091,15 +1150,15 @@ local ToNumber = tonumber;");
 			ComputeConstants(_context.HeadChunk);
 
 			vm += BuildPayloadRejectRuntime();
-			vm += T(VMStrings.VMP1
+			vm += T(ApplyBuildDomains(VMStrings.VMP1
 				// 环境绑定：注入种子派生代码（读盐 → 跑探针 → Hash 派生 Xs）
 				.Replace("__IB2_SEED__", settings.EnvironmentLock ? _context.Binder.SeedDeriveLua : EnvBinder.PlainSeedLua)
 				.Replace("__IB2_WATERMARK__", EscapeLuaString(settings.Watermark))
-				.Replace("__IB2_OPCODE_COUNT__", virtuals.Count.ToString()));
+				.Replace("__IB2_OPCODE_COUNT__", virtuals.Count.ToString())));
 			
 				// 每个 prototype 根据自身 K1/K2/K3 派生独立字段顺序。
 				// 常量在这里仅按 capsule framing 切片；认证和明文恢复延迟到 block 进入时。
-				vm += T(@"local Schema = DerivePermutation(5, K1, K2, K3, 113);
+				vm += T(ApplyBuildDomains(@"local Schema = DerivePermutation(5, K1, K2, K3, __IB2_DOMAIN_SCHEMA_PERMUTATION__);
 	for StepIndex = 1, 5 do
 	    local Step = Schema[StepIndex];
 	    if (Step == 0) then
@@ -1175,7 +1234,7 @@ local ToNumber = tonumber;");
 	            if Length < 10 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
 	            Functions[Idx - 1] = Sub(ByteString, Pos, Pos + Length - 1);
 	            Pos = Pos + Length;
-	        end;");
+	        end;"));
 
 			if (settings.PreserveLineInfo)
 				vm += T(@"    elseif (Step == 4) then
@@ -1269,7 +1328,7 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState)
     if ComputeBlockIntegrity(Block[3], EntryState, Block[1], Block[2], Block[8], References, ConstCapsules, Block[6], Block[9], K1, K2, K3) ~= Block[7] then
         error('invalid protected payload', 0);
     end;
-    local ConstTags = DerivePermutation(4, K1, K2, K3, 911);
+    local ConstTags = DerivePermutation(4, K1, K2, K3, __IB2_DOMAIN_CONSTANT_TAG_PERMUTATION__);
     local ConstCache = {};
     for ReferenceIndex = 1, #References do
         local Index = References[ReferenceIndex];
@@ -1278,7 +1337,7 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState)
     -- Authenticate first, then split all five length-framed physical pages and
     -- recover their logical descriptor/opcode/A/B/C roles from this block's state.
     ByteString, Pos = Block[3], 1;
-    local ColumnOrder = DeriveBlockPermutation(5, EntryState, K1, K2, K3, 3253);
+    local ColumnOrder = DeriveBlockPermutation(5, EntryState, K1, K2, K3, __IB2_DOMAIN_BLOCK_COLUMN__);
     local Columns = {};
     for PhysicalSlot = 1, 5 do
         if Pos + 3 > #ByteString then error('invalid protected payload', 0); end;
@@ -1442,11 +1501,11 @@ end;";
 					.Replace("__IB2_CACHE_SEQUENTIAL__", "")
 					.Replace("__IB2_INSTRUCTION_LOOKUP__", "local Inst = Chunk[1][Index]; if Inst then return Inst; end; DecodeInstructionBlock(Chunk, Block, EntryState); Inst = Chunk[1][Index]; if not Inst then error('invalid protected payload', 0); end; return Inst;");
 			}
-			vm += T(blockRuntime);
+			vm += T(ApplyBuildDomains(blockRuntime));
 
 			string loopRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2);
 			loopRuntime = loopRuntime.Replace("__IB2_GUARD_CHECK__", settings.AntiDump
-				? "if GuardProbe(false) then Instr, Proto, Args, Vararg, Lupvals, Stk, Flow[4] = nil, nil, nil, nil, nil, nil, nil; return GuardDecoy(); end;"
+				? "GuardProbe(false);"
 				: "");
 			vm += T(loopRuntime);
 
@@ -1481,7 +1540,8 @@ end;";
 
 			string BuildHandler(int opcodeIndex)
 			{
-				string code = ApplyHandlerTemplate(virtuals[opcodeIndex].GetObfuscated(_context));
+				string code = ApplySemanticPolymorphism(virtuals[opcodeIndex].GetObfuscated(_context));
+				code = ApplyHandlerTemplate(code);
 				code = T(code);
 				code = ScrambleOps(code);
 				if (settings.Noise)
@@ -1623,7 +1683,9 @@ end;";
 				for (int nodeIndex = 0; nodeIndex < laneNodes.Count; nodeIndex++)
 				{
 					ContinuationNode node = laneNodes[nodeIndex];
-					string decoded = u32Name + "(" + bitXorName + "(" + dispatchStateName + "," + dispatchStepMaskName + "))";
+					string decoded = settings.AntiDump
+						? u32Name + "(" + bitXorName + "(" + bitXorName + "(" + dispatchStateName + "," + dispatchStepMaskName + ")," + T("GuardFaultWord") + "))"
+						: u32Name + "(" + bitXorName + "(" + dispatchStateName + "," + dispatchStepMaskName + "))";
 					string token = ScrambleUInt(node.Token);
 					string condition;
 					switch (r.Next(3))

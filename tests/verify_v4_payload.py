@@ -12,26 +12,59 @@ import struct
 import sys
 import zlib
 
+from build_domains import BuildDomains, extract_build_domains
+
 MASK32 = 0xFFFFFFFF
 MOD32 = 1 << 32
-INTEGRITY_DOMAIN = 0xA5C31F27
-BLOCK_INTEGRITY_DOMAIN = 0x7F4A7C15
-FLOW_DOMAIN = 0x6D2B79F5
-ENVELOPE_INTEGRITY_DOMAIN = 0xC4D29A6B
-ENTROPY_DIGEST_DOMAIN = 0x91E10DA5
-ENVELOPE_MASK_DOMAIN = 0x3A75C9EF
-CONSTANT_INTEGRITY_DOMAIN = 0xD13C5E79
-CONSTANT_MASK_DOMAIN = 0x4B8F21A3
-PROTOTYPE_INTEGRITY_DOMAIN = 0xE9274D6B
-BLOCK_COLUMN_DOMAIN = 3253
-ENTROPY_KIND = 0xA7
-DATA_KIND = 0x5C
+# Activated from each generated Lua file before its payload is parsed or rebuilt.
+INTEGRITY_DOMAIN = 0
+BLOCK_INTEGRITY_DOMAIN = 0
+FLOW_DOMAIN = 0
+ENVELOPE_INTEGRITY_DOMAIN = 0
+ENTROPY_DIGEST_DOMAIN = 0
+ENVELOPE_MASK_DOMAIN = 0
+CONSTANT_INTEGRITY_DOMAIN = 0
+CONSTANT_MASK_DOMAIN = 0
+PROTOTYPE_INTEGRITY_DOMAIN = 0
+OPCODE_PERMUTATION_DOMAIN = 0
+SCHEMA_DOMAIN = 0
+CONSTANT_TAG_DOMAIN = 0
+BLOCK_COLUMN_DOMAIN = 0
+FLOW_VERIFIER_MASK = 0
+BLOCK_FIELD_STRIDE = 0
+ENTROPY_KIND = 0
+DATA_KIND = 0
 ENTROPY_MIN = 64 * 1024
 ENTROPY_MAX = 96 * 1024
 LCG_MULTIPLIER = 1664525
 LCG_INCREMENT = 1013904223
 LCG_INVERSE = pow(LCG_MULTIPLIER, -1, MOD32)
 POLY31_INVERSE = pow(31, -1, MOD32)
+
+
+def activate_domains(domains: BuildDomains) -> None:
+    global INTEGRITY_DOMAIN, BLOCK_INTEGRITY_DOMAIN, FLOW_DOMAIN
+    global ENVELOPE_INTEGRITY_DOMAIN, ENTROPY_DIGEST_DOMAIN, ENVELOPE_MASK_DOMAIN
+    global CONSTANT_INTEGRITY_DOMAIN, CONSTANT_MASK_DOMAIN, PROTOTYPE_INTEGRITY_DOMAIN
+    global OPCODE_PERMUTATION_DOMAIN, SCHEMA_DOMAIN, CONSTANT_TAG_DOMAIN, BLOCK_COLUMN_DOMAIN
+    global FLOW_VERIFIER_MASK, BLOCK_FIELD_STRIDE, ENTROPY_KIND, DATA_KIND
+    INTEGRITY_DOMAIN = domains.integrity
+    BLOCK_INTEGRITY_DOMAIN = domains.block_integrity
+    FLOW_DOMAIN = domains.flow
+    ENVELOPE_INTEGRITY_DOMAIN = domains.envelope_integrity
+    ENTROPY_DIGEST_DOMAIN = domains.entropy_digest
+    ENVELOPE_MASK_DOMAIN = domains.envelope_mask
+    CONSTANT_INTEGRITY_DOMAIN = domains.constant_integrity
+    CONSTANT_MASK_DOMAIN = domains.constant_mask
+    PROTOTYPE_INTEGRITY_DOMAIN = domains.prototype_integrity
+    OPCODE_PERMUTATION_DOMAIN = domains.opcode_permutation
+    SCHEMA_DOMAIN = domains.schema_permutation
+    CONSTANT_TAG_DOMAIN = domains.constant_tag_permutation
+    BLOCK_COLUMN_DOMAIN = domains.block_column
+    FLOW_VERIFIER_MASK = domains.flow_verifier_mask
+    BLOCK_FIELD_STRIDE = domains.block_field_stride
+    ENTROPY_KIND = domains.entropy_record_kind
+    DATA_KIND = domains.data_record_kind
 
 
 @dataclass(frozen=True)
@@ -97,6 +130,7 @@ class Prototype:
 class PayloadInfo:
     path: Path
     source: str
+    domains: BuildDomains
     literals: list[Literal]
     payload: bytes
     head: int
@@ -327,7 +361,7 @@ def block_field_mask(entry_state: int, pc: int, slot: int, prototype: Prototype)
         + prototype.k1 * 13
         + prototype.k2 * 7
         + prototype.k3
-        + slot * 911
+        + slot * BLOCK_FIELD_STRIDE
     ) & 0xFFFF
 
 
@@ -435,7 +469,7 @@ def flow_key(entry_state: int, from_pc: int, to_pc: int, prototype: Prototype) -
 
 
 def recover_entry_state(verifier: int, block_start: int, prototype: Prototype) -> int:
-    to_pc = block_start ^ 0x5A5A
+    to_pc = block_start ^ FLOW_VERIFIER_MASK
     value = ((verifier - LCG_INCREMENT) * LCG_INVERSE) & MASK32
     constant = (
         block_start * 257
@@ -477,7 +511,7 @@ def validate_capsule(data: bytes, prototype: Prototype, capsule: Capsule) -> Non
     raw = stream_xor(encoded, constant_mask_state(capsule.index, prototype))
     if not raw:
         raise ValueError("empty decoded constant capsule")
-    tags = derive_permutation(4, prototype.k1, prototype.k2, prototype.k3, 911)
+    tags = derive_permutation(4, prototype.k1, prototype.k2, prototype.k3, CONSTANT_TAG_DOMAIN)
     try:
         constant_type = tags.index(raw[0])
     except ValueError as error:
@@ -505,7 +539,7 @@ def parse_prototype(
         raise ValueError("prototype slice authentication mismatch")
 
     cursor = Cursor(data, start + 10, end)
-    schema = derive_permutation(5, k1, k2, k3, 113)
+    schema = derive_permutation(5, k1, k2, k3, SCHEMA_DOMAIN)
     for step in schema:
         if step == 0:
             prototype.parameter_offset = cursor.position
@@ -552,7 +586,7 @@ def parse_prototype(
                 if destinations != sorted(set(destinations)):
                     raise ValueError("invalid ordered successor records")
                 entry_state = recover_entry_state(verifier, start_pc, prototype)
-                if flow_key(entry_state, start_pc, start_pc ^ 0x5A5A, prototype) != verifier:
+                if flow_key(entry_state, start_pc, start_pc ^ FLOW_VERIFIER_MASK, prototype) != verifier:
                     raise ValueError("flow verifier inversion mismatch")
                 prototype.blocks.append(
                     Block(start_pc, count, route, references, verifier, tag, tag_offset, successors,
@@ -621,6 +655,8 @@ def parse_prototype(
 
 def parse_and_verify(path: Path) -> PayloadInfo:
     source = path.read_text("latin1")
+    domains = extract_build_domains(source)
+    activate_domains(domains)
     literals, payload = extract_payload(source)
     head, stored_integrity = struct.unpack_from("<II", payload)
     flags = payload[8]
@@ -724,7 +760,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         raise ValueError(f"entropy records are not high entropy enough: {entropy_score:.4f} bits/byte")
 
     return PayloadInfo(
-        path, source, literals, payload, head, seed, flags, envelope, records, entropy,
+        path, source, domains, literals, payload, head, seed, flags, envelope, records, entropy,
         protected_body, body, root, entropy_length, entropy_digest, nonce,
         data_count, entropy_count, entropy_score
     )
@@ -806,6 +842,7 @@ def patch_u32(data: bytearray, offset: int, value: int) -> None:
 
 
 def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
+    activate_domains(info.domains)
     entropy_records = [record for record in info.records if record.kind == ENTROPY_KIND]
     if len(entropy_records) < 2:
         raise ValueError("not enough entropy records for tamper variants")
@@ -948,6 +985,9 @@ def main() -> int:
         if args.compare:
             other = parse_and_verify(args.compare)
             print(describe(other))
+            if info.domains == other.domains:
+                raise ValueError("independent generations reused the complete build-domain vector")
+            print("PASS independent serializer/runtime domains across generations")
             if info.entropy == other.entropy or info.entropy_digest == other.entropy_digest or info.nonce == other.nonce:
                 raise ValueError("independent generations reused entropy state")
             print("PASS independent entropy across generations")

@@ -9,7 +9,64 @@ import json
 from pathlib import Path
 import re
 
+from build_domains import extract_build_domains
+
 IDENT = r"[A-Za-z_]\w*"
+
+
+def _code_only(source: str) -> str:
+    """Blank Lua strings/comments while preserving offsets and line breaks."""
+    output = list(source)
+
+    def blank(start: int, end: int) -> None:
+        for position in range(start, min(end, len(output))):
+            if output[position] not in "\r\n":
+                output[position] = " "
+
+    def long_bracket(start: int) -> tuple[int, str] | None:
+        match = re.match(r"\[(=*)\[", source[start:])
+        if not match:
+            return None
+        return len(match.group(0)), "]" + match.group(1) + "]"
+
+    index = 0
+    while index < len(source):
+        if source.startswith("--", index):
+            bracket = long_bracket(index + 2)
+            if bracket:
+                opening_length, closing = bracket
+                end = source.find(closing, index + 2 + opening_length)
+                end = len(source) if end < 0 else end + len(closing)
+            else:
+                end = source.find("\n", index + 2)
+                end = len(source) if end < 0 else end
+            blank(index, end)
+            index = end
+            continue
+        bracket = long_bracket(index)
+        if bracket:
+            opening_length, closing = bracket
+            end = source.find(closing, index + opening_length)
+            end = len(source) if end < 0 else end + len(closing)
+            blank(index, end)
+            index = end
+            continue
+        if source[index] not in "'\"":
+            index += 1
+            continue
+        quote = source[index]
+        end = index + 1
+        while end < len(source):
+            if source[end] == "\\":
+                end += 2
+                continue
+            if source[end] == quote:
+                end += 1
+                break
+            end += 1
+        blank(index, end)
+        index = end
+    return "".join(output)
 
 
 def _expect(pattern: str, source: str, message: str, flags: int = 0) -> re.Match[str]:
@@ -41,6 +98,8 @@ def _arithmetic_value(expression: str) -> int:
 def derive_runtime_layout(source: str) -> dict[str, object]:
     if "invalid protected payload" in source:
         raise ValueError("stable protected-payload diagnostic leaked into generated VM")
+    domains = extract_build_domains(source)
+    source = _code_only(source)
 
     # Deserialize begins with three local storage tables and the Chunk table,
     # followed by keyed assignments for Instructions, Functions and Lines.
@@ -71,9 +130,10 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     )
     chunk_map.update({5: int(key_match.group(5)), 6: int(key_match.group(6)), 7: int(key_match.group(7))})
 
-    # The opcode bank assignment is uniquely tied to derivation domain 1777.
+    # The opcode bank assignment is tied to this build's recovered derivation domain.
     opcode = _expect(
-        rf"local\s+({IDENT})\s*=\s*{IDENT}\(\s*(\d+)\s*,[^;]*,\s*1777\);\s*"
+        rf"local\s+({IDENT})\s*=\s*{IDENT}\(\s*(\d+)\s*,[^;]*,\s*"
+        rf"{re.escape(str(domains.opcode_permutation))}\);\s*"
         rf"{re.escape(chunk)}\[(\d+)\]\s*=\s*\1;",
         source,
         "could not recover Chunk opcode-bank slot",
@@ -247,6 +307,20 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     if not re.search(rf"\b{re.escape(flow_name)}\s*\[\s*{flow_map[3]}\s*\]", continuation_init.group(0)):
         raise ValueError("continuation entry mask is not bound to the current Flow state")
 
+    periodic_calls = list(re.finditer(rf"\b({IDENT})\s*\(\s*false\s*\)\s*;", source))
+    if len(periodic_calls) != 1:
+        raise ValueError(f"expected one VM-loop periodic guard probe, found {len(periodic_calls)}")
+    guard_probe = periodic_calls[0].group(1)
+    if periodic_calls[0].start() >= continuation_init.start():
+        raise ValueError("periodic guard probe is not executed before continuation decoding")
+    if not re.search(rf"local\s+function\s+{re.escape(guard_probe)}\s*\(\s*{IDENT}\s*\)", source):
+        raise ValueError("periodic guard call does not resolve to the generated guard probe")
+    if not re.search(
+        rf"(?:\brepeat|\bwhile\s+true\s+do)\s+{re.escape(guard_probe)}\s*\(\s*false\s*\)\s*;",
+        source,
+    ):
+        raise ValueError("periodic guard probe is not fused into the VM execution loop")
+
     continuation_loop = _expect(
         rf"while\s+{re.escape(dispatch_active)}\s+do\s+(.*?)"
         rf"if\s+not\s+{re.escape(dispatch_matched)}\s+then\s+"
@@ -291,8 +365,35 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     if len(lanes) < 3 or len(lanes) > 5 or lanes != set(range(len(lanes))) or len(lane_values) != len(lanes):
         raise ValueError(f"continuation dispatcher does not use one complete 3-5 lane set: {lane_values}")
 
-    decoded_state = (rf"{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
-                     rf"{re.escape(dispatch_state)}\s*,\s*{re.escape(dispatch_step_mask)}\s*\)\s*\)")
+    fault_use = _expect(
+        rf"{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
+        rf"{re.escape(dispatch_xor)}\(\s*{re.escape(dispatch_state)}\s*,\s*"
+        rf"{re.escape(dispatch_step_mask)}\s*\)\s*,\s*({IDENT})\s*\)\s*\)",
+        loop_body,
+        "continuation decoder does not consume a sticky guard fault word",
+    )
+    guard_fault = fault_use.group(1)
+    fault_init = _expect(
+        rf"local\s+{re.escape(guard_fault)}\s*=\s*0\s*;",
+        source,
+        "sticky guard fault word is not initialized to zero",
+    )
+    fault_assignments = [
+        int(match.group(1))
+        for match in re.finditer(rf"\b{re.escape(guard_fault)}\s*=\s*(\d+)\s*;", source)
+    ]
+    if len(fault_assignments) != 2 or fault_assignments[0] != 0 or fault_assignments[1] == 0:
+        raise ValueError(f"sticky guard fault word assignments are invalid: {fault_assignments}")
+    if fault_init.start() >= periodic_calls[0].start():
+        raise ValueError("sticky guard fault word is declared after periodic probing")
+    if re.search(rf"\b{re.escape(guard_fault)}\b", selector):
+        raise ValueError("sticky guard fault word leaked into continuation token encoding")
+
+    decoded_state = (
+        rf"{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
+        rf"{re.escape(dispatch_xor)}\(\s*{re.escape(dispatch_state)}\s*,\s*"
+        rf"{re.escape(dispatch_step_mask)}\s*\)\s*,\s*{re.escape(guard_fault)}\s*\)\s*\)"
+    )
     node_header = (
         rf"(?:if|elseif)\s+(?:not\s*\(\s*)?{decoded_state}\s*(?:==|~=|<=)\s*{arithmetic}"
         rf"[^;]*?then\s+{re.escape(dispatch_matched)}\s*=\s*true;"
@@ -301,6 +402,10 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     node_tokens = [_arithmetic_value(match.group(1)) for match in node_matches]
     if len(node_tokens) != len(set(node_tokens)):
         raise ValueError("continuation state tokens are not unique")
+    fault_decode_uses = len(re.findall(decoded_state, loop_body))
+    fault_identifier_uses = len(re.findall(rf"\b{re.escape(guard_fault)}\b", loop_body))
+    if fault_identifier_uses != fault_decode_uses or not len(node_tokens) <= fault_decode_uses <= 2 * len(node_tokens):
+        raise ValueError("sticky guard fault word is used outside continuation decode comparisons")
 
     node_lanes: dict[int, int] = {}
     for lane_index, lane_match in enumerate(lane_matches):
@@ -401,10 +506,13 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         "nodes": len(node_tokens),
         "transitions": len(transitions),
         "terminals": terminal_count,
+        "periodic_guard_probe": guard_probe,
+        "sticky_fault_word": guard_fault,
         "fingerprint": hashlib.sha256(graph_material.encode("ascii")).hexdigest()[:16],
     }
 
     return {
+        "domains": domains.as_dict(),
         "chunk": chunk_map,
         "block": block_map_slots,
         "flow": flow_map,

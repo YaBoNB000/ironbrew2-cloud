@@ -53,10 +53,15 @@ namespace IronBrew2.Obfuscator
 
 		// 环境绑定器：生成盐、attestation token 和 VM 端种子派生代码
 		public EnvBinder Binder;
+
+		// Serializer/runtime 共享的每 Build domain、record kind 与 permutation salt。
+		// 它们不是秘密，但会让旧 Build 的固定解析坐标无法直接复用。
+		public BuildDomains Domains;
 		
 		public ObfuscationContext(Chunk chunk, ObfuscationSettings settings)
 		{
 			HeadChunk = chunk;
+			Domains = new BuildDomains();
 			
 			InstructionSteps1 = Enumerable.Range(0, (int) InstructionStep1.StepCount).Select(i => (InstructionStep1) i).ToArray();
 			InstructionSteps1.Shuffle();

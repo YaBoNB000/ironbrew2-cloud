@@ -20,18 +20,6 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private const int MaxBlockInstructions = DispatcherFlatteningPlanner.MaxBlockInstructions;
 		private const int EntropyMinBytes = 64 * 1024;
 		private const int EntropyMaxBytes = 96 * 1024;
-		private const byte EntropyRecordKind = 0xA7;
-		private const byte DataRecordKind = 0x5C;
-		private const uint IntegrityDomain = 0xA5C31F27u;
-		private const uint BlockIntegrityDomain = 0x7F4A7C15u;
-		private const uint FlowDomain = 0x6D2B79F5u;
-		private const uint EnvelopeIntegrityDomain = 0xC4D29A6Bu;
-		private const uint EntropyDigestDomain = 0x91E10DA5u;
-		private const uint EnvelopeMaskDomain = 0x3A75C9EFu;
-		private const uint ConstantIntegrityDomain = 0xD13C5E79u;
-		private const uint ConstantMaskDomain = 0x4B8F21A3u;
-		private const uint PrototypeIntegrityDomain = 0xE9274D6Bu;
-		private const uint BlockColumnDomain = 3253u;
 
 		private sealed class EntropyRecord
 		{
@@ -88,15 +76,15 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return output.ToArray();
 		}
 
-		private static uint ComputeIntegrity(byte[] encrypted, uint seed, byte flags)
+		private uint ComputeIntegrity(byte[] encrypted, uint seed, byte flags)
 		{
-			uint hash = unchecked((seed ^ IntegrityDomain) * 31u + flags);
+			uint hash = unchecked((seed ^ _context.Domains.IntegrityDomain) * 31u + flags);
 			foreach (byte value in encrypted)
 				hash = unchecked(hash * 31u + value);
 			return hash;
 		}
 
-		private static byte[] WrapEntropyEnvelope(byte[] payload, uint seed)
+		private byte[] WrapEntropyEnvelope(byte[] payload, uint seed)
 		{
 			if (payload == null || payload.Length == 0)
 				throw new InvalidOperationException("Cannot envelope an empty protected payload.");
@@ -109,7 +97,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			List<byte[]> dataParts = SplitRandom(payload, RandomNumberGenerator.GetInt32(4, 9));
 			uint entropyDigest = ComputeEntropyDigest(entropyParts, seed, nonce, entropyLength);
 
-			uint maskState = seed ^ nonce ^ entropyDigest ^ EnvelopeMaskDomain ^ (uint)payload.Length;
+			uint maskState = seed ^ nonce ^ entropyDigest ^ _context.Domains.EnvelopeMaskDomain ^ (uint)payload.Length;
 			byte[] maskedPayload = new byte[payload.Length];
 			for (int index = 0; index < payload.Length; index++)
 			{
@@ -120,9 +108,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 			var records = new List<EntropyRecord>(entropyParts.Count + dataParts.Count);
 			for (int index = 0; index < entropyParts.Count; index++)
-				records.Add(new EntropyRecord {Kind = EntropyRecordKind, Ordinal = (ushort)(index + 1), Data = entropyParts[index]});
+				records.Add(new EntropyRecord {Kind = _context.Domains.EntropyRecordKind, Ordinal = (ushort)(index + 1), Data = entropyParts[index]});
 			for (int index = 0; index < dataParts.Count; index++)
-				records.Add(new EntropyRecord {Kind = DataRecordKind, Ordinal = (ushort)(index + 1), Data = dataParts[index]});
+				records.Add(new EntropyRecord {Kind = _context.Domains.DataRecordKind, Ordinal = (ushort)(index + 1), Data = dataParts[index]});
 			ShuffleEntropyRecords(records);
 
 			// 8 x u32 fields. The final field is patched with a keyed envelope tag.
@@ -185,9 +173,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return result;
 		}
 
-		private static uint ComputeEntropyDigest(IReadOnlyList<byte[]> records, uint seed, uint nonce, int totalLength)
+		private uint ComputeEntropyDigest(IReadOnlyList<byte[]> records, uint seed, uint nonce, int totalLength)
 		{
-			uint hash = unchecked((seed ^ EntropyDigestDomain) * 31u + nonce);
+			uint hash = unchecked((seed ^ _context.Domains.EntropyDigestDomain) * 31u + nonce);
 			hash = unchecked(hash * 31u + (uint)totalLength);
 			hash = unchecked(hash * 31u + (uint)records.Count);
 			for (int index = 0; index < records.Count; index++)
@@ -201,9 +189,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return hash;
 		}
 
-		private static uint ComputeEnvelopeIntegrity(byte[] envelope, uint seed)
+		private uint ComputeEnvelopeIntegrity(byte[] envelope, uint seed)
 		{
-			uint hash = unchecked((seed ^ EnvelopeIntegrityDomain) * 31u);
+			uint hash = unchecked((seed ^ _context.Domains.EnvelopeIntegrityDomain) * 31u);
 			for (int index = 0; index < envelope.Length; index++)
 			{
 				// Bytes 28..31 hold the tag itself and are intentionally omitted.
@@ -255,29 +243,29 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return state;
 		}
 
-		private static uint InitialFlowKey(ushort k1, ushort k2, ushort k3, uint binding)
+		private uint InitialFlowKey(ushort k1, ushort k2, ushort k3, uint binding)
 		{
-			uint value = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3 + FlowDomain + binding);
+			uint value = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3 + _context.Domains.FlowDomain + binding);
 			return unchecked(value * 1664525u + 1013904223u);
 		}
 
-		private static uint FlowKey(uint entryState, int fromPc, int toPc, ushort k1, ushort k2, ushort k3, uint binding)
+		private uint FlowKey(uint entryState, int fromPc, int toPc, ushort k1, ushort k2, ushort k3, uint binding)
 		{
 			uint value = unchecked(entryState * 1664525u + (uint)fromPc * 257u +
 			                       (uint)toPc * 65537u + (uint)k1 * 251u +
-			                       (uint)k2 * 17u + k3 + FlowDomain + binding);
+			                       (uint)k2 * 17u + k3 + _context.Domains.FlowDomain + binding);
 			return unchecked(value * 1664525u + 1013904223u);
 		}
 
-		private static uint FlowVerifier(uint entryState, int blockStart, ushort k1, ushort k2, ushort k3, uint binding) =>
-			FlowKey(entryState, blockStart, blockStart ^ 0x5A5A, k1, k2, k3, binding);
+		private uint FlowVerifier(uint entryState, int blockStart, ushort k1, ushort k2, ushort k3, uint binding) =>
+			FlowKey(entryState, blockStart, blockStart ^ _context.Domains.FlowVerifierMask, k1, k2, k3, binding);
 
-		private static ushort BlockFieldMask(uint entryState, int pc, int slot, ushort k1, ushort k2, ushort k3)
+		private ushort BlockFieldMask(uint entryState, int pc, int slot, ushort k1, ushort k2, ushort k3)
 		{
 			uint low = entryState & 0xFFFFu;
 			uint high = entryState >> 16;
 			return (ushort)((low * (uint)((pc + slot * 29) % 251 + 1) + high * 17u +
-			                 (uint)k1 * 13u + (uint)k2 * 7u + k3 + (uint)slot * 911u) & 0xFFFFu);
+			                 (uint)k1 * 13u + (uint)k2 * 7u + k3 + (uint)slot * _context.Domains.BlockFieldStride) & 0xFFFFu);
 		}
 
 		private static uint HashWord(uint hash, uint value) => unchecked(hash * 31u + value);
@@ -289,28 +277,28 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return hash;
 		}
 
-		private static uint ConstantMaskState(int oneBasedIndex, ushort k1, ushort k2, ushort k3)
+		private uint ConstantMaskState(int oneBasedIndex, ushort k1, ushort k2, ushort k3)
 		{
 			uint value = unchecked((uint)oneBasedIndex * 65537u + (uint)k1 * 257u +
-			                       (uint)k2 * 17u + k3 + ConstantMaskDomain);
+			                       (uint)k2 * 17u + k3 + _context.Domains.ConstantMaskDomain);
 			return unchecked(value * 1664525u + 1013904223u);
 		}
 
-		private static uint ComputeConstantIntegrity(byte[] encodedBody, int oneBasedIndex,
+		private uint ComputeConstantIntegrity(byte[] encodedBody, int oneBasedIndex,
 			ushort k1, ushort k2, ushort k3)
 		{
 			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
-			uint hash = HashWord(keyed ^ ConstantIntegrityDomain, (uint)oneBasedIndex);
+			uint hash = HashWord(keyed ^ _context.Domains.ConstantIntegrityDomain, (uint)oneBasedIndex);
 			hash = HashWord(hash, (uint)encodedBody.Length);
 			return HashBytes(hash, encodedBody);
 		}
 
-		private static uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
+		private uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
 			uint routeToken, IReadOnlyList<int> constantReferences, IReadOnlyList<byte[]> constantCapsules,
 			uint verifier, IReadOnlyList<KeyValuePair<int, uint>> successors, ushort k1, ushort k2, ushort k3,
 			uint binding)
 		{
-			uint hash = HashWord(entryState ^ BlockIntegrityDomain ^ binding, (uint)start);
+			uint hash = HashWord(entryState ^ _context.Domains.BlockIntegrityDomain ^ binding, (uint)start);
 			hash = HashWord(hash, (uint)count);
 			hash = HashWord(hash, k1);
 			hash = HashWord(hash, k2);
@@ -337,10 +325,10 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return HashBytes(hash, body);
 		}
 
-		private static uint ComputePrototypeIntegrity(byte[] body, ushort k1, ushort k2, ushort k3)
+		private uint ComputePrototypeIntegrity(byte[] body, ushort k1, ushort k2, ushort k3)
 		{
 			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
-			uint hash = HashWord(keyed ^ PrototypeIntegrityDomain, (uint)body.Length);
+			uint hash = HashWord(keyed ^ _context.Domains.PrototypeIntegrityDomain, (uint)body.Length);
 			for (int index = 0; index < body.Length; index++)
 			{
 				// Bytes 6..9 contain this prototype's own tag.
@@ -451,7 +439,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 			// Bank[local index] = canonical VIndex. The serialized opcode is the inverse
 			// lookup, so each prototype keeps a different opcode numbering until dispatch.
-			int[] opcodeBank = DerivePermutation(_context.VirtualOpcodeCount, k1, k2, k3, 1777u);
+			int[] opcodeBank = DerivePermutation(_context.VirtualOpcodeCount, k1, k2, k3, _context.Domains.OpcodePermutationDomain);
 			int[] opcodeToLocal = new int[opcodeBank.Length];
 			for (int localIndex = 0; localIndex < opcodeBank.Length; localIndex++)
 				opcodeToLocal[opcodeBank[localIndex]] = localIndex;
@@ -591,8 +579,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 			// Schema 与常量 tag 都由当前 prototype 的独立 keys 派生，并使用不同 domain。
 			// 因此父子 prototype 不再共享一个全局 ChunkSteps 或简单 tag rotation。
-			int[] schema = DerivePermutation((int)ChunkStep.StepCount, k1, k2, k3, 113u);
-			int[] constantTags = DerivePermutation(4, k1, k2, k3, 911u);
+			int[] schema = DerivePermutation((int)ChunkStep.StepCount, k1, k2, k3, _context.Domains.SchemaPermutationDomain);
+			int[] constantTags = DerivePermutation(4, k1, k2, k3, _context.Domains.ConstantTagPermutationDomain);
 
 			byte[] BuildConstantCapsule(Constant constant, int constantIndex)
 			{
@@ -678,7 +666,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							// page order is derived from this block's state plus prototype keys, so the
 							// decoder must recover a different descriptor/opcode/A/B/C role mapping per block.
 							var blockBody = new List<byte>();
-							int[] columnOrder = DeriveBlockPermutation(5, entryState, k1, k2, k3, BlockColumnDomain);
+							int[] columnOrder = DeriveBlockPermutation(5, entryState, k1, k2, k3, _context.Domains.BlockColumnDomain);
 							foreach (int logicalColumn in columnOrder)
 							{
 								WriteUInt32(blockBody, (uint)columns[logicalColumn].Count);

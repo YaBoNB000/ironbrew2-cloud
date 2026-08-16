@@ -173,7 +173,7 @@ __IB2_SEED__
 local OuterSeed = Xs;
 
 -- 在解密前验证整个密文；随后 envelope 再独立认证 record framing 与物理顺序。
-local PayloadHash = (BitXOR(Xs, 2781028135) * 31 + PayloadFlags) % 4294967296;
+local PayloadHash = (BitXOR(Xs, __IB2_DOMAIN_INTEGRITY__) * 31 + PayloadFlags) % 4294967296;
 for PayloadIndex = 10, #ByteString do
 	PayloadHash = (PayloadHash * 31 + Byte(ByteString, PayloadIndex, PayloadIndex)) % 4294967296;
 end;
@@ -216,7 +216,7 @@ or EnvelopeEntropyCount < 8 or EnvelopeEntropyCount > 64
 or EnvelopeRecordCount ~= EnvelopeDataCount + EnvelopeEntropyCount
 or EnvelopeNonce == 0 or EnvelopeExpected ~= #ByteString then error('invalid protected payload', 0); end;
 
-local EnvelopeHash = (BitXOR(OuterSeed, 3302136427) * 31) % 4294967296;
+local EnvelopeHash = (BitXOR(OuterSeed, __IB2_DOMAIN_ENVELOPE_INTEGRITY__) * 31) % 4294967296;
 for EnvelopeIndex = 1, #ByteString do
 	if EnvelopeIndex < 29 or EnvelopeIndex > 32 then
 		EnvelopeHash = (EnvelopeHash * 31 + Byte(ByteString, EnvelopeIndex, EnvelopeIndex)) % 4294967296;
@@ -241,11 +241,11 @@ for EnvelopeIndex = 1, EnvelopeRecordCount do
 	if EnvelopeLength < 1 or EnvelopePos + EnvelopeLength - 1 > #ByteString then error('invalid protected payload', 0); end;
 	local EnvelopeRecord = Sub(ByteString, EnvelopePos, EnvelopePos + EnvelopeLength - 1);
 	EnvelopePos = EnvelopePos + EnvelopeLength;
-	if EnvelopeKind == 92 then
+	if EnvelopeKind == __IB2_DATA_RECORD_KIND__ then
 		if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeDataCount or EnvelopeDataRecords[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
 		EnvelopeDataRecords[EnvelopeOrdinal] = EnvelopeRecord;
 		EnvelopeDataLength = EnvelopeDataLength + EnvelopeLength;
-	elseif EnvelopeKind == 167 then
+	elseif EnvelopeKind == __IB2_ENTROPY_RECORD_KIND__ then
 		if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeEntropyCount or EnvelopeEntropyRecords[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
 		EnvelopeEntropyRecords[EnvelopeOrdinal] = EnvelopeRecord;
 		EnvelopeEntropySeenLength = EnvelopeEntropySeenLength + EnvelopeLength;
@@ -258,7 +258,7 @@ or EnvelopeEntropySeenLength ~= EnvelopeEntropyLength then error('invalid protec
 
 -- Digest entropy in logical ordinal order. Every entropy byte contributes to
 -- the state that masks the real stream, even when its record appears later.
-local EntropyHash = (BitXOR(OuterSeed, 2447445413) * 31 + EnvelopeNonce) % 4294967296;
+local EntropyHash = (BitXOR(OuterSeed, __IB2_DOMAIN_ENTROPY_DIGEST__) * 31 + EnvelopeNonce) % 4294967296;
 EntropyHash = (EntropyHash * 31 + EnvelopeEntropyLength) % 4294967296;
 EntropyHash = (EntropyHash * 31 + EnvelopeEntropyCount) % 4294967296;
 for EnvelopeIndex = 1, EnvelopeEntropyCount do
@@ -272,7 +272,7 @@ for EnvelopeIndex = 1, EnvelopeEntropyCount do
 end;
 if EntropyHash ~= EnvelopeDigest then error('invalid protected payload', 0); end;
 
-local EnvelopeState = BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), 980797935), EnvelopeRealLength) % 4294967296;
+local EnvelopeState = BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), __IB2_DOMAIN_ENVELOPE_MASK__), EnvelopeRealLength) % 4294967296;
 local EnvelopeBody = {};
 local EnvelopeBodyIndex = 0;
 for EnvelopeIndex = 1, EnvelopeDataCount do
@@ -370,25 +370,25 @@ local function FieldKey32(I, Slot, K1, K2, K3)
 end;
 
 local function InitialFlowKey(K1, K2, K3)
-    local Value = (K1 * 65537 + K2 * 257 + K3 + 1831565813 + OuterSeed) % 4294967296;
+    local Value = (K1 * 65537 + K2 * 257 + K3 + __IB2_DOMAIN_FLOW__ + OuterSeed) % 4294967296;
     return (Value * 1664525 + 1013904223) % 4294967296;
 end;
 
 local function FlowKey(EntryState, FromPC, ToPC, K1, K2, K3)
     local Value = (EntryState * 1664525 + FromPC * 257 + ToPC * 65537
-        + K1 * 251 + K2 * 17 + K3 + 1831565813 + OuterSeed) % 4294967296;
+        + K1 * 251 + K2 * 17 + K3 + __IB2_DOMAIN_FLOW__ + OuterSeed) % 4294967296;
     return (Value * 1664525 + 1013904223) % 4294967296;
 end;
 
 local function FlowVerifier(EntryState, BlockStart, K1, K2, K3)
-    return FlowKey(EntryState, BlockStart, BitXOR(BlockStart, 23130), K1, K2, K3);
+    return FlowKey(EntryState, BlockStart, BitXOR(BlockStart, __IB2_FLOW_VERIFIER_MASK__), K1, K2, K3);
 end;
 
 local function BlockFieldKey(EntryState, I, Slot, K1, K2, K3)
     local Low = EntryState % 65536;
     local High = (EntryState - Low) / 65536;
     return (Low * (((I + Slot * 29) % 251) + 1) + High * 17
-        + K1 * 13 + K2 * 7 + K3 + Slot * 911) % 65536;
+        + K1 * 13 + K2 * 7 + K3 + Slot * __IB2_BLOCK_FIELD_STRIDE__) % 65536;
 end;
 
 local function BlockFieldKey32(EntryState, I, Slot, K1, K2, K3)
@@ -397,13 +397,13 @@ local function BlockFieldKey32(EntryState, I, Slot, K1, K2, K3)
 end;
 
 local function ConstantMaskState(Index, K1, K2, K3)
-    local Value = (Index * 65537 + K1 * 257 + K2 * 17 + K3 + 1267671459) % 4294967296;
+    local Value = (Index * 65537 + K1 * 257 + K2 * 17 + K3 + __IB2_DOMAIN_CONSTANT_MASK__) % 4294967296;
     return (Value * 1664525 + 1013904223) % 4294967296;
 end;
 
 local function ComputeConstantIntegrity(EncodedBody, Index, K1, K2, K3)
     local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
-    local Hash = (BitXOR(Keyed, 3510394489) * 31 + Index) % 4294967296;
+    local Hash = (BitXOR(Keyed, __IB2_DOMAIN_CONSTANT_INTEGRITY__) * 31 + Index) % 4294967296;
     Hash = (Hash * 31 + #EncodedBody) % 4294967296;
     for I = 1, #EncodedBody do Hash = (Hash * 31 + Byte(EncodedBody, I, I)) % 4294967296; end;
     return Hash;
@@ -411,7 +411,7 @@ end;
 
 local function ComputePrototypeIntegrity(Body, K1, K2, K3)
     local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
-    local Hash = (BitXOR(Keyed, 3911667051) * 31 + #Body) % 4294967296;
+    local Hash = (BitXOR(Keyed, __IB2_DOMAIN_PROTOTYPE_INTEGRITY__) * 31 + #Body) % 4294967296;
     for I = 1, #Body do
         if I < 7 or I > 10 then Hash = (Hash * 31 + Byte(Body, I, I)) % 4294967296; end;
     end;
@@ -419,7 +419,7 @@ local function ComputePrototypeIntegrity(Body, K1, K2, K3)
 end;
 
 local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteToken, References, ConstCapsules, Verifier, SuccessorRecords, K1, K2, K3)
-    local Hash = (BitXOR(BitXOR(EntryState, 2135587861), OuterSeed) * 31 + BlockStart) % 4294967296;
+    local Hash = (BitXOR(BitXOR(EntryState, __IB2_DOMAIN_BLOCK_INTEGRITY__), OuterSeed) * 31 + BlockStart) % 4294967296;
     Hash = (Hash * 31 + Count) % 4294967296;
     Hash = (Hash * 31 + K1) % 4294967296;
     Hash = (Hash * 31 + K2) % 4294967296;
@@ -497,7 +497,7 @@ local function Deserialize()
     local PrototypeTag = gBits32();
     if ComputePrototypeIntegrity(ByteString, K1, K2, K3) ~= PrototypeTag then error('invalid protected payload', 0); end;
     Chunk[5], Chunk[6], Chunk[7] = K1, K2, K3;
-    local OpcodeBank = DerivePermutation(__IB2_OPCODE_COUNT__, K1, K2, K3, 1777);
+    local OpcodeBank = DerivePermutation(__IB2_OPCODE_COUNT__, K1, K2, K3, __IB2_DOMAIN_OPCODE_PERMUTATION__);
     Chunk[8] = OpcodeBank;
     local ConstCapsules = {};
     Chunk[15] = ConstCapsules;

@@ -151,6 +151,8 @@ local function GuardDecoy(...)
                      })
                 transcriptExpected = MixWord(transcriptExpected, value);
             uint attestationOffset = unchecked(attestationToken - transcriptExpected);
+            uint faultWord = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(sizeof(uint)), 0);
+            if (faultWord == 0) faultWord = 0xC2B2AE35u;
 
             string guard = @"
 local GuardString = string;
@@ -216,6 +218,7 @@ local GuardSeal = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 
 local GuardTripped = false;
 local GuardAttested = false;
 local GuardReportOnly = __IB2_REPORT_ONLY__;
+local GuardFaultWord = 0;
 local GuardUpvalue = __IB2_UPVALUE_EXPECTED__;
 
 local function GuardReject()
@@ -224,6 +227,10 @@ local function GuardReject()
         GuardAttestation = __IB2_ATTESTATION_TOKEN__;
         return false;
     end;
+    -- Periodic failures do not require a dedicated visible branch.  The sticky
+    -- word is consumed by the normal opcode continuation decoder, so a failed
+    -- environment contract corrupts its next authenticated state transition.
+    GuardFaultWord = __IB2_FAULT_WORD__;
     GuardAttestation = 0;
     return true;
 end;
@@ -498,6 +505,7 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__IB2_TRANSCRIPT_EXPECTED__"] = transcriptExpected.ToString(),
                 ["__IB2_ATTESTATION_OFFSET__"] = attestationOffset.ToString(),
                 ["__IB2_ATTESTATION_TOKEN__"] = attestationToken.ToString(),
+                ["__IB2_FAULT_WORD__"] = faultWord.ToString(),
                 ["__IB2_REPORT_ONLY__"] = TemporaryGlobalSinkBypass ? "true" : "false",
                 ["__IB2_DECOY_GRAPH__"] = BuildDecoyGraph(decoySeed),
                 ["__KEY_GETGENV__"] = LuaChars("getgenv"),
