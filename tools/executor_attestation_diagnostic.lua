@@ -97,9 +97,24 @@ record("environment.current-table", envOK and value_type(ThreadEnvironment) == "
     "expected table, got " .. value_type(ThreadEnvironment))
 if value_type(ThreadEnvironment) ~= "table" then ThreadEnvironment = nil end
 
-local GetGenV0 = ThreadEnvironment and RawGet0(ThreadEnvironment, "getgenv")
-record("environment.getgenv-raw-function", is_function(GetGenV0),
-    "getgenv must be a raw function in the current environment; got " .. value_type(GetGenV0))
+-- Executor globals may be supplied through the thread environment's __index
+-- chain. sUNC requires getgenv behavior; it does not require getgenv itself to
+-- be a raw key of getfenv(). Prefer raw values, then use a protected ordinary
+-- lookup so proxy-backed environments are diagnosed without weakening the
+-- later cross-API behavior challenges.
+local function environment_read(environment, key)
+    if value_type(environment) ~= "table" then return false, nil, "environment is not a table" end
+    local rawValue = RawGet0(environment, key)
+    if rawValue ~= nil then return true, rawValue, "raw" end
+    local ok, indexedValue = PCall0(function() return environment[key] end)
+    if not ok then return false, nil, indexedValue end
+    return true, indexedValue, "indexed"
+end
+
+local getGenReadOK, GetGenV0 = environment_read(ThreadEnvironment, "getgenv")
+record("environment.getgenv-lookup", getGenReadOK, "protected environment lookup raised")
+record("environment.getgenv-function", is_function(GetGenV0),
+    "getgenv must resolve to a function; got " .. value_type(GetGenV0))
 
 local capOK, ExecutorEnvironment = false, nil
 if is_function(GetGenV0) then capOK, ExecutorEnvironment = PCall0(GetGenV0) end
@@ -109,8 +124,8 @@ record("environment.getgenv-table", capOK and value_type(ExecutorEnvironment) ==
 if value_type(ExecutorEnvironment) ~= "table" then ExecutorEnvironment = nil end
 
 local function lookup(name)
-    local value = ExecutorEnvironment and RawGet0(ExecutorEnvironment, name)
-    if value == nil and ThreadEnvironment then value = RawGet0(ThreadEnvironment, name) end
+    local _, value = environment_read(ExecutorEnvironment, name)
+    if value == nil then _, value = environment_read(ThreadEnvironment, name) end
     return value
 end
 
@@ -569,7 +584,8 @@ stable("member.unpack", unpack, UnpackGlobal0)
 stable("member.table.unpack", Table0 and Table0.unpack, TableUnpack0)
 stable("member.selected-unpack", unpack or (table and table.unpack), Unpack0)
 
-stable("api.getgenv", ThreadEnvironment and RawGet0(ThreadEnvironment, "getgenv"), GetGenV0)
+local _, CurrentGetGenV = environment_read(ThreadEnvironment, "getgenv")
+stable("api.getgenv", CurrentGetGenV, GetGenV0)
 stable("api.identifyexecutor", lookup("identifyexecutor"), Identify0)
 stable("api.checkcaller", lookup("checkcaller"), CheckCaller0)
 stable("api.iscclosure", lookup("iscclosure"), IsC0)
