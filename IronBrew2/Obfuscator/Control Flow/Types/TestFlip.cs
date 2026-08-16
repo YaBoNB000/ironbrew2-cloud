@@ -9,12 +9,13 @@ namespace IronBrew2.Obfuscator.Control_Flow.Types
 {
 	public static class TestFlip
 	{
-		public static void DoInstructions(Chunk chunk, List<Instruction> instructions)
+		public static void DoInstructions(Chunk chunk, List<Instruction> instructions, Random random)
 		{
 			instructions = instructions.ToList();
 			
-			CFGenerator generator = new CFGenerator();
-			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
+			if (random == null) throw new ArgumentNullException(nameof(random));
+			CFGenerator generator = new CFGenerator(random);
+			Random r = random;
 
 			for (int idx = instructions.Count - 1; idx >= 0; idx--)
 			{

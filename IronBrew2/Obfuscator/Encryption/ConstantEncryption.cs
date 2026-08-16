@@ -13,6 +13,7 @@ namespace IronBrew2.Obfuscator.Encryption
 		public int SLen = 0;
 		
 		public string Name;
+		private readonly BuildRandom _random;
 
 		private static string BuildXorFn()
 		{
@@ -26,7 +27,7 @@ namespace IronBrew2.Obfuscator.Encryption
 
 		public string Encrypt(byte[] bytes)
 		{
-			Random rnd = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
+			BuildRandom rnd = _random;
 			int variant = rnd.Next(0, 3);
 			List<byte> encrypted = new List<byte>();
 
@@ -112,12 +113,11 @@ namespace IronBrew2.Obfuscator.Encryption
 			}
 		}
 
-		public Decryptor(string name, int maxLen)
+		public Decryptor(string name, int maxLen, BuildRandom random)
 		{
-			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
-
+			_random = random ?? throw new ArgumentNullException(nameof(random));
 			Name = name;
-			Table = Enumerable.Repeat(0, maxLen).Select(i => r.Next(0, 256)).ToArray();
+			Table = Enumerable.Repeat(0, maxLen).Select(i => _random.Next(0, 256)).ToArray();
 		}
 	}
 	
@@ -125,6 +125,7 @@ namespace IronBrew2.Obfuscator.Encryption
 	{
 		private string _src;
 		private ObfuscationSettings _settings;
+		private readonly BuildRandom _random;
 		private Encoding _fuckingLua = Encoding.GetEncoding(28591);
 
 		public Decryptor GenerateGenericDecryptor(MatchCollection matches)
@@ -141,7 +142,7 @@ namespace IronBrew2.Obfuscator.Encryption
 			if (len > _settings.DecryptTableLen)
 				len = _settings.DecryptTableLen;
 			
-			return new Decryptor("IRONBREW_STR_DEC_GENERIC", len);
+			return new Decryptor("IRONBREW_STR_DEC_GENERIC", len, _random);
 		}
 
 		public static byte[] UnescapeLuaString(string str)
@@ -266,7 +267,7 @@ namespace IronBrew2.Obfuscator.Encryption
 						continue;
 
 					captured = captured.Substring(13);
-					Decryptor dec = new Decryptor("IRONBREW_STR_ENCRYPT" + n++, m.Length);
+					Decryptor dec = new Decryptor("IRONBREW_STR_ENCRYPT" + n++, m.Length, _random);
 
 					string before = _src.Substring(0, m.Index + indDiff);
 					string after = _src.Substring(m.Index + indDiff + m.Length);
@@ -308,7 +309,7 @@ namespace IronBrew2.Obfuscator.Encryption
 					if (!cont)
 						continue;
 
-					Decryptor dec = new Decryptor("IRONBREW_STR_ENCRYPT_IMPORTANT" + n++, m.Length);
+					Decryptor dec = new Decryptor("IRONBREW_STR_ENCRYPT_IMPORTANT" + n++, m.Length, _random);
 
 					string before = _src.Substring(0, m.Index + indDiff);
 					string after = _src.Substring(m.Index + indDiff + m.Length);
@@ -327,10 +328,11 @@ namespace IronBrew2.Obfuscator.Encryption
 			return _src;
 		}
 
-		public ConstantEncryption(ObfuscationSettings settings, string source)
+		public ConstantEncryption(ObfuscationSettings settings, string source, BuildRandom random)
 		{
 			_settings = settings;
 			_src = source;
+			_random = random ?? throw new ArgumentNullException(nameof(random));
 		}
 	}
 }

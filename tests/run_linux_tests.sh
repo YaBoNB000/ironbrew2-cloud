@@ -34,6 +34,7 @@ cd "$ROOT"
 "$DOTNET" build "IronBrew2 CLI/IronBrew2 CLI.csproj" -c Release --nologo >/dev/null
 CLI="$ROOT/IronBrew2 CLI/bin/Release/net8.0/IronBrew2 CLI.dll"
 "$DOTNET" run --project tests/cfg_regression/cfg_regression.csproj --configuration Debug --nologo
+python3 tests/build_seed_wiring.py
 "$LUA" tests/semantic.lua > "$WORK/baseline.out"
 
 obfuscate() {
@@ -297,6 +298,40 @@ for ((i = 1; i <= RANDOM_RUNS; i++)); do
     run_executor "$WORK/random.lua" > "$WORK/random.out"
     cmp -s "$WORK/baseline.out" "$WORK/random.out"
 done
+python3 - "$WORK" "$RANDOM_RUNS" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+work = Path(sys.argv[1])
+runs = int(sys.argv[2])
+if runs < 5:
+    raise SystemExit("opcode polymorphism comparison requires at least five builds")
+layouts = []
+for index in range(1, runs + 1):
+    line = (work / f"runtime-layout-{index}.out").read_text().strip().splitlines()[-1]
+    marker = "PASS runtime slot ABI "
+    if not line.startswith(marker):
+        raise SystemExit(f"missing runtime layout result for build {index}")
+    layouts.append(json.loads(line[len(marker):]))
+
+counts = [layout["continuation"]["opcodes"] for layout in layouts]
+fingerprints = [layout["continuation"]["fingerprint"] for layout in layouts]
+domain_vectors = [json.dumps(layout["domains"], sort_keys=True) for layout in layouts]
+slot_abis = [json.dumps({key: layout[key] for key in ("chunk", "block", "flow", "flow_cache")}, sort_keys=True)
+             for layout in layouts]
+if min(counts) <= 44:
+    raise SystemExit(f"semantic opcode aliases were not emitted in every build: {counts}")
+if len(set(counts)) < 2:
+    raise SystemExit(f"opcode cardinality did not vary across builds: {counts}")
+if len(set(fingerprints)) != runs:
+    raise SystemExit("a continuation/opcode execution graph was reused across builds")
+if len(set(domain_vectors)) != runs:
+    raise SystemExit("a serializer/runtime domain vector was reused across builds")
+if len(set(slot_abis)) != runs:
+    raise SystemExit("a runtime slot ABI was reused across builds")
+print(f"PASS {runs}-build opcode reuse barrier: counts={sorted(set(counts))}, unique graphs/domains/ABIs={runs}")
+PY
 echo "PASS randomized opcode handlers and non-identity runtime layouts: $RANDOM_RUNS/$RANDOM_RUNS"
 
 # Tamper with v4's invocation-local flow metadata only after the outer payload

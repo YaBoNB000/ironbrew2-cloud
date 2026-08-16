@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 
 namespace IronBrew2.Obfuscator.AntiDump
@@ -18,18 +17,16 @@ namespace IronBrew2.Obfuscator.AntiDump
         // enforcement enabled; a true value must never ship.
         private const bool TemporaryGlobalSinkBypass = false;
 
-        private static readonly Random R = new Random(RandomNumberGenerator.GetInt32(int.MaxValue));
-
-        private static string RN(int min, int max)
+        private static string RN(Random random, int min, int max)
         {
             const string characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-            int length = R.Next(min, max + 1);
+            int length = random.Next(min, max + 1);
             char[] name = new char[length];
-            name[0] = characters[R.Next(characters.Length)];
+            name[0] = characters[random.Next(characters.Length)];
             for (int index = 1; index < length; index++)
-                name[index] = R.Next(2) == 0
-                    ? (char)('0' + R.Next(10))
-                    : characters[R.Next(characters.Length)];
+                name[index] = random.Next(2) == 0
+                    ? (char)('0' + random.Next(10))
+                    : characters[random.Next(characters.Length)];
             return new string(name);
         }
 
@@ -38,12 +35,12 @@ namespace IronBrew2.Obfuscator.AntiDump
         private static string LuaChars(string value) =>
             "Char(" + string.Join(",", Encoding.ASCII.GetBytes(value).Select(item => item.ToString())) + ")";
 
-        private static string BuildDecoyGraph(uint seed)
+        private static string BuildDecoyGraph(uint seed, Random random)
         {
             int stateCount = 6 + (int)(seed % 5);
             var routes = new HashSet<int>();
             while (routes.Count < stateCount)
-                routes.Add(RandomNumberGenerator.GetInt32(100000, int.MaxValue));
+                routes.Add(random.Next(100000, int.MaxValue));
             int[] route = routes.ToArray();
 
             var graph = new StringBuilder();
@@ -76,9 +73,9 @@ local function GuardDecoy(...)
             {
                 string branch = index == 0 ? "        if" : "        elseif";
                 int next = route[(index + 1) % route.Length];
-                int multiplier = 30011 + R.Next(20000);
-                int increment = 257 + R.Next(8000);
-                int rotate = 3 + R.Next(21);
+                int multiplier = 30011 + random.Next(20000);
+                int increment = 257 + random.Next(8000);
+                int rotate = 3 + random.Next(21);
                 graph.Append(branch).Append(" GuardRoute == ").Append(route[index]).Append(" then\n");
                 switch (index % 3)
                 {
@@ -124,8 +121,9 @@ local function GuardDecoy(...)
         /// state graph without printing or throwing a dedicated block message. The
         /// temporary global diagnostic switch changes only that rejection response.
         /// </summary>
-        public static string GenerateRuntimeGuard(int probeInterval, uint decoySeed, uint attestationToken)
+        public static string GenerateRuntimeGuard(int probeInterval, uint decoySeed, uint attestationToken, Random random)
         {
+            if (random == null) throw new ArgumentNullException(nameof(random));
             if (probeInterval < 16)
                 throw new ArgumentOutOfRangeException(nameof(probeInterval));
             if (attestationToken == 0)
@@ -134,15 +132,15 @@ local function GuardDecoy(...)
             int probeJitter = Math.Max(5, probeInterval / 3);
             int heavyPeriod = 3 + (int)(decoySeed % 3);
             uint sealSalt = (decoySeed ^ 0x6E624EB7u) % 2147483647u;
-            uint constantExpected = (uint)RandomNumberGenerator.GetInt32(1000000, 1000000000);
-            uint upvalueExpected = (uint)RandomNumberGenerator.GetInt32(1000000, 1000000000);
-            uint upvalueChanged = (uint)RandomNumberGenerator.GetInt32(1000000, 1000000000);
-            uint protoConstant = (uint)RandomNumberGenerator.GetInt32(1000000, 1000000000);
-            uint protoInput = (uint)RandomNumberGenerator.GetInt32(1000, 100000);
+            uint constantExpected = (uint)random.Next(1000000, 1000000000);
+            uint upvalueExpected = (uint)random.Next(1000000, 1000000000);
+            uint upvalueChanged = (uint)random.Next(1000000, 1000000000);
+            uint protoConstant = (uint)random.Next(1000000, 1000000000);
+            uint protoInput = (uint)random.Next(1000, 100000);
             uint protoExpected = (protoConstant + protoInput) % 2147483647u;
-            uint loadExpected = (uint)RandomNumberGenerator.GetInt32(1000000, 1000000000);
-            uint cInput = (uint)RandomNumberGenerator.GetInt32(1000, 100000);
-            uint transcriptSeed = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
+            uint loadExpected = (uint)random.Next(1000000, 1000000000);
+            uint cInput = (uint)random.Next(1000, 100000);
+            uint transcriptSeed = (uint)random.Next(1, int.MaxValue);
             uint transcriptExpected = transcriptSeed;
             foreach (uint value in new[]
                      {
@@ -151,7 +149,7 @@ local function GuardDecoy(...)
                      })
                 transcriptExpected = MixWord(transcriptExpected, value);
             uint attestationOffset = unchecked(attestationToken - transcriptExpected);
-            uint faultWord = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(sizeof(uint)), 0);
+            uint faultWord = unchecked((uint)random.NextInt64(0, 1L << 32));
             if (faultWord == 0) faultWord = 0xC2B2AE35u;
 
             string guard = @"
@@ -507,9 +505,9 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__IB2_ATTESTATION_TOKEN__"] = attestationToken.ToString(),
                 ["__IB2_FAULT_WORD__"] = faultWord.ToString(),
                 ["__IB2_REPORT_ONLY__"] = TemporaryGlobalSinkBypass ? "true" : "false",
-                ["__IB2_DECOY_GRAPH__"] = BuildDecoyGraph(decoySeed),
+                ["__IB2_DECOY_GRAPH__"] = BuildDecoyGraph(decoySeed, random),
                 ["__KEY_GETGENV__"] = LuaChars("getgenv"),
-                ["__KEY_ENV_CANARY__"] = LuaChars(RN(14, 20)),
+                ["__KEY_ENV_CANARY__"] = LuaChars(RN(random, 14, 20)),
                 ["__KEY_IDENTIFY__"] = LuaChars("identifyexecutor"),
                 ["__KEY_CHECKCALLER__"] = LuaChars("checkcaller"),
                 ["__KEY_ISC__"] = LuaChars("iscclosure"),
@@ -530,29 +528,31 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__KEY_SETUPVALUE__"] = LuaChars("setupvalue"),
                 ["__VALUE_PLAYERS__"] = LuaChars("Players"),
                 ["__VALUE_VECTOR3__"] = LuaChars("Vector3"),
-                ["__VALUE_INVALID_CHUNK__"] = LuaChars(RN(10, 16))
+                ["__VALUE_INVALID_CHUNK__"] = LuaChars(RN(random, 10, 16))
             };
             foreach (KeyValuePair<string, string> replacement in replacements)
                 guard = guard.Replace(replacement.Key, replacement.Value);
             return guard;
         }
 
-        public static string GenerateHandlerNoise()
+        public static string GenerateHandlerNoise(Random random)
         {
+            if (random == null) throw new ArgumentNullException(nameof(random));
             var parts = new List<string>();
             var expressions = new[]
             {
                 "string.byte(\"A\")==65", "#{\"x\"}==1", "(-1<0)==true", "tostring(1)==\"1\""
             };
-            parts.Add("local " + RN(4, 8) + "=(" + expressions[R.Next(4)] + ")");
-            string function = RN(5, 8);
+            parts.Add("local " + RN(random, 4, 8) + "=(" + expressions[random.Next(4)] + ")");
+            string function = RN(random, 5, 8);
             parts.Add("local function " + function + "(...)local _={...};return #_ end;" + function + "(1,2,3);" + function + "=nil");
             return "\t" + string.Join(";", parts) + ";\n";
         }
 
-        public static string GenerateLoopNoise()
+        public static string GenerateLoopNoise(Random random)
         {
-            int modulus = new[] {7, 11, 13, 17, 19}[R.Next(5)];
+            if (random == null) throw new ArgumentNullException(nameof(random));
+            int modulus = new[] {7, 11, 13, 17, 19}[random.Next(5)];
             var output = new StringBuilder();
             output.Append("\tif (InstrPoint%"); output.Append(modulus); output.Append("==0) then\n");
             output.Append("\t\tlocal _lt={};for _li=1,20 do _lt[_li]={_li}end;\n");

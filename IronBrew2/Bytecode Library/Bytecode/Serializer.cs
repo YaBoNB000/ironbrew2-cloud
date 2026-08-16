@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using IronBrew2.Bytecode_Library.IR;
 using IronBrew2.Obfuscator;
@@ -30,12 +29,14 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 		private readonly ObfuscationContext _context;
 		private readonly ObfuscationSettings _settings;
+		private readonly BuildRandom _random;
 		private readonly Encoding _luaEncoding = Encoding.GetEncoding(28591);
 
 		public Serializer(ObfuscationContext context, ObfuscationSettings settings)
 		{
 			_context = context;
 			_settings = settings;
+			_random = context.Seed.GetStream("payload.serializer");
 		}
 
 		/// <summary>
@@ -89,12 +90,12 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			if (payload == null || payload.Length == 0)
 				throw new InvalidOperationException("Cannot envelope an empty protected payload.");
 
-			int entropyLength = RandomNumberGenerator.GetInt32(EntropyMinBytes, EntropyMaxBytes + 1);
-			byte[] entropy = RandomNumberGenerator.GetBytes(entropyLength);
+			int entropyLength = _random.Next(EntropyMinBytes, EntropyMaxBytes + 1);
+			byte[] entropy = _random.GetBytes(entropyLength);
 			uint nonce = NextState32();
 
-			List<byte[]> entropyParts = SplitRandom(entropy, RandomNumberGenerator.GetInt32(12, 21));
-			List<byte[]> dataParts = SplitRandom(payload, RandomNumberGenerator.GetInt32(4, 9));
+			List<byte[]> entropyParts = SplitRandom(entropy, _random.Next(12, 21));
+			List<byte[]> dataParts = SplitRandom(payload, _random.Next(4, 9));
 			uint entropyDigest = ComputeEntropyDigest(entropyParts, seed, nonce, entropyLength);
 
 			uint maskState = seed ^ nonce ^ entropyDigest ^ _context.Domains.EnvelopeMaskDomain ^ (uint)payload.Length;
@@ -137,7 +138,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return result;
 		}
 
-		private static List<byte[]> SplitRandom(byte[] data, int requestedCount)
+		private List<byte[]> SplitRandom(byte[] data, int requestedCount)
 		{
 			int count = Math.Max(1, Math.Min(requestedCount, data.Length));
 			if (count == 1)
@@ -145,7 +146,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 			var cuts = new HashSet<int>();
 			while (cuts.Count < count - 1)
-				cuts.Add(RandomNumberGenerator.GetInt32(1, data.Length));
+				cuts.Add(_random.Next(1, data.Length));
 			var lengths = new List<int>(count);
 			int previous = 0;
 			foreach (int cut in cuts.OrderBy(value => value))
@@ -201,14 +202,14 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return hash;
 		}
 
-		private static void ShuffleEntropyRecords(List<EntropyRecord> records)
+		private void ShuffleEntropyRecords(List<EntropyRecord> records)
 		{
 			int transitions;
 			do
 			{
 				for (int index = records.Count - 1; index > 0; index--)
 				{
-					int swapIndex = RandomNumberGenerator.GetInt32(index + 1);
+					int swapIndex = _random.Next(index + 1);
 					(records[index], records[swapIndex]) = (records[swapIndex], records[index]);
 				}
 				transitions = 0;
@@ -217,8 +218,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			} while (transitions < 2);
 		}
 
-		private static ushort NextKey16() =>
-			(ushort)RandomNumberGenerator.GetInt32(1, 65536);
+		private ushort NextKey16() =>
+			(ushort)_random.Next(1, 65536);
 
 		private static ushort OpcodeMask(int pc, ushort k1, ushort k2, ushort k3)
 		{
@@ -233,12 +234,12 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			(uint)(OperandMask16(pc, k1, k2, k3, slot) |
 			       (OperandMask16(pc, k1, k2, k3, slot + 4) << 16));
 
-		private static uint NextState32()
+		private uint NextState32()
 		{
 			uint state;
 			do
 			{
-				state = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(sizeof(uint)), 0);
+				state = _random.NextUInt32();
 			} while (state == 0);
 			return state;
 		}
@@ -338,11 +339,11 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return hash;
 		}
 
-		private static void ShuffleBlocks(List<ControlFlowBlock> blocks)
+		private void ShuffleBlocks(List<ControlFlowBlock> blocks)
 		{
 			for (int index = blocks.Count - 1; index > 0; index--)
 			{
-				int swapIndex = RandomNumberGenerator.GetInt32(index + 1);
+				int swapIndex = _random.Next(index + 1);
 				(blocks[index], blocks[swapIndex]) = (blocks[swapIndex], blocks[index]);
 			}
 		}

@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Security.Cryptography;
 
 namespace IronBrew2.Obfuscator
 {
@@ -41,60 +40,61 @@ namespace IronBrew2.Obfuscator
 		public byte EntropyRecordKind { get; }
 		public byte DataRecordKind { get; }
 
-		public BuildDomains()
+		public BuildDomains(BuildRandom random)
 		{
+			if (random == null) throw new ArgumentNullException(nameof(random));
 			var used = new HashSet<uint>();
-			IntegrityDomain = NextWord(used);
-			BlockIntegrityDomain = NextWord(used);
-			FlowDomain = NextWord(used);
-			EnvelopeIntegrityDomain = NextWord(used);
-			EntropyDigestDomain = NextWord(used);
-			EnvelopeMaskDomain = NextWord(used);
-			ConstantIntegrityDomain = NextWord(used);
-			ConstantMaskDomain = NextWord(used);
-			PrototypeIntegrityDomain = NextWord(used);
+			IntegrityDomain = NextWord(random, used);
+			BlockIntegrityDomain = NextWord(random, used);
+			FlowDomain = NextWord(random, used);
+			EnvelopeIntegrityDomain = NextWord(random, used);
+			EntropyDigestDomain = NextWord(random, used);
+			EnvelopeMaskDomain = NextWord(random, used);
+			ConstantIntegrityDomain = NextWord(random, used);
+			ConstantMaskDomain = NextWord(random, used);
+			PrototypeIntegrityDomain = NextWord(random, used);
 
 			// These values are reduced modulo 2^16 by the permutation/masking
 			// recurrences.  Their effective words must therefore be independently
 			// randomized too, rather than merely having distinct 32-bit containers.
 			var effectiveWords = new HashSet<ushort>(LegacyEffectiveWords);
-			OpcodePermutationDomain = NextEffectiveWord(used, effectiveWords);
-			SchemaPermutationDomain = NextEffectiveWord(used, effectiveWords);
-			ConstantTagPermutationDomain = NextEffectiveWord(used, effectiveWords);
-			BlockColumnDomain = NextEffectiveWord(used, effectiveWords);
+			OpcodePermutationDomain = NextEffectiveWord(random, used, effectiveWords);
+			SchemaPermutationDomain = NextEffectiveWord(random, used, effectiveWords);
+			ConstantTagPermutationDomain = NextEffectiveWord(random, used, effectiveWords);
+			BlockColumnDomain = NextEffectiveWord(random, used, effectiveWords);
 			// An odd non-zero stride avoids short slot-mask cycles modulo 2^16.
-			BlockFieldStride = NextEffectiveWord(used, effectiveWords, true);
+			BlockFieldStride = NextEffectiveWord(random, used, effectiveWords, true);
 
 			ushort verifierMask;
-			do verifierMask = (ushort)RandomNumberGenerator.GetInt32(1, 65536);
+			do verifierMask = (ushort)random.Next(1, 65536);
 			while (effectiveWords.Contains(verifierMask));
 			FlowVerifierMask = verifierMask;
 
 			byte entropyKind;
-			do entropyKind = (byte)RandomNumberGenerator.GetInt32(1, 256);
+			do entropyKind = (byte)random.Next(1, 256);
 			while (entropyKind == 0xA7 || entropyKind == 0x5C);
 			EntropyRecordKind = entropyKind;
 
 			byte dataKind;
-			do dataKind = (byte)RandomNumberGenerator.GetInt32(1, 256);
+			do dataKind = (byte)random.Next(1, 256);
 			while (dataKind == entropyKind || dataKind == 0xA7 || dataKind == 0x5C);
 			DataRecordKind = dataKind;
 		}
 
-		private static uint NextWord(HashSet<uint> used)
+		private static uint NextWord(BuildRandom random, HashSet<uint> used)
 		{
 			uint value;
-			do value = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(sizeof(uint)), 0);
+			do value = random.NextUInt32();
 			while (value == 0 || LegacyWords.Contains(value) || !used.Add(value));
 			return value;
 		}
 
 		private static uint NextEffectiveWord(
-			HashSet<uint> used, HashSet<ushort> effectiveWords, bool requireOdd = false)
+			BuildRandom random, HashSet<uint> used, HashSet<ushort> effectiveWords, bool requireOdd = false)
 		{
 			while (true)
 			{
-				uint value = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(sizeof(uint)), 0);
+				uint value = random.NextUInt32();
 				ushort effective = (ushort)value;
 				if (value == 0 || effective == 0 || (requireOdd && (effective & 1) == 0) ||
 					LegacyWords.Contains(value) || used.Contains(value) || effectiveWords.Contains(effective))

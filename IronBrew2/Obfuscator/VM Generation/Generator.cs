@@ -201,7 +201,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 
 		public List<OpMutated> GenerateMutations(List<VOpcode> opcodes)
 		{
-			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
+			Random r = _context.Seed.GetStream("opcode.mutations");
 			List<OpMutated> mutated = new List<OpMutated>();
 
 			foreach (VOpcode opc in opcodes)
@@ -212,9 +212,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				for (int i = 0; i < r.Next(35, 50); i++)
 				{
 					int[] rand = {0, 1, 2};
-					rand.Shuffle();
+					rand.Shuffle(r);
 
-					OpMutated mut = new OpMutated();
+					OpMutated mut = new OpMutated {Random = r};
 
 					mut.Registers = rand;
 					mut.Mutated = opc;
@@ -223,7 +223,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				}
 			}
 
-			mutated.Shuffle();
+			mutated.Shuffle(r);
 			return mutated;
 		}
 
@@ -271,7 +271,6 @@ namespace IronBrew2.Obfuscator.VM_Generation
 		public List<OpSuperOperator> GenerateSuperOperators(Chunk chunk, int maxSize, int minSize = 5)
 		{
 			List<OpSuperOperator> results = new List<OpSuperOperator>();
-			Random                r       = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
 
 			bool[] skip = new bool[chunk.Instructions.Count + 1];
 
@@ -598,12 +597,96 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			       (value.Length == keyword.Length || !(char.IsLetterOrDigit(value[keyword.Length]) || value[keyword.Length] == '_'));
 		}
 
+		private static void CollectAliasableInstructions(Chunk chunk, List<Instruction> output)
+		{
+			for (int index = 0; index < chunk.Instructions.Count; index++)
+			{
+				Instruction instruction = chunk.Instructions[index];
+				output.Add(instruction);
+				// CLOSURE's following MOVE/GETUPVAL words are an inline binding ABI,
+				// not independently dispatched instructions. OpClosure compares their
+				// canonical base VIndex, so assigning an alias would change that ABI.
+				if (instruction.OpCode == Opcode.Closure && instruction.RefOperands[0] is Chunk prototype)
+					index += prototype.UpvalueCount;
+			}
+			foreach (Chunk child in chunk.Functions)
+				CollectAliasableInstructions(child, output);
+		}
+
+		/// <summary>
+		/// Adds build-local many-to-one opcode aliases and assigns real instructions
+		/// to them. Each alias later receives an independently transformed handler,
+		/// so opcode cardinality and implementation shape vary for the same source.
+		/// </summary>
+		private void AddOpcodeAliases(List<VOpcode> virtuals, Random random)
+		{
+			var instructions = new List<Instruction>();
+			CollectAliasableInstructions(_context.HeadChunk, instructions);
+			List<VOpcode> candidates = virtuals
+				.Where(opcode => opcode is not OpAlias && opcode is not OpMutated && opcode is not OpSuperOperator)
+				.Where(opcode => instructions.Any(instruction =>
+					instruction.CustomData?.Opcode == opcode && instruction.CustomData.WrittenOpcode == null))
+				.ToList();
+			candidates.Shuffle(random);
+			if (candidates.Count == 0)
+				throw new InvalidOperationException("No virtual opcodes were available for build-local aliases.");
+
+			int minimum = Math.Max(3, (candidates.Count + 5) / 6);
+			int maximum = Math.Max(minimum, (candidates.Count * 2 + 4) / 5);
+			int targetCount = random.Next(minimum, maximum + 1);
+			int added = 0;
+			foreach (VOpcode target in candidates.Take(targetCount))
+			{
+				List<Instruction> occurrences = instructions
+					.Where(instruction => instruction.CustomData?.Opcode == target &&
+					                      instruction.CustomData.WrittenOpcode == null)
+					.ToList();
+				occurrences.Shuffle(random);
+				int aliasCount = occurrences.Count >= 4 && random.Next(4) == 0 ? 2 : 1;
+				var aliases = Enumerable.Range(0, aliasCount)
+					.Select(_ => new OpAlias {Target = target})
+					.ToArray();
+				virtuals.AddRange(aliases);
+				added += aliases.Length;
+
+				// Every emitted alias is live. Remaining occurrences choose between the
+				// original and aliases, preventing one semantic ID per build.
+				for (int index = 0; index < occurrences.Count; index++)
+				{
+					if (index < aliases.Length || random.Next(100) < 55)
+						occurrences[index].CustomData.Opcode = aliases[random.Next(aliases.Length)];
+				}
+			}
+			_context.VirtualOpcodeAliasCount = added;
+			ValidateClosureBindingOpcodeAbi(_context.HeadChunk);
+		}
+
+		private void ValidateClosureBindingOpcodeAbi(Chunk chunk)
+		{
+			for (int index = 0; index < chunk.Instructions.Count; index++)
+			{
+				Instruction instruction = chunk.Instructions[index];
+				if (instruction.OpCode != Opcode.Closure || instruction.RefOperands[0] is not Chunk prototype)
+					continue;
+				for (int offset = 1; offset <= prototype.UpvalueCount; offset++)
+				{
+					Instruction binding = chunk.Instructions[index + offset];
+					if (!_context.InstructionMapping.TryGetValue(binding.OpCode, out VOpcode canonical) ||
+					    binding.CustomData?.Opcode != canonical || binding.CustomData.WrittenOpcode != null)
+						throw new InvalidOperationException("Opcode alias changed the CLOSURE binding ABI.");
+				}
+			}
+			foreach (Chunk child in chunk.Functions)
+				ValidateClosureBindingOpcodeAbi(child);
+		}
+
 		public string GenerateVM(ObfuscationSettings settings)
 		{
 			if (settings.EnvironmentLock && !settings.AntiDump)
 				throw new InvalidOperationException("EnvironmentLock requires the VM-integrated AntiDump attestation guard.");
 
-			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
+			Random r = _context.Seed.GetStream("vm.generator");
+			Random guardRandom = _context.Seed.GetStream("runtime.guard");
 
 			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
 			                                 .Where(t => t.IsSubclassOf(typeof(VOpcode)))
@@ -651,8 +734,10 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				
 				Console.WriteLine("Folded " + folded + " instructions into super operators.");
 			}
-			
-			virtuals.Shuffle();
+
+			AddOpcodeAliases(virtuals, r);
+			Console.WriteLine("Added " + _context.VirtualOpcodeAliasCount + " build-local opcode aliases.");
+			virtuals.Shuffle(r);
 			
 			for (int i = 0; i < virtuals.Count; i++)
 				virtuals[i].VIndex = i;
@@ -1114,7 +1199,8 @@ local ToNumber = tonumber;");
 				vm += T(AntiDumpGenerator.GenerateRuntimeGuard(
 					37 + r.Next(36),
 					(uint) r.Next(1, int.MaxValue),
-					_context.Binder.AttestationToken));
+					_context.Binder.AttestationToken,
+					guardRandom));
 
 			// 数据切片:base92 字符串拆成 2-6 小段,以 local <随机名>='段' 形式散布在产物各处,
 			// 最后统一拼接 —— 视觉上与代码交织,不再是一整块孤立的"数据区"
@@ -1510,7 +1596,7 @@ end;";
 			vm += T(loopRuntime);
 
 			if (settings.Noise)
-				vm += T(AntiDumpGenerator.GenerateLoopNoise());
+				vm += T(AntiDumpGenerator.GenerateLoopNoise(guardRandom));
 
 			int maxFunc = 0;
 
@@ -1566,7 +1652,7 @@ end;";
 			var continuationChains = new Dictionary<int, List<ContinuationNode>>();
 			var allContinuationNodes = new List<ContinuationNode>();
 			int[] firstLaneCoverage = Enumerable.Range(0, laneCount).ToArray();
-			firstLaneCoverage.Shuffle();
+			firstLaneCoverage.Shuffle(r);
 			for (int opcodeIndex = 0; opcodeIndex < virtuals.Count; opcodeIndex++)
 			{
 				int nodeCount = 3 + r.Next(3);
@@ -1603,7 +1689,7 @@ end;";
 				}
 				string handler = BuildHandler(opcodeIndex);
 				if (settings.Noise)
-					handler += AntiDumpGenerator.GenerateHandlerNoise();
+					handler += AntiDumpGenerator.GenerateHandlerNoise(guardRandom);
 				chain[chain.Count - 1].Handler = handler;
 				continuationChains[opcodeIndex] = chain;
 			}
@@ -1674,7 +1760,7 @@ end;";
 			      dispatchMatchedName + "=false;";
 
 			int[] laneOrder = Enumerable.Range(0, laneCount).ToArray();
-			laneOrder.Shuffle();
+			laneOrder.Shuffle(r);
 			for (int laneOrderIndex = 0; laneOrderIndex < laneOrder.Length; laneOrderIndex++)
 			{
 				int lane = laneOrder[laneOrderIndex];

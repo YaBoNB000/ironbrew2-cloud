@@ -12,6 +12,7 @@ namespace IronBrew2.Obfuscator.Control_Flow
 	public class CFContext
 	{
 		public Chunk lChunk;
+		private readonly Random _random;
 
 		public void DoChunk(Chunk c)
 		{
@@ -52,7 +53,7 @@ namespace IronBrew2.Obfuscator.Control_Flow
 							nIns = c.Instructions.Skip(cBegin).Take(cEnd - cBegin).ToList();
 
 							Console.WriteLine("Test Spam");
-							TestSpam.DoInstructions(c, nIns);
+							TestSpam.DoInstructions(c, nIns, _random);
 							
 							cBegin = c.InstructionMap[CBegin];
 							cEnd = c.InstructionMap[instr];
@@ -65,7 +66,7 @@ namespace IronBrew2.Obfuscator.Control_Flow
 							//nIns = c.Instructions.Skip(cBegin).TakLOe(cEnd - cBegin).ToList();
 
 							Console.WriteLine("Bounce");
-							Bounce.DoInstructions(c, nIns);
+							Bounce.DoInstructions(c, nIns, _random);
 
 							cBegin = c.InstructionMap[CBegin];
 							cEnd = c.InstructionMap[instr];
@@ -119,7 +120,10 @@ namespace IronBrew2.Obfuscator.Control_Flow
 			//File.WriteAllBytes("ok.luac", new VanillaSerializer(lChunk).Serialize());
 		}
 
-		public CFContext(Chunk lChunk_) =>
+		public CFContext(Chunk lChunk_, Random random)
+		{
 			lChunk = lChunk_;
+			_random = random ?? throw new ArgumentNullException(nameof(random));
+		}
 	}
 }

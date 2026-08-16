@@ -1,5 +1,6 @@
 using IronBrew2.Bytecode_Library.Bytecode;
 using IronBrew2.Bytecode_Library.IR;
+using IronBrew2.Obfuscator;
 using IronBrew2.Obfuscator.Control_Flow;
 
 static Chunk NewChunk(params Opcode[] opcodes)
@@ -156,4 +157,29 @@ foreach (Opcode opcode in new[] { Opcode.Eq, Opcode.Lt, Opcode.Le, Opcode.Test, 
     Expect(!decision.IsEligible && decision.Reason == "invalid-closure-binding", "invalid closure binding fallback failed");
 }
 
-Console.WriteLine("PASS CFG and dispatcher planner regression");
+// One master BuildSeed must deterministically derive independent named streams.
+// Re-requesting a name continues the same stream instead of replaying bytes.
+{
+    byte[] root = Enumerable.Range(0, 32).Select(value => (byte)value).ToArray();
+    using var seedA = new BuildSeed(root);
+    using var seedB = new BuildSeed(root);
+    BuildRandom opcodeA = seedA.GetStream("opcode");
+    BuildRandom opcodeB = seedB.GetStream("opcode");
+    byte[] firstA = opcodeA.GetBytes(96);
+    byte[] firstB = opcodeB.GetBytes(96);
+    Expect(firstA.SequenceEqual(firstB), "equal build roots did not reproduce a purpose stream");
+    Expect(ReferenceEquals(opcodeA, seedA.GetStream("opcode")), "purpose stream was restarted instead of continued");
+    Expect(opcodeA.GetBytes(64).SequenceEqual(opcodeB.GetBytes(64)), "continued purpose streams diverged");
+
+    byte[] layout = seedA.GetStream("vm-layout").GetBytes(96);
+    Expect(!firstA.SequenceEqual(layout), "different build purposes produced the same stream");
+    for (int index = 0; index < 10000; index++)
+    {
+        int signed = opcodeA.Next(-37, 91);
+        long wide = opcodeA.NextInt64(-5000000000L, 9000000000L);
+        Expect(signed >= -37 && signed < 91, "BuildRandom int range escaped its bounds");
+        Expect(wide >= -5000000000L && wide < 9000000000L, "BuildRandom int64 range escaped its bounds");
+    }
+}
+
+Console.WriteLine("PASS CFG, dispatcher planner and BuildSeed regression");

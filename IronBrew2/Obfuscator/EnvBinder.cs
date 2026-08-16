@@ -1,5 +1,4 @@
 using System;
-using System.Security.Cryptography;
 using System.Text;
 
 namespace IronBrew2.Obfuscator
@@ -24,12 +23,13 @@ namespace IronBrew2.Obfuscator
         /// <summary>EnvironmentLock-disabled compatibility path for library callers.</summary>
         public const string PlainSeedLua = "local Xs = PayloadHead;";
 
-        public EnvBinder()
+        public EnvBinder(BuildRandom random)
         {
-            Salt = NextNonZeroUInt32();
+            if (random == null) throw new ArgumentNullException(nameof(random));
+            Salt = NextNonZeroUInt32(random);
             do
             {
-                AttestationToken = NextNonZeroUInt32();
+                AttestationToken = NextNonZeroUInt32(random);
             } while (DeriveSeed(AttestationToken) == 0);
 
             SeedDeriveLua = @"
@@ -41,13 +41,10 @@ end;
 ";
         }
 
-        private static uint NextNonZeroUInt32()
+        private static uint NextNonZeroUInt32(BuildRandom random)
         {
             uint value;
-            do
-            {
-                value = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(sizeof(uint)), 0);
-            } while (value == 0);
+            do value = random.NextUInt32(); while (value == 0);
             return value;
         }
 

@@ -9,11 +9,10 @@ namespace IronBrew2.Obfuscator.Control_Flow.Types
 {
     public static class EQMutate
     {
-        public static Random      Random      = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
-        public static CFGenerator CFGenerator = new CFGenerator();
-
-        public static void DoInstructions(Chunk chunk, List<Instruction> instructions)
+        public static void DoInstructions(Chunk chunk, List<Instruction> instructions, Random random)
         {
+            if (random == null) throw new ArgumentNullException(nameof(random));
+            var generator = new CFGenerator(random);
             chunk.UpdateMappings();
             foreach (Instruction l in instructions)
             {
@@ -33,9 +32,9 @@ namespace IronBrew2.Obfuscator.Control_Flow.Types
                 
                 int idx = chunk.InstructionMap[l];
 
-                Instruction j1 = CFGenerator.NextJMP(chunk, target2);
-                Instruction j2 = CFGenerator.NextJMP(chunk, target2);
-                Instruction j3 = CFGenerator.NextJMP(chunk, target);
+                Instruction j1 = generator.NextJMP(chunk, target2);
+                Instruction j2 = generator.NextJMP(chunk, target2);
+                Instruction j3 = generator.NextJMP(chunk, target);
 
                 chunk.Instructions.InsertRange(idx, new[] {newLt, j1, newLe, j2, j3});
 

@@ -11,18 +11,19 @@ namespace IronBrew2.Obfuscator.Control_Flow.Types
 	{
 		private static List<int> used = new List<int>();
 
-		private static int NIntND(int min, int max)
+		private static int NIntND(int min, int max, Random random)
 		{
 			var x = Enumerable.Range(min, max - min).ToList();
 			x.RemoveAll(y => used.Contains(y));
-			x.Shuffle();
+			x.Shuffle(random);
 			int n = x[0];
 			used.Add(n);
 			return n;
 		}
 
-		public static void DoInstructions(Chunk chunk, List<Instruction> instructions)
+		public static void DoInstructions(Chunk chunk, List<Instruction> instructions, Random random)
 		{
+			if (random == null) throw new ArgumentNullException(nameof(random));
 			for (int idx = 0; idx < instructions.Count; idx++)
 			{
 				used.Clear();
@@ -92,8 +93,8 @@ namespace IronBrew2.Obfuscator.Control_Flow.Types
 					case Opcode.Test:
 					case Opcode.TestSet:
 					{
-						int rReg = NIntND(0, 128);
-						int pReg = NIntND(257, 512);
+						int rReg = NIntND(0, 128, random);
+						int pReg = NIntND(257, 512, random);
 						
 						Instruction m1 = new Instruction(chunk, Opcode.Move);
 						m1.A = pReg;

@@ -11,21 +11,22 @@ namespace IronBrew2.Obfuscator.Control_Flow.Types
 	{
 		private static List<int> used = new List<int>();
 
-		private static int NIntND(int min, int max)
+		private static int NIntND(int min, int max, Random random)
 		{
 			var x = Enumerable.Range(min, max - min).ToList();
 			x.RemoveAll(y => used.Contains(y));
-			x.Shuffle();
+			x.Shuffle(random);
 			int n = x[0];
 			used.Add(n);
 			return n;
 		}
 
-		public static void DoInstructions(Chunk chunk, List<Instruction> Instructions)
+		public static void DoInstructions(Chunk chunk, List<Instruction> Instructions, Random random)
 		{
+			if (random == null) throw new ArgumentNullException(nameof(random));
 			Instructions = Instructions.ToList();
-			CFGenerator cg = new CFGenerator();
-			Random r = new Random(System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue));
+			CFGenerator cg = new CFGenerator(random);
+			Random r = random;
 			
 			for (int i =  Instructions.Count - 1; i >= 0; i--)
 			{

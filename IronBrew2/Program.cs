@@ -43,6 +43,7 @@ namespace IronBrew2
 			try
 			{
 				error = "";
+				using BuildSeed buildSeed = new BuildSeed();
 
 				string luacPath = FindTool("luac", "luac5.1", "luac.exe")
 					?? throw new Exception("luac (Lua 5.1 compiler) not found in PATH.");
@@ -130,7 +131,8 @@ namespace IronBrew2
 				
 				Console.WriteLine("Compiling...");
 
-				var t1Source = new ConstantEncryption(settings, File.ReadAllText(t0, _fuckingLua)).EncryptStrings();
+				var t1Source = new ConstantEncryption(settings, File.ReadAllText(t0, _fuckingLua),
+					buildSeed.GetStream("constant-encryption")).EncryptStrings();
 				File.WriteAllText(t1, t1Source, _fuckingLua);
 				proc = new Process
 				       {
@@ -164,7 +166,7 @@ namespace IronBrew2
 
 				if (settings.ControlFlow)
 				{
-					CFContext cf = new CFContext(lChunk);
+					CFContext cf = new CFContext(lChunk, buildSeed.GetStream("control-flow"));
 					cf.DoChunks();
 				}
 
@@ -178,7 +180,7 @@ namespace IronBrew2
 				//lChunk.Constants.Shuffle();
 				//lChunk.Functions.Shuffle();
 
-				ObfuscationContext context = new ObfuscationContext(lChunk, settings);
+				ObfuscationContext context = new ObfuscationContext(lChunk, settings, buildSeed);
 
 				string t2 = Path.Combine(path, "t2.lua");
 				string c = new Generator(context).GenerateVM(settings);
