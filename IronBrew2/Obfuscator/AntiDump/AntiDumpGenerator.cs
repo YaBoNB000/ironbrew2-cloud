@@ -14,6 +14,11 @@ namespace IronBrew2.Obfuscator.AntiDump
     /// </summary>
     public static class AntiDumpGenerator
     {
+        // TEMPORARY: globally preserve guard detection but continue with the
+        // expected token so obfuscated diagnostic payloads can print results.
+        // Set this back to false immediately after the executor comparison.
+        private const bool TemporaryGlobalSinkBypass = true;
+
         private static readonly Random R = new Random(RandomNumberGenerator.GetInt32(int.MaxValue));
 
         private static string RN(int min, int max)
@@ -116,8 +121,9 @@ local function GuardDecoy(...)
         /// semantics, closure classification/wrapping, Luau compilation, debug
         /// introspection/mutation, and inactive/active prototype rules. Exact debug
         /// source strings and non-standard identity aliases are deliberately excluded.
-        /// Any failure becomes sticky and enters a non-yielding O(1)-memory state graph
-        /// without printing or throwing a dedicated block message.
+        /// Any failure becomes sticky and normally enters a non-yielding O(1)-memory
+        /// state graph without printing or throwing a dedicated block message. The
+        /// temporary global diagnostic switch changes only that rejection response.
         /// </summary>
         public static string GenerateRuntimeGuard(int probeInterval, uint decoySeed, uint attestationToken)
         {
@@ -210,7 +216,18 @@ local GuardAttestation = 0;
 local GuardSeal = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
 local GuardTripped = false;
 local GuardAttested = false;
+local GuardReportOnly = __IB2_REPORT_ONLY__;
 local GuardUpvalue = __IB2_UPVALUE_EXPECTED__;
+
+local function GuardReject()
+    GuardTripped = true;
+    if GuardReportOnly then
+        GuardAttestation = __IB2_ATTESTATION_TOKEN__;
+        return false;
+    end;
+    GuardAttestation = 0;
+    return true;
+end;
 
 local function GuardLuaProbe(GuardProbeValue) return GuardProbeValue; end;
 local function GuardConstantProbe() return __IB2_CONSTANT_EXPECTED__; end;
@@ -464,12 +481,10 @@ __IB2_DECOY_GRAPH__
 
 local function GuardProbe(Force)
     GuardCounter = GuardCounter + 1;
-    if GuardTripped then return true; end;
+    if GuardTripped then return GuardReject(); end;
     if not Force and GuardCounter < GuardNextProbe then return false; end;
     if GuardSeal ~= (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647 then
-        GuardTripped = true;
-        GuardAttestation = 0;
-        return true;
+        return GuardReject();
     end;
 
     GuardEpoch = GuardEpoch + 1;
@@ -480,21 +495,13 @@ local function GuardProbe(Force)
         GuardValid, GuardTranscript = GuardStrictChallenge();
     end;
     if GuardValid and GuardTranscript ~= __IB2_TRANSCRIPT_EXPECTED__ then GuardValid = false; end;
-    if not GuardValid then
-        GuardTripped = true;
-        GuardAttestation = 0;
-        return true;
-    end;
+    if not GuardValid then return GuardReject(); end;
 
     if not GuardAttested then
         GuardAttestation = (GuardTranscript + __IB2_ATTESTATION_OFFSET__) % 4294967296;
         GuardAttested = true;
     end;
-    if GuardAttestation ~= __IB2_ATTESTATION_TOKEN__ then
-        GuardTripped = true;
-        GuardAttestation = 0;
-        return true;
-    end;
+    if GuardAttestation ~= __IB2_ATTESTATION_TOKEN__ then return GuardReject(); end;
 
     GuardState = (GuardState * 48271 + GuardCounter + GuardEpoch * 17 + GuardAttestation % 65521) % 2147483647;
     GuardSeal = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
@@ -524,6 +531,7 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__IB2_TRANSCRIPT_EXPECTED__"] = transcriptExpected.ToString(),
                 ["__IB2_ATTESTATION_OFFSET__"] = attestationOffset.ToString(),
                 ["__IB2_ATTESTATION_TOKEN__"] = attestationToken.ToString(),
+                ["__IB2_REPORT_ONLY__"] = TemporaryGlobalSinkBypass ? "true" : "false",
                 ["__IB2_DECOY_GRAPH__"] = BuildDecoyGraph(decoySeed),
                 ["__KEY_GETGENV__"] = LuaChars("getgenv"),
                 ["__KEY_ENV_CANARY__"] = LuaChars(RN(14, 20)),

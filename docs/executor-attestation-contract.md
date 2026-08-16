@@ -4,8 +4,15 @@ Research date: 2026-08-16
 
 The runtime guard is deliberately brand-neutral. It does not treat an executor
 name, a claimed UNC/sUNC percentage, or the presence of global names as proof.
-Admission requires a cross-API behavior transcript, and every failure enters the
-same silent non-yielding fixed-memory sink.
+Admission requires a cross-API behavior transcript, and every failure normally
+enters the same silent non-yielding fixed-memory sink.
+
+> **Temporary diagnostic state:** `TemporaryGlobalSinkBypass` is currently
+> enabled so the obfuscated sink checker can finish printing on a failing real
+> executor. The existing checks are unchanged and the guard still latches its
+> first failure, but the expected payload token is supplied and execution
+> continues instead of entering the sink. This must be set back to `false` after
+> the comparison.
 
 This is a client-side compatibility contract, not an unforgeable executor
 oracle. An environment that completely emulates every admitted behavior can

@@ -101,13 +101,10 @@ echo "PASS v4 prototype, block-manifest, column framing/consumption and constant
 # The trusted test executor must pass every hard-AND behavior contract. The
 # compatibility paths also model proxy-backed globals, empty C-upvalue results,
 # userdata inactive-proto handles and callable inactive protos that execute the
-# expected child. Non-standard identity aliases remain optional. Plain Lua,
-# polluted executor globals, callable protos returning the wrong child result,
-# exposed C upvalues, invalid loadstring/debug behavior, partial API surfaces,
-# unstable identity and hooked primitives must remain silent and non-returning
-# until an external timeout terminates the tight
-# sink. An injected mid-canary getgenv failure separately verifies that both
-# writes are restored before the guard enters that sink.
+# expected child. The temporary global report-only switch preserves every guard
+# challenge but supplies the expected payload token and continues instead of
+# entering the sink. This lets the obfuscated checker print executor failures;
+# it must be set back to false after the real-executor comparison is complete.
 run_executor "$WORK/fixed.lua" > "$WORK/executor-trusted.out"
 cmp "$WORK/baseline.out" "$WORK/executor-trusted.out"
 run_executor_mode no-alias "$WORK/fixed.lua" > "$WORK/executor-no-alias.out"
@@ -138,29 +135,22 @@ grep -q '^综合结论: 当前环境会进入静默 sink$' \
     "$WORK/sink-check-wrong-callable.out"
 echo "PASS standalone sink-trigger checker"
 
-set +e
-timeout 2s "$LUA" "$WORK/fixed.lua" > "$WORK/executor-plain.stdout" 2> "$WORK/executor-plain.stderr"
-plain_code=$?
-set -e
-[[ $plain_code -eq 124 && ! -s "$WORK/executor-plain.stdout" && ! -s "$WORK/executor-plain.stderr" ]]
+"$LUA" "$WORK/fixed.lua" > "$WORK/executor-plain.out"
+cmp "$WORK/baseline.out" "$WORK/executor-plain.out"
 
 for mode in primitive-hook raw-hook debug-api-hook classifier-spoof identity-spoof version-number missing-debug polluted-genv invalid-load wrong-callable-proto c-debug-leak c-upvalue-leak; do
-    set +e
-    timeout 2s "$LUA" tests/executor_runner.lua "$mode" "$WORK/fixed.lua" \
-        > "$WORK/executor-$mode.stdout" 2> "$WORK/executor-$mode.stderr"
-    executor_code=$?
-    set -e
-    [[ $executor_code -eq 124 ]]
-    [[ ! -s "$WORK/executor-$mode.stdout" && ! -s "$WORK/executor-$mode.stderr" ]]
+    timeout 5s "$LUA" tests/executor_runner.lua "$mode" "$WORK/fixed.lua" \
+        > "$WORK/executor-$mode.out"
+    cmp "$WORK/baseline.out" "$WORK/executor-$mode.out"
 done
 set +e
-timeout 2s "$LUA" tests/executor_runner.lua canary-error "$WORK/fixed.lua" \
+timeout 5s "$LUA" tests/executor_runner.lua canary-error "$WORK/fixed.lua" \
     > "$WORK/executor-canary-error.stdout" 2> "$WORK/executor-canary-error.stderr"
 canary_code=$?
 set -e
 [[ $canary_code -eq 42 ]]
 [[ ! -s "$WORK/executor-canary-error.stdout" && ! -s "$WORK/executor-canary-error.stderr" ]]
-echo "PASS strict executor contract, canary cleanup and silent non-returning O(1) decoy sink"
+echo "PASS strict executor detection and temporary global report-only continuation"
 
 # Verify the unminified generated VM contains all three guard checkpoints and
 # that stable implementation identifiers do not survive name randomization.

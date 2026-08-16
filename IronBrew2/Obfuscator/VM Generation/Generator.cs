@@ -690,7 +690,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardActivated","GuardActivatedOK","GuardActivatedValid","GuardActiveCallOK","GuardActiveCallResult","GuardActiveProto","GuardCConstantsOK","GuardCOK","GuardCProtoOK",
 				"GuardCProtosOK","GuardCResult","GuardCSetupOK","GuardCUpvalues","GuardCUpvaluesOK","GuardCapabilityMarker","GuardCapabilityOld","GuardClassifies","GuardExpectedC",
 				"GuardInactiveCallOK","GuardInactiveCallResult","GuardInactiveProto","GuardInactiveProtoOK","GuardInactiveType","GuardInvalidError","GuardInvalidFunction","GuardInvalidOK","GuardInvalidSource","GuardLOK","GuardLResult",
-				"GuardPersistent","GuardProtoConstants","GuardProtoConstantsOK","GuardProtosValid","GuardRepeatEnvironment","GuardRepeatOK","GuardSawInactiveProto","GuardSeparated",
+				"GuardPersistent","GuardProtoConstants","GuardProtoConstantsOK","GuardProtosValid","GuardReject","GuardRepeatEnvironment","GuardRepeatOK","GuardReportOnly","GuardSawInactiveProto","GuardSeparated",
 				"GuardThreadMarker","GuardThreadOld","GuardCanaryOK","GuardCapabilityRestoreOK","GuardThreadRestoreOK","GuardWrappedUpvalues","GuardWrappedUpvaluesOK",
 				"GuardPrimitiveIndex","GuardPrimitives",
 				"PayloadHead","PayloadTag","PayloadFlags","PayloadFeatures","PayloadVersion","OuterSeed","PayloadHash","PayloadIndex","PayloadDecoded","PayloadByte","PayloadKey",
