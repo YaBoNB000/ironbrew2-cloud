@@ -17,6 +17,18 @@ namespace IronBrew2.Obfuscator.VM_Generation
 	public class Generator
 	{
 		private ObfuscationContext _context;
+
+		private sealed class ContinuationNode
+		{
+			public int OpcodeIndex;
+			public int Depth;
+			public int Lane;
+			public uint Token;
+			public uint NextToken;
+			public int NextLane;
+			public string Handler;
+			public bool Terminal => Handler != null;
+		}
 		
 		public Generator(ObfuscationContext context) =>
 			_context = context;
@@ -666,6 +678,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
 				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
+				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched",
 				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetInfo","GuardInfo","GuardInspector",
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardEnvironmentRead","GuardGetGenV",
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
@@ -840,6 +853,30 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					case 3: { int a = r.Next(0, n + 1); return "(" + a + "+" + (n - a) + ")"; }
 					case 4: { int a = r.Next(1, n + 1); return "(" + (n + a) + "-" + a + ")"; }
 					default: { int a = r.Next(1, Math.Max(2, n + 1)); return (n % a == 0) ? "(" + (n / a) + "*" + a + ")" : "(" + n + "+0)"; }
+				}
+			}
+
+			// Continuation tokens occupy the full unsigned 32-bit range. Keep every
+			// arithmetic form below exact in Lua's double representation while avoiding
+			// one canonical decimal spelling for the dispatch graph.
+			string ScrambleUInt(uint n)
+			{
+				ulong value = n;
+				switch (r.Next(5))
+				{
+					case 0: return "(" + value + "+0)";
+					case 1: return "(" + value + "-0)";
+					case 2: return "(" + value + "*1)";
+					case 3:
+					{
+						ulong left = (ulong)r.NextInt64(0, (long)value + 1);
+						return "(" + left + "+" + (value - left) + ")";
+					}
+					default:
+					{
+						ulong extra = (ulong)r.Next(1, 1 << 20);
+						return "(" + (value + extra) + "-" + extra + ")";
+					}
 				}
 			}
 
@@ -1400,66 +1437,166 @@ end;";
 				return code;
 			}
 			
-			string GetStr(List<int> opcodes)
+			// The opcode tree no longer owns handler bodies. It selects a masked entry
+			// token, then a build-random 3-5 lane continuation graph reaches the handler
+			// through 2-4 state transitions. Handlers stay in this Wrap lexical scope,
+			// preserving top-level return and direct InstrPoint/Top updates.
+			int laneCount = 3 + r.Next(3);
+			var usedContinuationTokens = new HashSet<uint>();
+			uint NewContinuationToken()
 			{
-				string str = "";
-				
-				if (opcodes.Count == 1)
-				{
-					str += BuildHandler(opcodes[0]);
-					if (settings.Noise)
-						str += AntiDumpGenerator.GenerateHandlerNoise();
-				}
-
-				else if (opcodes.Count == 2) 
-				{
-					// A leaf deliberately owns two canonical handlers. This is dispatch
-					// structure polymorphism only: it does not fuse bytecode instructions
-					// and therefore is not a Phase 3 superoperator.
-					string h0 = BuildHandler(opcodes[0]);
-					string h1 = BuildHandler(opcodes[1]);
-					if (settings.Noise)
-					{
-						h0 += AntiDumpGenerator.GenerateHandlerNoise();
-						h1 += AntiDumpGenerator.GenerateHandlerNoise();
-					}
-
-					string enumName = T("Enum");
-					string v0 = ScrambleNumber(virtuals[opcodes[0]].VIndex);
-					string v1 = ScrambleNumber(virtuals[opcodes[1]].VIndex);
-					switch (r.Next(4))
-					{
-						case 0:
-							str += "if " + enumName + " > " + v0 + " then " + h1 + "else " + h0 + "end;";
-							break;
-						case 1:
-							str += "if " + enumName + " == " + v0 + " then " + h0 + "else " + h1 + "end;";
-							break;
-						case 2:
-							str += "if " + enumName + " ~= " + v0 + " then " + h1 + "else " + h0 + "end;";
-							break;
-						default:
-							// Must start with "if": recursive parents concatenate "else" +
-							// the right child into a valid Lua "elseif" chain.
-							str += "if " + enumName + " == " + enumName + " then if " + enumName + " == " + v1 + " then " + h1 + "else " + h0 + "end;end;";
-							break;
-					}
-				}
-				else
-				{
-					List<int> ordered = opcodes.OrderBy(o => o).ToList();
-					var sorted = new[] { ordered.Take(ordered.Count / 2).ToList(), ordered.Skip(ordered.Count / 2).ToList() };
-					
-					str += T("if Enum <= ") + ScrambleNumber(sorted[0].Last()) + " then ";
-					str += GetStr(sorted[0]);
-					str += " else";
-					str += GetStr(sorted[1]);
-				}
-
-				return str;
+				uint token;
+				do token = unchecked((uint)r.NextInt64(1L, 4294967296L));
+				while (!usedContinuationTokens.Add(token));
+				return token;
 			}
 
-			vm += GetStr(Enumerable.Range(0, virtuals.Count).ToList());
+			var continuationChains = new Dictionary<int, List<ContinuationNode>>();
+			var allContinuationNodes = new List<ContinuationNode>();
+			int[] firstLaneCoverage = Enumerable.Range(0, laneCount).ToArray();
+			firstLaneCoverage.Shuffle();
+			for (int opcodeIndex = 0; opcodeIndex < virtuals.Count; opcodeIndex++)
+			{
+				int nodeCount = 3 + r.Next(3);
+				if (opcodeIndex == 0)
+					nodeCount = Math.Max(nodeCount, laneCount);
+				var chain = new List<ContinuationNode>();
+				int previousLane = -1;
+				for (int depth = 0; depth < nodeCount; depth++)
+				{
+					int lane;
+					if (opcodeIndex == 0 && depth < laneCount)
+						lane = firstLaneCoverage[depth];
+					else
+					{
+						do lane = r.Next(laneCount); while (lane == previousLane);
+					}
+
+					var node = new ContinuationNode
+					{
+						OpcodeIndex = opcodeIndex,
+						Depth = depth,
+						Lane = lane,
+						Token = NewContinuationToken()
+					};
+					chain.Add(node);
+					allContinuationNodes.Add(node);
+					previousLane = lane;
+				}
+
+				for (int depth = 0; depth < chain.Count - 1; depth++)
+				{
+					chain[depth].NextToken = chain[depth + 1].Token;
+					chain[depth].NextLane = chain[depth + 1].Lane;
+				}
+				string handler = BuildHandler(opcodeIndex);
+				if (settings.Noise)
+					handler += AntiDumpGenerator.GenerateHandlerNoise();
+				chain[chain.Count - 1].Handler = handler;
+				continuationChains[opcodeIndex] = chain;
+			}
+
+			string dispatchMaskName = T("DispatchMask");
+			string dispatchSaltName = T("DispatchSalt");
+			string dispatchStateName = T("DispatchState");
+			string dispatchLaneName = T("DispatchLane");
+			string dispatchActiveName = T("DispatchActive");
+			string dispatchStepsName = T("DispatchSteps");
+			string dispatchStepMaskName = T("DispatchStepMask");
+			string dispatchMatchedName = T("DispatchMatched");
+			string bitXorName = T("BitXOR");
+			string u32Name = T("U32");
+			string enumName = T("Enum");
+
+			string EntryAssignment(int opcodeIndex)
+			{
+				ContinuationNode entry = continuationChains[opcodeIndex][0];
+				return dispatchStateName + "=" + u32Name + "(" + bitXorName + "(" + ScrambleUInt(entry.Token) + "," + dispatchMaskName + "));" +
+				       dispatchLaneName + "=" + ScrambleNumber(entry.Lane) + ";";
+			}
+
+			string BuildOpcodeSelector(List<int> opcodes)
+			{
+				if (opcodes.Count == 1)
+					return EntryAssignment(opcodes[0]);
+				if (opcodes.Count == 2)
+				{
+					int first = opcodes[0];
+					int second = opcodes[1];
+					string firstValue = ScrambleNumber(virtuals[first].VIndex);
+					switch (r.Next(3))
+					{
+						case 0:
+							return "if " + enumName + "==" + firstValue + " then " + EntryAssignment(first) + "else " + EntryAssignment(second) + "end;";
+						case 1:
+							return "if " + enumName + "~=" + firstValue + " then " + EntryAssignment(second) + "else " + EntryAssignment(first) + "end;";
+						default:
+							return "if " + enumName + ">" + firstValue + " then " + EntryAssignment(second) + "else " + EntryAssignment(first) + "end;";
+					}
+				}
+
+				List<int> ordered = opcodes.OrderBy(opcode => opcode).ToList();
+				int middle = ordered.Count / 2;
+				List<int> left = ordered.Take(middle).ToList();
+				List<int> right = ordered.Skip(middle).ToList();
+				return "if " + enumName + "<=" + ScrambleNumber(left.Last()) + " then " +
+				       BuildOpcodeSelector(left) + "else " + BuildOpcodeSelector(right) + "end;";
+			}
+
+			uint dispatchSaltFactor = (uint)(1 + r.Next(1, 32768) * 2);
+			uint dispatchSaltAddend = unchecked((uint)r.NextInt64(1L, 4294967296L));
+			vm += "local " + dispatchMaskName + "=" + u32Name + "(" + bitXorName + "(" + bitXorName + "(" + T("Flow") + "[3]," +
+			      T("OpcodeKey") + "(" + T("InstrPoint") + "," + T("K1") + "," + T("K2") + "," + T("K3") + "))," +
+			      T("BlockFieldKey") + "(" + T("Flow") + "[3]," + T("InstrPoint") + ",6," + T("K1") + "," + T("K2") + "," + T("K3") + ")));";
+			vm += "local " + dispatchSaltName + "=(" + T("BlockFieldKey") + "(" + T("Flow") + "[3]," + T("InstrPoint") +
+			      ",11," + T("K1") + "," + T("K2") + "," + T("K3") + ")*" + ScrambleUInt(dispatchSaltFactor) + "+" +
+			      ScrambleUInt(dispatchSaltAddend) + ")%4294967296;";
+			vm += "local " + dispatchStateName + "," + dispatchLaneName + "," + dispatchStepMaskName + ";" +
+			      "local " + dispatchActiveName + "=true;local " + dispatchStepsName + "=0;local " + dispatchMatchedName + ";";
+			vm += BuildOpcodeSelector(Enumerable.Range(0, virtuals.Count).ToList());
+
+			int maximumDepth = continuationChains.Values.Max(chain => chain.Count - 1);
+			vm += "while " + dispatchActiveName + " do " +
+			      "if " + dispatchStepsName + ">" + ScrambleNumber(maximumDepth) + " then error('invalid protected payload',0);end;" +
+			      dispatchStepMaskName + "=" + u32Name + "(" + bitXorName + "(" + dispatchMaskName + ",(" + dispatchStepsName + "*" + dispatchSaltName + ")%4294967296));" +
+			      dispatchMatchedName + "=false;";
+
+			int[] laneOrder = Enumerable.Range(0, laneCount).ToArray();
+			laneOrder.Shuffle();
+			for (int laneOrderIndex = 0; laneOrderIndex < laneOrder.Length; laneOrderIndex++)
+			{
+				int lane = laneOrder[laneOrderIndex];
+				vm += (laneOrderIndex == 0 ? "if " : "elseif ") + dispatchLaneName + "==" + ScrambleNumber(lane) + " then ";
+				List<ContinuationNode> laneNodes = allContinuationNodes.Where(node => node.Lane == lane).OrderBy(node => r.Next()).ToList();
+				for (int nodeIndex = 0; nodeIndex < laneNodes.Count; nodeIndex++)
+				{
+					ContinuationNode node = laneNodes[nodeIndex];
+					string decoded = u32Name + "(" + bitXorName + "(" + dispatchStateName + "," + dispatchStepMaskName + "))";
+					string token = ScrambleUInt(node.Token);
+					string condition;
+					switch (r.Next(3))
+					{
+						case 0: condition = decoded + "==" + token; break;
+						case 1: condition = "not(" + decoded + "~=" + token + ")"; break;
+						default: condition = decoded + "<=" + token + " and " + decoded + ">=" + token; break;
+					}
+					vm += (nodeIndex == 0 ? "if " : "elseif ") + condition + " then " + dispatchMatchedName + "=true;";
+					if (node.Terminal)
+					{
+						vm += node.Handler;
+						vm += dispatchActiveName + "=false;";
+					}
+					else
+					{
+						vm += dispatchStepsName + "=" + dispatchStepsName + "+1;" +
+						      dispatchStepMaskName + "=" + u32Name + "(" + bitXorName + "(" + dispatchMaskName + ",(" + dispatchStepsName + "*" + dispatchSaltName + ")%4294967296));" +
+						      dispatchStateName + "=" + u32Name + "(" + bitXorName + "(" + ScrambleUInt(node.NextToken) + "," + dispatchStepMaskName + "));" +
+						      dispatchLaneName + "=" + ScrambleNumber(node.NextLane) + ";";
+					}
+				}
+				vm += "end;";
+			}
+			vm += "end;if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;end;";
 			string finalRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP3_LI_R : VMStrings.VMP3_LI) : (useRepeat ? VMStrings.VMP3_R : VMStrings.VMP3);
 			if (settings.AntiDump)
 			{

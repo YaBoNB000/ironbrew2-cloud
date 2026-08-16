@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -25,7 +26,19 @@ def _permutation(mapping: dict[int, int], count: int, name: str) -> None:
         raise ValueError(f"{name} unexpectedly retained the identity layout")
 
 
-def derive_runtime_layout(source: str) -> dict[str, dict[int, int] | str]:
+def _arithmetic_value(expression: str) -> int:
+    match = re.fullmatch(r"\(\s*(\d+)\s*([+\-*])\s*(\d+)\s*\)", expression)
+    if not match:
+        raise ValueError(f"unsupported scrambled integer expression: {expression}")
+    left, operator, right = int(match.group(1)), match.group(2), int(match.group(3))
+    if operator == "+":
+        return left + right
+    if operator == "-":
+        return left - right
+    return left * right
+
+
+def derive_runtime_layout(source: str) -> dict[str, object]:
     # Deserialize begins with three local storage tables and the Chunk table,
     # followed by keyed assignments for Instructions, Functions and Lines.
     init = _expect(
@@ -57,12 +70,13 @@ def derive_runtime_layout(source: str) -> dict[str, dict[int, int] | str]:
 
     # The opcode bank assignment is uniquely tied to derivation domain 1777.
     opcode = _expect(
-        rf"local\s+({IDENT})\s*=\s*{IDENT}\([^;]*,\s*1777\);\s*"
+        rf"local\s+({IDENT})\s*=\s*{IDENT}\(\s*(\d+)\s*,[^;]*,\s*1777\);\s*"
         rf"{re.escape(chunk)}\[(\d+)\]\s*=\s*\1;",
         source,
         "could not recover Chunk opcode-bank slot",
     )
-    chunk_map[8] = int(opcode.group(2))
+    opcode_count = int(opcode.group(2))
+    chunk_map[8] = int(opcode.group(3))
 
     # Constant capsules are initialized immediately before InstrCount/Blocks.
     capsules = _expect(
@@ -174,26 +188,215 @@ def derive_runtime_layout(source: str) -> dict[str, dict[int, int] | str]:
         match = _expect(pattern, source, f"{label} does not use the permuted Block layout", re.S)
         aliases[label] = match.group(1)
 
+    # The opcode comparison tree must only choose a masked entry token. A
+    # continuation graph then crosses 3-5 shuffled lanes and 3-5 nodes before a
+    # terminal handler runs in the VM closure. Recover the randomized names from
+    # the declaration shape rather than relying on implementation identifiers.
+    continuation_init = _expect(
+        rf"local\s+({IDENT})\s*=\s*({IDENT})\(\s*({IDENT})\([^;]+\)\s*\);\s*"
+        rf"local\s+({IDENT})\s*=\s*[^;]+;\s*"
+        rf"local\s+({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*;\s*"
+        rf"local\s+({IDENT})\s*=\s*true;\s*local\s+({IDENT})\s*=\s*0;\s*"
+        rf"local\s+({IDENT})\s*;",
+        source,
+        "could not recover continuation dispatcher locals",
+    )
+    (dispatch_mask, dispatch_u32, dispatch_xor, dispatch_salt, dispatch_state, dispatch_lane,
+     dispatch_step_mask, dispatch_active, dispatch_steps, dispatch_matched) = continuation_init.groups()
+    dispatch_names = {
+        dispatch_mask, dispatch_u32, dispatch_xor, dispatch_salt, dispatch_state, dispatch_lane,
+        dispatch_step_mask, dispatch_active, dispatch_steps, dispatch_matched,
+    }
+    if len(dispatch_names) != 10:
+        raise ValueError("continuation dispatcher locals are not independently randomized")
+    stable_dispatch = re.search(
+        r"\b(?:DispatchMask|DispatchSalt|DispatchState|DispatchLane|DispatchActive|"
+        r"DispatchSteps|DispatchStepMask|DispatchMatched|BitXOR|U32)\b",
+        source,
+    )
+    if stable_dispatch:
+        raise ValueError(f"stable continuation identifier leaked: {stable_dispatch.group(0)}")
+    if not re.search(rf"\b{re.escape(flow_name)}\s*\[\s*{flow_map[3]}\s*\]", continuation_init.group(0)):
+        raise ValueError("continuation entry mask is not bound to the current Flow state")
+
+    continuation_loop = _expect(
+        rf"while\s+{re.escape(dispatch_active)}\s+do\s+(.*?)"
+        rf"if\s+not\s+{re.escape(dispatch_matched)}\s+then\s+"
+        rf"error\(\s*['\"]invalid protected payload['\"]\s*,\s*0\s*\);\s*end;\s*end;",
+        source[continuation_init.end():],
+        "could not recover complete continuation dispatcher loop",
+        re.S,
+    )
+    selector = source[continuation_init.end():continuation_init.end() + continuation_loop.start()]
+    loop_body = continuation_loop.group(1)
+    arithmetic = r"(\(\s*\d+\s*[+\-*]\s*\d+\s*\))"
+
+    salt_init = _expect(
+        rf"local\s+{re.escape(dispatch_salt)}\s*=\s*\([^;]*\*\s*{arithmetic}\s*\+\s*{arithmetic}"
+        rf"\s*\)\s*%\s*4294967296\s*;",
+        continuation_init.group(0),
+        "continuation salt is not flow-derived 32-bit arithmetic",
+    )
+    salt_factor = _arithmetic_value(salt_init.group(1))
+    if salt_factor == 0 or salt_factor % 2 == 0:
+        raise ValueError("continuation step salt factor must be odd and non-zero")
+
+    entry_matches = re.findall(
+        rf"{re.escape(dispatch_state)}\s*=\s*{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
+        rf"{arithmetic}\s*,\s*{re.escape(dispatch_mask)}\s*\)\s*\);\s*"
+        rf"{re.escape(dispatch_lane)}\s*=\s*{arithmetic}\s*;",
+        selector,
+    )
+    entry_tokens = [_arithmetic_value(token) for token, _lane in entry_matches]
+    entry_lanes = [_arithmetic_value(lane) for _token, lane in entry_matches]
+    if len(entry_tokens) != opcode_count or len(set(entry_tokens)) != opcode_count:
+        raise ValueError(f"opcode selector exposed {len(entry_tokens)} non-unique entries for {opcode_count} opcodes")
+
+    lane_pattern = re.compile(
+        rf"(?:if|elseif)\s+{re.escape(dispatch_lane)}\s*==\s*{arithmetic}\s+then"
+    )
+    lane_matches = list(lane_pattern.finditer(loop_body))
+    lane_values = [_arithmetic_value(match.group(1)) for match in lane_matches]
+    lanes = set(lane_values)
+    if len(lanes) < 3 or len(lanes) > 5 or lanes != set(range(len(lanes))) or len(lane_values) != len(lanes):
+        raise ValueError(f"continuation dispatcher does not use one complete 3-5 lane set: {lane_values}")
+
+    decoded_state = (rf"{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
+                     rf"{re.escape(dispatch_state)}\s*,\s*{re.escape(dispatch_step_mask)}\s*\)\s*\)")
+    node_header = (
+        rf"(?:if|elseif)\s+(?:not\s*\(\s*)?{decoded_state}\s*(?:==|~=|<=)\s*{arithmetic}"
+        rf"[^;]*?then\s+{re.escape(dispatch_matched)}\s*=\s*true;"
+    )
+    node_matches = list(re.finditer(node_header, loop_body))
+    node_tokens = [_arithmetic_value(match.group(1)) for match in node_matches]
+    if len(node_tokens) != len(set(node_tokens)):
+        raise ValueError("continuation state tokens are not unique")
+
+    node_lanes: dict[int, int] = {}
+    for lane_index, lane_match in enumerate(lane_matches):
+        lane = _arithmetic_value(lane_match.group(1))
+        lane_end = lane_matches[lane_index + 1].start() if lane_index + 1 < len(lane_matches) else len(loop_body)
+        for node_match in re.finditer(node_header, loop_body[lane_match.end():lane_end]):
+            token = _arithmetic_value(node_match.group(1))
+            if token in node_lanes:
+                raise ValueError("continuation state appears in multiple lanes")
+            node_lanes[token] = lane
+    if set(node_lanes) != set(node_tokens):
+        raise ValueError("could not bind every continuation state to exactly one lane")
+
+    step_mask_assignment = (
+        rf"{re.escape(dispatch_step_mask)}\s*=\s*{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
+        rf"{re.escape(dispatch_mask)}\s*,\s*\(\s*{re.escape(dispatch_steps)}\s*\*\s*"
+        rf"{re.escape(dispatch_salt)}\s*\)\s*%\s*4294967296\s*\)\s*\);"
+    )
+    transition_pattern = re.compile(
+        node_header +
+        rf"\s*{re.escape(dispatch_steps)}\s*=\s*{re.escape(dispatch_steps)}\s*\+\s*1;\s*"
+        + step_mask_assignment +
+        rf"\s*{re.escape(dispatch_state)}\s*=\s*{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
+        rf"{arithmetic}\s*,\s*{re.escape(dispatch_step_mask)}\s*\)\s*\);\s*"
+        rf"{re.escape(dispatch_lane)}\s*=\s*{arithmetic}\s*;"
+    )
+    transitions: dict[int, int] = {}
+    transition_lanes: dict[int, int] = {}
+    for match in transition_pattern.finditer(loop_body):
+        current = _arithmetic_value(match.group(1))
+        successor = _arithmetic_value(match.group(2))
+        successor_lane = _arithmetic_value(match.group(3))
+        if current in transitions:
+            raise ValueError("continuation state has multiple successor assignments")
+        transitions[current] = successor
+        transition_lanes[current] = successor_lane
+
+    terminal_count = len(re.findall(rf"\b{re.escape(dispatch_active)}\s*=\s*false;", loop_body))
+    if terminal_count != opcode_count:
+        raise ValueError(f"expected {opcode_count} terminal handlers, found {terminal_count}")
+    if re.search(rf"\b{re.escape(dispatch_active)}\s*=\s*false;", selector):
+        raise ValueError("opcode selector still contains a terminal handler marker")
+    if len(node_tokens) != len(transitions) + terminal_count:
+        raise ValueError("continuation node/transition/terminal counts are inconsistent")
+    if not set(transitions.values()).issubset(set(node_tokens)):
+        raise ValueError("continuation transition targets an unknown state token")
+    if len(re.findall(step_mask_assignment, loop_body)) != len(transitions) + 1:
+        raise ValueError("continuation step mask is not recomputed at loop entry and after every transition")
+
+    for entry, entry_lane in zip(entry_tokens, entry_lanes):
+        if node_lanes.get(entry) != entry_lane:
+            raise ValueError("opcode selector chose the wrong lane for its continuation entry")
+    for current, successor in transitions.items():
+        successor_lane = transition_lanes[current]
+        if node_lanes[successor] != successor_lane:
+            raise ValueError("continuation transition chose the wrong target lane")
+        if node_lanes[current] == successor_lane:
+            raise ValueError("continuation path retained the same lane across adjacent nodes")
+
+    visited: set[int] = set()
+    has_full_lane_path = False
+    for entry in entry_tokens:
+        path: set[int] = set()
+        path_lanes: set[int] = set()
+        current = entry
+        while current in transitions:
+            if current in path:
+                raise ValueError("continuation path contains a cycle")
+            path.add(current)
+            path_lanes.add(node_lanes[current])
+            current = transitions[current]
+        path.add(current)
+        path_lanes.add(node_lanes[current])
+        if current not in node_tokens:
+            raise ValueError("continuation entry does not reach a terminal handler")
+        if len(path) < 3 or len(path) > 5:
+            raise ValueError(f"continuation path length is outside 3-5 nodes: {len(path)}")
+        if visited.intersection(path):
+            raise ValueError("opcode continuation paths unexpectedly merge")
+        visited.update(path)
+        has_full_lane_path |= path_lanes == lanes
+    if visited != set(node_tokens):
+        raise ValueError("continuation graph contains unreachable states")
+    if not has_full_lane_path:
+        raise ValueError("no continuation path covers every generated lane")
+
+    graph_material = ",".join(
+        f"{index}:{entry}@{entry_lanes[index]}" for index, entry in enumerate(entry_tokens)
+    ) + ";" + ",".join(
+        f"{current}@{node_lanes[current]}>{successor}@{transition_lanes[current]}"
+        for current, successor in sorted(transitions.items())
+    )
+    continuation = {
+        "opcodes": opcode_count,
+        "lanes": len(lanes),
+        "entries": len(entry_tokens),
+        "nodes": len(node_tokens),
+        "transitions": len(transitions),
+        "terminals": terminal_count,
+        "fingerprint": hashlib.sha256(graph_material.encode("ascii")).hexdigest()[:16],
+    }
+
     return {
         "chunk": chunk_map,
         "block": block_map_slots,
         "flow": flow_map,
         "flow_cache": flow_cache_map,
+        "continuation": continuation,
         "identifiers": {
             "Chunk": chunk,
             "Block": block_name,
             "Flow": flow_name,
             "FlowCache": flow_cache_name,
+            "DispatchState": dispatch_state,
+            "DispatchLane": dispatch_lane,
             **aliases,
         },
     }
 
 
-def json_ready(layout: dict[str, dict[int, int] | str]) -> dict[str, object]:
-    return {
-        key: ({str(old): new for old, new in value.items()} if key != "identifiers" else value)
-        for key, value in layout.items()
-    }
+def json_ready(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_ready(item) for item in value]
+    return value
 
 
 def main() -> int:
@@ -209,7 +412,10 @@ def main() -> int:
             changed = [name for name in ("chunk", "block", "flow", "flow_cache") if first[name] != second[name]]
             if not changed:
                 raise ValueError("independent builds unexpectedly reused the complete runtime slot ABI")
+            if first["continuation"]["fingerprint"] == second["continuation"]["fingerprint"]:
+                raise ValueError("independent builds unexpectedly reused the continuation graph")
             print("PASS independent runtime slot ABI differs: " + ", ".join(changed))
+            print("PASS independent continuation graph differs")
     except (OSError, ValueError) as error:
         raise SystemExit(str(error)) from error
     return 0
