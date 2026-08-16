@@ -98,54 +98,62 @@ for payload_case in prototype-tag block-manifest column-framing column-consumpti
 done
 echo "PASS v4 prototype, block-manifest, column framing/consumption and constant-capsule tamper rejection"
 
-# The trusted test executor must pass every hard-AND behavior contract. The
-# compatibility paths also model proxy-backed globals, empty C-upvalue results,
-# userdata inactive-proto handles and callable inactive protos that execute the
-# expected child. The temporary global report-only switch preserves every guard
-# challenge but supplies the expected payload token and continues instead of
-# entering the sink. This lets the obfuscated checker print executor failures;
-# it must be set back to false after the real-executor comparison is complete.
-run_executor "$WORK/fixed.lua" > "$WORK/executor-trusted.out"
-cmp "$WORK/baseline.out" "$WORK/executor-trusted.out"
-run_executor_mode no-alias "$WORK/fixed.lua" > "$WORK/executor-no-alias.out"
-cmp "$WORK/baseline.out" "$WORK/executor-no-alias.out"
-run_executor_mode compat-representations "$WORK/fixed.lua" > "$WORK/executor-compat-representations.out"
-cmp "$WORK/baseline.out" "$WORK/executor-compat-representations.out"
-run_executor_mode callable-proto "$WORK/fixed.lua" > "$WORK/executor-callable-proto.out"
-cmp "$WORK/baseline.out" "$WORK/executor-callable-proto.out"
+# The trusted test executor must pass every retained hard-AND behavior contract.
+# Compatibility paths model proxy-backed globals, empty C-upvalue results and
+# alternate inactive-proto representations. The removed-root-contracts mode
+# reproduces all six real-executor compatibility failures removed from the gate:
+# hidden random constants/upvalues, no observable interim setupvalue mutation,
+# wrong callable inactive results and a wrong activated-proto result.
+for mode in trusted no-alias compat-representations callable-proto wrong-callable-proto removed-root-contracts; do
+    run_executor_mode "$mode" "$WORK/fixed.lua" > "$WORK/executor-$mode.out"
+    cmp "$WORK/baseline.out" "$WORK/executor-$mode.out"
+done
 
-# The standalone sink checker evaluates every condition without entering the
-# sink itself, but prints only triggering conditions plus its final summary.
-# Trusted, callable-proto and compatible representation shims have no triggering
-# line; a callable proto with the wrong result is reported before the summary.
-for mode in trusted callable-proto compat-representations; do
+# The standalone sink checker evaluates every retained production condition
+# without entering the sink itself, prints only triggering conditions and keeps
+# a dynamic summary. All six removed root contracts must be absent from its
+# record set and from transcript/token/seal evidence.
+removed_sink_checks=(
+    constants.contains-random-value
+    upvalues.contains-random-value
+    upvalues.changed-value
+    proto.getproto-inactive-contract
+    proto.getproto-active-result
+    proto.getprotos-inactive-contract
+)
+for check in "${removed_sink_checks[@]}"; do
+    ! grep -Fq "$check" tools/executor_sink_trigger_check.lua
+done
+for mode in trusted callable-proto compat-representations wrong-callable-proto removed-root-contracts; do
     "$LUA" tests/executor_runner.lua "$mode" tools/executor_sink_trigger_check.lua \
         > "$WORK/sink-check-$mode.out"
     ! grep -q '^\[会触发静默 sink\]' "$WORK/sink-check-$mode.out"
     ! grep -q '^\[不会触发静默 sink\]' "$WORK/sink-check-$mode.out"
-    grep -q '^逐项汇总: 不会触发静默 sink: 168 会触发静默 sink: 0$' \
+    grep -q '^逐项汇总: 不会触发静默 sink: 162 会触发静默 sink: 0$' \
         "$WORK/sink-check-$mode.out"
     grep -q '^综合结论: 当前环境不会因上述 executor gate 条件进入静默 sink$' \
         "$WORK/sink-check-$mode.out"
 done
-"$LUA" tests/executor_runner.lua wrong-callable-proto tools/executor_sink_trigger_check.lua \
-    > "$WORK/sink-check-wrong-callable.out"
-grep -q '^\[会触发静默 sink\] proto.getproto-inactive-contract:' \
-    "$WORK/sink-check-wrong-callable.out"
-grep -q '^\[会触发静默 sink\] proto.getprotos-inactive-contract:' \
-    "$WORK/sink-check-wrong-callable.out"
-! grep -q '^\[不会触发静默 sink\]' "$WORK/sink-check-wrong-callable.out"
-grep -q '^综合结论: 当前环境会进入静默 sink$' \
-    "$WORK/sink-check-wrong-callable.out"
-echo "PASS standalone sink-trigger checker"
+echo "PASS standalone sink-trigger checker and six removed root contracts"
 
-"$LUA" "$WORK/fixed.lua" > "$WORK/executor-plain.out"
-cmp "$WORK/baseline.out" "$WORK/executor-plain.out"
+set +e
+timeout 1s "$LUA" "$WORK/fixed.lua" > "$WORK/executor-plain.stdout" 2> "$WORK/executor-plain.stderr"
+plain_code=$?
+set -e
+[[ $plain_code -eq 124 ]]
+[[ ! -s "$WORK/executor-plain.stdout" && ! -s "$WORK/executor-plain.stderr" ]]
 
-for mode in primitive-hook raw-hook debug-api-hook classifier-spoof identity-spoof version-number missing-debug polluted-genv invalid-load wrong-callable-proto c-debug-leak c-upvalue-leak; do
-    timeout 5s "$LUA" tests/executor_runner.lua "$mode" "$WORK/fixed.lua" \
-        > "$WORK/executor-$mode.out"
-    cmp "$WORK/baseline.out" "$WORK/executor-$mode.out"
+# With the temporary bypass disabled, ordinary Lua and every retained
+# executor-contract failure must remain in the silent non-yielding sink until
+# the external timeout kills the process. The sink itself emits no output.
+for mode in primitive-hook raw-hook debug-api-hook classifier-spoof identity-spoof version-number missing-debug polluted-genv invalid-load c-debug-leak c-upvalue-leak; do
+    set +e
+    timeout 1s "$LUA" tests/executor_runner.lua "$mode" "$WORK/fixed.lua" \
+        > "$WORK/executor-$mode.stdout" 2> "$WORK/executor-$mode.stderr"
+    sink_code=$?
+    set -e
+    [[ $sink_code -eq 124 ]]
+    [[ ! -s "$WORK/executor-$mode.stdout" && ! -s "$WORK/executor-$mode.stderr" ]]
 done
 set +e
 timeout 5s "$LUA" tests/executor_runner.lua canary-error "$WORK/fixed.lua" \
@@ -154,7 +162,7 @@ canary_code=$?
 set -e
 [[ $canary_code -eq 42 ]]
 [[ ! -s "$WORK/executor-canary-error.stdout" && ! -s "$WORK/executor-canary-error.stderr" ]]
-echo "PASS strict executor detection and temporary global report-only continuation"
+echo "PASS strict executor detection, silent sink enforcement and challenge cleanup"
 
 # Verify the unminified generated VM contains all three guard checkpoints and
 # that stable implementation identifiers do not survive name randomization.

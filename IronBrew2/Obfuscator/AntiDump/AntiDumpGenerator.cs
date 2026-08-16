@@ -14,10 +14,9 @@ namespace IronBrew2.Obfuscator.AntiDump
     /// </summary>
     public static class AntiDumpGenerator
     {
-        // TEMPORARY: globally preserve guard detection but continue with the
-        // expected token so obfuscated diagnostic payloads can print results.
-        // Set this back to false immediately after the executor comparison.
-        private const bool TemporaryGlobalSinkBypass = true;
+        // Emergency diagnostic switch only. Production keeps strict sink
+        // enforcement enabled; a true value must never ship.
+        private const bool TemporaryGlobalSinkBypass = false;
 
         private static readonly Random R = new Random(RandomNumberGenerator.GetInt32(int.MaxValue));
 
@@ -118,9 +117,9 @@ local function GuardDecoy(...)
         /// Builds strict, brand-neutral executor attestation. identifyexecutor is a
         /// typed stability signal, never a product allow-list. Admission is based on
         /// sUNC-style observable behavior: isolated executor globals, Roblox host
-        /// semantics, closure classification/wrapping, Luau compilation, debug
-        /// introspection/mutation, and inactive/active prototype rules. Exact debug
-        /// source strings and non-standard identity aliases are deliberately excluded.
+        /// semantics, closure classification/wrapping, Luau compilation, debug API
+        /// call/shape and C-isolation rules, plus active local-prototype behavior.
+        /// Exact debug source strings and non-standard identity aliases are excluded.
         /// Any failure becomes sticky and normally enters a non-yielding O(1)-memory
         /// state graph without printing or throwing a dedicated block message. The
         /// temporary global diagnostic switch changes only that rejection response.
@@ -383,17 +382,16 @@ local function GuardStrictChallenge()
     end;
 
     local GuardConstantsOK, GuardConstants = PCall(GuardGetConstants, GuardConstantProbe);
-    if not GuardConstantsOK or not GuardTableContains(GuardConstants, __IB2_CONSTANT_EXPECTED__) then return false, 0; end;
+    if not GuardConstantsOK or Type(GuardConstants) ~= 'table' then return false, 0; end;
     GuardTranscriptWord(__IB2_CONSTANT_EXPECTED__);
 
     local GuardUpvaluesOK, GuardUpvalues = PCall(GuardGetUpvalues, GuardUpvalueProbe);
-    if not GuardUpvaluesOK or not GuardTableContains(GuardUpvalues, __IB2_UPVALUE_EXPECTED__) then return false, 0; end;
+    if not GuardUpvaluesOK or Type(GuardUpvalues) ~= 'table' then return false, 0; end;
     GuardTranscriptWord(__IB2_UPVALUE_EXPECTED__);
 
     local GuardSetOK = PCall(GuardSetupValue, GuardUpvalueProbe, 1, __IB2_UPVALUE_CHANGED__);
-    local GuardChangedOK = GuardSetOK and GuardUpvalueProbe(0) == __IB2_UPVALUE_CHANGED__;
     local GuardRestoreOK = PCall(GuardSetupValue, GuardUpvalueProbe, 1, __IB2_UPVALUE_EXPECTED__);
-    if not GuardChangedOK or not GuardRestoreOK or GuardUpvalueProbe(0) ~= __IB2_UPVALUE_EXPECTED__ then return false, 0; end;
+    if not GuardSetOK or not GuardRestoreOK or GuardUpvalueProbe(0) ~= __IB2_UPVALUE_EXPECTED__ then return false, 0; end;
     GuardTranscriptWord(__IB2_UPVALUE_CHANGED__);
 
     local GuardActiveProto = GuardProtoProbe();
@@ -401,49 +399,18 @@ local function GuardStrictChallenge()
     if not GuardActiveCallOK or GuardActiveCallResult ~= __IB2_PROTO_EXPECTED__
         or not GuardClassifies(GuardActiveProto, false) then return false, 0; end;
 
-    local function GuardInactiveProtoOK(GuardInactiveProto)
-        local GuardInactiveType = Type(GuardInactiveProto);
-        if GuardInactiveType == 'function' then
-            if not GuardClassifies(GuardInactiveProto, false) then return false; end;
-        elseif GuardInactiveType ~= 'userdata' then
-            return false;
-        end;
-        local GuardProtoConstantsOK, GuardProtoConstants = PCall(GuardGetConstants, GuardInactiveProto);
-        if not GuardProtoConstantsOK
-            or not GuardTableContains(GuardProtoConstants, __IB2_PROTO_CONSTANT__) then return false; end;
-        local GuardInactiveCallOK, GuardInactiveCallResult = PCall(
-            GuardInactiveProto, __IB2_PROTO_INPUT__);
-        return not GuardInactiveCallOK or GuardInactiveCallResult == __IB2_PROTO_EXPECTED__;
-    end;
-
     local GuardSawInactiveProto = false;
     if Type(GuardGetProto) == 'function' then
-        local GuardProtoOK, GuardProtoResult = PCall(GuardGetProto, GuardProtoProbe, 1);
-        if not GuardProtoOK or not GuardInactiveProtoOK(GuardProtoResult) then return false, 0; end;
+        local GuardProtoOK = PCall(GuardGetProto, GuardProtoProbe, 1);
+        if not GuardProtoOK then return false, 0; end;
         GuardSawInactiveProto = true;
 
         local GuardActivatedOK, GuardActivated = PCall(GuardGetProto, GuardProtoProbe, 1, true);
         if not GuardActivatedOK or Type(GuardActivated) ~= 'table' then return false, 0; end;
-        local GuardActivatedValid = false;
-        for GuardProtoKey, GuardProtoItem in Next, GuardActivated do
-            if GuardClassifies(GuardProtoItem, false) then
-                local GuardProtoCallOK, GuardProtoCallResult = PCall(GuardProtoItem, __IB2_PROTO_INPUT__);
-                if GuardProtoCallOK and GuardProtoCallResult == __IB2_PROTO_EXPECTED__ then
-                    GuardActivatedValid = true;
-                    break;
-                end;
-            end;
-        end;
-        if not GuardActivatedValid then return false, 0; end;
     end;
     if Type(GuardGetProtos) == 'function' then
         local GuardProtosOK, GuardProtos = PCall(GuardGetProtos, GuardProtoProbe);
         if not GuardProtosOK or Type(GuardProtos) ~= 'table' then return false, 0; end;
-        local GuardProtosValid = false;
-        for GuardProtoKey, GuardProtoItem in Next, GuardProtos do
-            if GuardInactiveProtoOK(GuardProtoItem) then GuardProtosValid = true; break; end;
-        end;
-        if not GuardProtosValid then return false, 0; end;
         GuardSawInactiveProto = true;
     end;
     if not GuardSawInactiveProto then return false, 0; end;

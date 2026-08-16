@@ -11,6 +11,9 @@ local native_byte = string.byte
 local native_rawset = rawset
 local native_loadstring = loadstring
 local inactive_targets = setmetatable({}, {__mode = "k"})
+local lua_constants_calls = 0
+local lua_upvalues_calls = 0
+local lua_setupvalue_calls = 0
 
 local function closure_kind(value)
     if type(value) ~= "function" then return nil end
@@ -20,6 +23,12 @@ end
 
 local function inspect_constants(value)
     if closure_kind(value) == "C" then error("C closures have no accessible constants") end
+    lua_constants_calls = lua_constants_calls + 1
+    if mode == "removed-root-contracts" and lua_constants_calls == 1 then
+        -- The generated constant probe remains callable, but its randomized
+        -- value is not visible through this executor's constants API.
+        return {}
+    end
     -- Lua 5.1 cannot expose an inactive proto object. The harness associates a
     -- wrapper with its real child so constants inspection remains independent
     -- from whether that executor representation is callable.
@@ -37,6 +46,12 @@ local function inspect_upvalues(value)
         if mode == "c-upvalue-leak" then return {197843211} end
         error("C closures have no accessible upvalues")
     end
+    lua_upvalues_calls = lua_upvalues_calls + 1
+    if mode == "removed-root-contracts" and lua_upvalues_calls == 1 then
+        -- The API succeeds with the required table shape but does not expose
+        -- the private randomized probe value.
+        return {}
+    end
     local values = {}
     local index = 1
     while true do
@@ -53,7 +68,7 @@ local function inactive_proto(target)
     local wrapper
     if mode == "compat-representations" then
         wrapper = newproxy(true)
-    elseif mode == "wrong-callable-proto" then
+    elseif mode == "wrong-callable-proto" or mode == "removed-root-contracts" then
         wrapper = function() return -197843211 end
     else
         wrapper = function() error("inactive prototype") end
@@ -66,7 +81,12 @@ local function inspect_proto(value, activated)
     if closure_kind(value) == "C" then error("C closures have no prototypes") end
     local ok, result = pcall(value)
     if not ok or type(result) ~= "function" then error("prototype not found") end
-    if activated then return {result} end
+    if activated then
+        if mode == "removed-root-contracts" then
+            return {function() return -197843211 end}
+        end
+        return {result}
+    end
     return inactive_proto(result)
 end
 
@@ -149,6 +169,13 @@ debug.getproto = function(value, _, activated) return inspect_proto(value, activ
 debug.getprotos = function(value) return {inspect_proto(value, false)} end
 debug.setupvalue = function(value, index, replacement)
     if closure_kind(value) == "C" then error("C closure upvalues are protected") end
+    lua_setupvalue_calls = lua_setupvalue_calls + 1
+    if mode == "removed-root-contracts" and lua_setupvalue_calls <= 2 then
+        -- Both setup and restore calls succeed, but the interim write is not
+        -- observable; the private probe consequently remains at its original
+        -- value for the retained final-restore check.
+        return "upvalue"
+    end
     return native_setupvalue(value, index, replacement)
 end
 
@@ -202,7 +229,7 @@ elseif mode == "missing-debug" then
 elseif mode == "trusted" or mode == "no-alias" or mode == "compat-representations"
     or mode == "polluted-genv" or mode == "invalid-load" or mode == "callable-proto"
     or mode == "c-debug-leak" or mode == "c-upvalue-leak" or mode == "wrong-callable-proto"
-    or mode == "canary-error" then
+    or mode == "removed-root-contracts" or mode == "canary-error" then
     -- Behavior for these modes is installed above before the generated chunk.
 else
     error("unknown executor harness mode: " .. tostring(mode))

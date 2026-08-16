@@ -342,7 +342,6 @@ end
 local CONSTANT_EXPECTED = 731245907
 local UPVALUE_EXPECTED = 318640271
 local UPVALUE_CHANGED = 827154963
-local PROTO_CONSTANT = 451278301
 local PROTO_INPUT = 59254
 local PROTO_EXPECTED = 451337555
 local LOAD_EXPECTED = 613323272
@@ -371,29 +370,22 @@ local function CBody(value) return Math0.abs(value) end
 local constantsOK, constants = false, nil
 if is_function(GetConstants0) then constantsOK, constants = PCall0(GetConstants0, ConstantProbe) end
 local constantsTable = constantsOK and value_type(constants) == "table"
-local constantsContain = constantsTable and table_contains(constants, CONSTANT_EXPECTED)
 record("constants.call", constantsOK, "debug.getconstants raised")
 record("constants.table", constantsTable, "expected table, got " .. value_type(constants))
-record("constants.contains-random-value", constantsContain, "random numeric constant was not found")
 
 local upvaluesOK, upvalues = false, nil
 if is_function(GetUpvalues0) then upvaluesOK, upvalues = PCall0(GetUpvalues0, UpvalueProbe) end
 local upvaluesTable = upvaluesOK and value_type(upvalues) == "table"
-local upvaluesContain = upvaluesTable and table_contains(upvalues, UPVALUE_EXPECTED)
 record("upvalues.call", upvaluesOK, "debug.getupvalues raised")
 record("upvalues.table", upvaluesTable, "expected table, got " .. value_type(upvalues))
-record("upvalues.contains-random-value", upvaluesContain, "private upvalue value was not found")
 
 local setupOK = false
 if is_function(SetupValue0) then setupOK = PCall0(SetupValue0, UpvalueProbe, 1, UPVALUE_CHANGED) end
-local changedCallOK, changedValue = PCall0(UpvalueProbe, 0)
-local changedObserved = changedCallOK and changedValue == UPVALUE_CHANGED
 local restoreOK = false
 if is_function(SetupValue0) then restoreOK = PCall0(SetupValue0, UpvalueProbe, 1, UPVALUE_EXPECTED) end
 local restoredCallOK, restoredValue = PCall0(UpvalueProbe, 0)
 local restoredObserved = restoredCallOK and restoredValue == UPVALUE_EXPECTED
 record("upvalues.setupvalue-call", setupOK, "setupvalue did not complete")
-record("upvalues.changed-value", changedObserved, "function did not observe the changed upvalue")
 record("upvalues.restore-call", restoreOK, "setupvalue restore did not complete")
 record("upvalues.restored-value", restoredObserved, "private upvalue was not restored")
 
@@ -407,55 +399,20 @@ record("proto.child-result", activeCallOK and activeCallValue == PROTO_EXPECTED,
 local activeClass, activeClassDetail = classification_result(ActiveProto, false)
 record("proto.child-Luau-class", activeClass, activeClassDetail)
 
-local function inactive_proto_result(value)
-    local kind = value_type(value)
-    if kind == "function" then
-        local classOK, classDetail = classification_result(value, false)
-        if not classOK then return false, "classification: " .. safe_text(classDetail) end
-    elseif kind ~= "userdata" then
-        return false, "expected function/userdata handle, got " .. kind
-    end
-    local inspectOK, protoConstants = PCall0(GetConstants0, value)
-    if not inspectOK then return false, "getconstants raised" end
-    if not table_contains(protoConstants, PROTO_CONSTANT) then return false, "child constant missing" end
-    local callable, callResult = PCall0(value, PROTO_INPUT)
-    if callable and callResult ~= PROTO_EXPECTED then
-        return false, "callable inactive proto returned " .. safe_text(callResult)
-            .. " instead of " .. PROTO_EXPECTED
-    end
-    return true
-end
-
 local getprotoEvidence = true
 if is_function(GetProto0) then
-    local inactiveOK, InactiveProto = PCall0(GetProto0, ProtoProbe, 1)
+    local inactiveOK = PCall0(GetProto0, ProtoProbe, 1)
     record("proto.getproto-call", inactiveOK, "debug.getproto(parent, 1) raised")
-    local inactiveValid, inactiveDetail = false, "getproto call failed"
-    if inactiveOK then inactiveValid, inactiveDetail = inactive_proto_result(InactiveProto) end
-    record("proto.getproto-inactive-contract", inactiveValid, inactiveDetail)
 
     local activatedOK, Activated = PCall0(GetProto0, ProtoProbe, 1, true)
     record("proto.getproto-active-call", activatedOK, "debug.getproto(parent, 1, true) raised")
     local activatedTable = activatedOK and value_type(Activated) == "table"
     record("proto.getproto-active-table", activatedTable, "expected table, got " .. value_type(Activated))
-    local activatedValid = false
-    if activatedTable then
-        for _, item in Next0, Activated do
-            local classOK = classification_result(item, false)
-            if classOK then
-                local callOK, value = PCall0(item, PROTO_INPUT)
-                if callOK and value == PROTO_EXPECTED then activatedValid = true break end
-            end
-        end
-    end
-    record("proto.getproto-active-result", activatedValid, "no active Luau child returned the expected value")
-    getprotoEvidence = inactiveOK and inactiveValid and activatedOK and activatedTable and activatedValid
+    getprotoEvidence = inactiveOK and activatedOK and activatedTable
 else
     record("proto.getproto-call", true)
-    record("proto.getproto-inactive-contract", true)
     record("proto.getproto-active-call", true)
     record("proto.getproto-active-table", true)
-    record("proto.getproto-active-result", true)
 end
 
 local getprotosEvidence = true
@@ -464,18 +421,10 @@ if is_function(GetProtos0) then
     record("proto.getprotos-call", protosOK, "debug.getprotos(parent) raised")
     local protosTable = protosOK and value_type(Protos) == "table"
     record("proto.getprotos-table", protosTable, "expected table, got " .. value_type(Protos))
-    local foundInactive = false
-    if protosTable then
-        for _, item in Next0, Protos do
-            if inactive_proto_result(item) then foundInactive = true break end
-        end
-    end
-    record("proto.getprotos-inactive-contract", foundInactive, "no inactive proto had valid constants and call behavior")
-    getprotosEvidence = protosOK and protosTable and foundInactive
+    getprotosEvidence = protosOK and protosTable
 else
     record("proto.getprotos-call", true)
     record("proto.getprotos-table", true)
-    record("proto.getprotos-inactive-contract", true)
 end
 local protoSurfaceEvidence = (is_function(GetProto0) or is_function(GetProtos0))
     and getprotoEvidence and getprotosEvidence
@@ -535,7 +484,7 @@ transcript = mix_word(transcript, UPVALUE_CHANGED)
 transcript = mix_word(transcript, PROTO_EXPECTED)
 transcript = mix_word(transcript, LOAD_EXPECTED)
 transcript = mix_word(transcript, C_INPUT)
-local challengeEvidence = constantsContain and upvaluesContain and setupOK and changedObserved
+local challengeEvidence = constantsTable and upvaluesTable and setupOK
     and restoreOK and restoredObserved and activeParentOK and activeCallOK
     and activeCallValue == PROTO_EXPECTED and activeClass and protoSurfaceEvidence
     and invalidOK and invalidFunction == nil and value_type(invalidError) == "string" and #invalidError >= 1
