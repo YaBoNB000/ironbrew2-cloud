@@ -706,6 +706,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardPersistent","GuardProtoConstants","GuardProtoConstantsOK","GuardProtosValid","GuardReject","GuardRepeatEnvironment","GuardRepeatOK","GuardReportOnly","GuardSawInactiveProto","GuardSeparated",
 				"GuardThreadMarker","GuardThreadOld","GuardCanaryOK","GuardCapabilityRestoreOK","GuardThreadRestoreOK","GuardWrappedUpvalues","GuardWrappedUpvaluesOK",
 				"GuardPrimitiveIndex","GuardPrimitives",
+				"PayloadRejectA","PayloadRejectB","PayloadRejectC","PayloadRejectD",
+				"PayloadRejectVoidA","PayloadRejectVoidB","PayloadRejectVoidC","PayloadRejectVoidD",
+				"PayloadRejectCodeA","PayloadRejectCodeB","PayloadRejectCodeC","PayloadRejectCodeD",
 				"PayloadHead","PayloadTag","PayloadFlags","PayloadFeatures","PayloadVersion","OuterSeed","PayloadHash","PayloadIndex","PayloadDecoded","PayloadByte","PayloadKey",
 				"EnvelopePos","EnvelopeRead32","EnvelopeRealLength","EnvelopeEntropyLength","EnvelopeRecordCount","EnvelopeDataCount","EnvelopeEntropyCount","EnvelopeNonce","EnvelopeDigest","EnvelopeTag","EnvelopeExpected",
 				"EnvelopeHash","EnvelopeIndex","EnvelopeDataRecords","EnvelopeEntropyRecords","EnvelopeDataLength","EnvelopeEntropySeenLength","EnvelopeKind","EnvelopeOrdinal","EnvelopeLength","EnvelopeRecord",
@@ -880,6 +883,54 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				}
 			}
 
+			string[] payloadRejectKeys = {"PayloadRejectA", "PayloadRejectB", "PayloadRejectC", "PayloadRejectD"};
+			string[] payloadRejectVoidKeys = {"PayloadRejectVoidA", "PayloadRejectVoidB", "PayloadRejectVoidC", "PayloadRejectVoidD"};
+			string[] payloadRejectCodeKeys = {"PayloadRejectCodeA", "PayloadRejectCodeB", "PayloadRejectCodeC", "PayloadRejectCodeD"};
+
+			// Payload authentication failures deliberately enter one of four native
+			// runtime-fault shapes. Randomized identifiers and per-site encoded values
+			// avoid both a stable diagnostic and a repeated direct error(...) signature.
+			string BuildPayloadRejectRuntime()
+			{
+				string[] bodies = {
+					"return {VOID}[{CODE}];",
+					"return {VOID}({CODE});",
+					"return {CODE}+{VOID};",
+					"return #{VOID}+{CODE};"
+				};
+				bodies = bodies.OrderBy(_ => r.Next()).ToArray();
+				var runtime = new StringBuilder();
+				for (int i = 0; i < payloadRejectKeys.Length; i++)
+				{
+					string body = bodies[i]
+						.Replace("{VOID}", payloadRejectVoidKeys[i])
+						.Replace("{CODE}", payloadRejectCodeKeys[i]);
+					runtime.Append("local function ").Append(payloadRejectKeys[i]).Append('(').Append(payloadRejectCodeKeys[i]).Append(')')
+						.Append("local ").Append(payloadRejectVoidKeys[i]).Append(';').Append(body).Append("end;");
+				}
+				return T(runtime.ToString());
+			}
+
+			string RewritePayloadRejects(string code)
+			{
+				const string pattern = @"error\s*\(\s*(['""])invalid protected payload\1\s*,\s*0\s*\)";
+				int replacementCount = 0;
+				int rejectOffset = r.Next(payloadRejectKeys.Length);
+				code = Regex.Replace(code, pattern, _ =>
+				{
+					int rejectIndex = replacementCount < payloadRejectKeys.Length
+						? (rejectOffset + replacementCount) % payloadRejectKeys.Length
+						: r.Next(payloadRejectKeys.Length);
+					replacementCount++;
+					string rejectName = idents[payloadRejectKeys[rejectIndex]];
+					uint rejectCode = (uint)r.NextInt64(0, 1L << 32);
+					return rejectName + "(" + ScrambleUInt(rejectCode) + ")";
+				});
+				if (replacementCount == 0 || code.Contains("invalid protected payload", StringComparison.Ordinal))
+					throw new InvalidOperationException("Payload rejection diagnostics were not fully rewritten.");
+				return code;
+			}
+
 			// 把 handler 代码里的 OP_ENUM/OP_A/OP_B/OP_C 占位符打散成数字表达式
 			string ScrambleOps(string code)
 			{
@@ -1039,6 +1090,7 @@ local ToNumber = tonumber;");
 			
 			ComputeConstants(_context.HeadChunk);
 
+			vm += BuildPayloadRejectRuntime();
 			vm += T(VMStrings.VMP1
 				// 环境绑定：注入种子派生代码（读盐 → 跑探针 → Hash 派生 Xs）
 				.Replace("__IB2_SEED__", settings.EnvironmentLock ? _context.Binder.SeedDeriveLua : EnvBinder.PlainSeedLua)
@@ -1607,6 +1659,7 @@ end;";
 					rootDeserialize + "\nif GuardProbe(true) then Root, ByteString = nil, nil; return GuardDecoy(); end;");
 			}
 			vm += T(finalRuntime);
+			vm = RewritePayloadRejects(vm);
 
 			vm = vm.Replace("OP_ENUM", "1")
 				.Replace("OP_A", "2")

@@ -42,6 +42,10 @@ obfuscate() {
     "$DOTNET" "$CLI" tests/semantic.lua > "$WORK/obfuscator.log"
     mv out.lua "$output"
     "$LUAC" -p "$output"
+    if LC_ALL=C grep -aFq 'invalid protected payload' "$output"; then
+        echo "Stable protected-payload diagnostic leaked into $output." >&2
+        exit 1
+    fi
 }
 
 run_executor() {
@@ -52,6 +56,25 @@ run_executor_mode() {
     local mode=$1
     local script=$2
     "$LUA" tests/executor_runner.lua "$mode" "$script"
+}
+
+assert_payload_rejected() {
+    local exit_code=$1
+    local stdout_file=$2
+    local stderr_file=$3
+    local label=$4
+    if [[ $exit_code -eq 0 ]]; then
+        echo "$label unexpectedly executed successfully." >&2
+        exit 1
+    fi
+    if cmp -s "$WORK/baseline.out" "$stdout_file"; then
+        echo "$label emitted the complete protected payload output before rejection." >&2
+        exit 1
+    fi
+    if LC_ALL=C grep -aFq 'invalid protected payload' "$stderr_file"; then
+        echo "$label leaked the stable protected-payload diagnostic." >&2
+        exit 1
+    fi
 }
 
 obfuscate "$WORK/fixed.lua"
@@ -77,8 +100,8 @@ for entropy_case in modify delete reorder; do
     run_executor "$entropy_file" > "$WORK/entropy-$entropy_case.stdout" 2> "$WORK/entropy-$entropy_case.stderr"
     entropy_code=$?
     set -e
-    [[ $entropy_code -ne 0 ]]
-    grep -Fq 'invalid protected payload' "$WORK/entropy-$entropy_case.stderr"
+    assert_payload_rejected "$entropy_code" "$WORK/entropy-$entropy_case.stdout" \
+        "$WORK/entropy-$entropy_case.stderr" "entropy $entropy_case tamper"
 done
 echo "PASS entropy record modification, deletion and reordering rejection after outer-tag recomputation"
 
@@ -93,8 +116,8 @@ for payload_case in prototype-tag block-manifest column-framing column-consumpti
     run_executor "$payload_file" > "$WORK/payload-$payload_case.stdout" 2> "$WORK/payload-$payload_case.stderr"
     payload_code=$?
     set -e
-    [[ $payload_code -ne 0 ]]
-    grep -Fq 'invalid protected payload' "$WORK/payload-$payload_case.stderr"
+    assert_payload_rejected "$payload_code" "$WORK/payload-$payload_case.stdout" \
+        "$WORK/payload-$payload_case.stderr" "v4 $payload_case tamper"
 done
 echo "PASS v4 prototype, block-manifest, column framing/consumption and constant-capsule tamper rejection"
 
@@ -343,8 +366,8 @@ for flow_case in block-body initial-state dispatcher-state missing-edge wrapped-
     run_executor "$flow_file" > "$WORK/flow-$flow_case.stdout" 2> "$WORK/flow-$flow_case.stderr"
     flow_code=$?
     set -e
-    [[ $flow_code -ne 0 ]]
-    grep -Fq 'invalid protected payload' "$WORK/flow-$flow_case.stderr"
+    assert_payload_rejected "$flow_code" "$WORK/flow-$flow_case.stdout" \
+        "$WORK/flow-$flow_case.stderr" "flow $flow_case tamper"
 done
 echo "PASS block body and flow edge/state tamper rejection"
 
@@ -491,9 +514,8 @@ set +e
 run_executor "$WORK/tampered.lua" > "$WORK/tamper.stdout" 2> "$WORK/tamper.stderr"
 tamper_code=$?
 set -e
-[[ $tamper_code -ne 0 ]]
-grep -Fq 'invalid protected payload' "$WORK/tamper.stderr"
-echo "PASS tamper detection"
+assert_payload_rejected "$tamper_code" "$WORK/tamper.stdout" "$WORK/tamper.stderr" "outer payload tamper"
+echo "PASS tamper detection without fixed diagnostic leakage"
 
 if grep -aEq "[\"'](constants|nested|closure)[\"']|A\\\\000B" "$WORK/fixed.lua"; then
     echo "A semantic string literal leaked into generated output." >&2

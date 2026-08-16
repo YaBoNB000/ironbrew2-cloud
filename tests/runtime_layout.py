@@ -39,6 +39,9 @@ def _arithmetic_value(expression: str) -> int:
 
 
 def derive_runtime_layout(source: str) -> dict[str, object]:
+    if "invalid protected payload" in source:
+        raise ValueError("stable protected-payload diagnostic leaked into generated VM")
+
     # Deserialize begins with three local storage tables and the Chunk table,
     # followed by keyed assignments for Instructions, Functions and Lines.
     init = _expect(
@@ -188,6 +191,31 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         match = _expect(pattern, source, f"{label} does not use the permuted Block layout", re.S)
         aliases[label] = match.group(1)
 
+    # Protected-payload checks must fan out across four randomized native-fault
+    # paths rather than repeating one searchable direct error call.
+    reject_declaration = re.compile(
+        rf"local\s+function\s+({IDENT})\s*\(\s*({IDENT})\s*\)\s*"
+        rf"local\s+({IDENT})\s*;\s*return\s+([^;]+);\s*end;"
+    )
+    reject_paths: dict[str, str] = {}
+    expected_fault_shapes = {"void[code]", "void(code)", "code+void", "#void+code"}
+    for match in reject_declaration.finditer(source):
+        name, code_name, void_name, expression = match.groups()
+        normalized = re.sub(r"\s+", "", expression)
+        shape = re.sub(rf"\b{re.escape(void_name)}\b", "void", normalized)
+        shape = re.sub(rf"\b{re.escape(code_name)}\b", "code", shape)
+        if shape in expected_fault_shapes:
+            if name in reject_paths:
+                raise ValueError("duplicate protected-payload rejection function")
+            reject_paths[name] = shape
+    if len(reject_paths) != 4 or set(reject_paths.values()) != expected_fault_shapes:
+        raise ValueError(f"expected four distinct hidden rejection paths, recovered {reject_paths}")
+
+    arithmetic_raw = r"\(\s*\d+\s*[+\-*]\s*\d+\s*\)"
+    for reject_name in reject_paths:
+        if not re.search(rf"\b{re.escape(reject_name)}\s*\(\s*{arithmetic_raw}\s*\)", source):
+            raise ValueError("a generated protected-payload rejection path is unused")
+
     # The opcode comparison tree must only choose a masked entry token. A
     # continuation graph then crosses 3-5 shuffled lanes and 3-5 nodes before a
     # terminal handler runs in the VM closure. Recover the randomized names from
@@ -222,14 +250,16 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     continuation_loop = _expect(
         rf"while\s+{re.escape(dispatch_active)}\s+do\s+(.*?)"
         rf"if\s+not\s+{re.escape(dispatch_matched)}\s+then\s+"
-        rf"error\(\s*['\"]invalid protected payload['\"]\s*,\s*0\s*\);\s*end;\s*end;",
+        rf"({IDENT})\(\s*{arithmetic_raw}\s*\);\s*end;\s*end;",
         source[continuation_init.end():],
         "could not recover complete continuation dispatcher loop",
         re.S,
     )
+    if continuation_loop.group(2) not in reject_paths:
+        raise ValueError("continuation dispatcher does not terminate through a hidden rejection path")
     selector = source[continuation_init.end():continuation_init.end() + continuation_loop.start()]
     loop_body = continuation_loop.group(1)
-    arithmetic = r"(\(\s*\d+\s*[+\-*]\s*\d+\s*\))"
+    arithmetic = f"({arithmetic_raw})"
 
     salt_init = _expect(
         rf"local\s+{re.escape(dispatch_salt)}\s*=\s*\([^;]*\*\s*{arithmetic}\s*\+\s*{arithmetic}"
@@ -365,6 +395,7 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     )
     continuation = {
         "opcodes": opcode_count,
+        "reject_paths": len(reject_paths),
         "lanes": len(lanes),
         "entries": len(entry_tokens),
         "nodes": len(node_tokens),
