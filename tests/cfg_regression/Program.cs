@@ -181,6 +181,28 @@ foreach (Opcode opcode in new[] { Opcode.Eq, Opcode.Lt, Opcode.Le, Opcode.Test, 
         $"dispatcher selector did not cover all templates: {string.Join(',', templates)}");
 }
 
+// All three VM state-carrier topologies must be reachable from the dedicated
+// purpose stream and reproducible from the same master root.
+{
+    var layouts = new HashSet<VMLayout>();
+    for (int discriminator = 0; discriminator < 256; discriminator++)
+    {
+        byte[] root = Enumerable.Range(0, 32)
+            .Select(value => (byte)(value ^ discriminator))
+            .ToArray();
+        using var first = new BuildSeed(root);
+        using var second = new BuildSeed(root);
+        VMLayout selected = VMLayoutSelector.Select(first.GetStream("vm.layout"));
+        VMLayout repeated = VMLayoutSelector.Select(second.GetStream("vm.layout"));
+        Expect(selected == repeated, "equal build roots selected different VM layouts");
+        Expect((int)selected >= 0 && (int)selected < VMLayoutSelector.TemplateCount,
+            "VM layout selector escaped its declared range");
+        layouts.Add(selected);
+    }
+    Expect(layouts.SetEquals(Enum.GetValues<VMLayout>()),
+        $"VM layout selector did not cover all templates: {string.Join(',', layouts)}");
+}
+
 // One master BuildSeed must deterministically derive independent named streams.
 // Re-requesting a name continues the same stream instead of replaying bytes.
 {
@@ -195,7 +217,7 @@ foreach (Opcode opcode in new[] { Opcode.Eq, Opcode.Lt, Opcode.Le, Opcode.Test, 
     Expect(ReferenceEquals(opcodeA, seedA.GetStream("opcode")), "purpose stream was restarted instead of continued");
     Expect(opcodeA.GetBytes(64).SequenceEqual(opcodeB.GetBytes(64)), "continued purpose streams diverged");
 
-    byte[] layout = seedA.GetStream("vm-layout").GetBytes(96);
+    byte[] layout = seedA.GetStream("vm.layout").GetBytes(96);
     Expect(!firstA.SequenceEqual(layout), "different build purposes produced the same stream");
     for (int index = 0; index < 10000; index++)
     {

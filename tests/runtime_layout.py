@@ -251,6 +251,122 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         match = _expect(pattern, source, f"{label} does not use the permuted Block layout", re.S)
         aliases[label] = match.group(1)
 
+    # Recover the invocation-state carrier topology from the Wrap closure. Every
+    # supported layout starts the returned closure with two or three randomized
+    # frame tables, then routes state roles through numeric frame slots. Names,
+    # role partitions, declaration order and slots are all excluded from template
+    # classification but retained in the per-build structural fingerprint.
+    root_boundary = _expect(
+        rf"local\s+({IDENT})\s*=\s*({IDENT})\s*\(\s*\)\s*;.*?"
+        rf"return\s+({IDENT})\s*\(\s*\1\s*,\s*\{{\s*\}}\s*,",
+        source,
+        "could not recover the generated root invocation",
+        re.S,
+    )
+    wrap_name = root_boundary.group(3)
+    wrap_declaration = _expect(
+        rf"local\s+function\s+{re.escape(wrap_name)}\s*\(\s*{re.escape(chunk)}\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)",
+        source[:root_boundary.start()],
+        "could not recover the VM Wrap closure",
+    )
+    closure = _expect(
+        r"return\s+function\s*\(\s*\.\.\.\s*\)",
+        source[wrap_declaration.end():root_boundary.start()],
+        "could not recover the VM invocation closure",
+    )
+    closure_start = wrap_declaration.end() + closure.end()
+    wrap_end = root_boundary.start()
+    if closure_start >= wrap_end:
+        raise ValueError("VM invocation closure crosses the root-deserialization boundary")
+    wrap_body = source[closure_start:wrap_end]
+
+    frame_names: list[str] = []
+    cursor = 0
+    while True:
+        declaration = re.match(rf"\s*local\s+({IDENT})\s*=\s*\{{\s*\}}\s*;", wrap_body[cursor:])
+        if not declaration:
+            break
+        frame_names.append(declaration.group(1))
+        cursor += declaration.end()
+    if len(frame_names) not in {2, 3} or len(frame_names) != len(set(frame_names)):
+        raise ValueError(f"expected two or three independent VM state frames, recovered {frame_names}")
+    stable_layout = re.search(
+        r"\b(?:LayoutFrameA|LayoutFrameB|LayoutFrameC|DualPartitioned|TieredPartitioned|HybridLocals)\b",
+        source,
+    )
+    if stable_layout:
+        raise ValueError(f"stable VM layout identifier leaked: {stable_layout.group(0)}")
+
+    frame_slot_orders: list[list[int]] = []
+    first_accesses: list[tuple[int, int, int]] = []
+    for frame_index, frame_name in enumerate(frame_names):
+        accesses = list(re.finditer(rf"\b{re.escape(frame_name)}\s*\[\s*(\d+)\s*\]", wrap_body))
+        if not accesses:
+            raise ValueError("a declared VM state frame is unused")
+        first_by_slot: dict[int, int] = {}
+        for access in accesses:
+            slot = int(access.group(1))
+            first_by_slot.setdefault(slot, access.start())
+        frame_size = max(first_by_slot)
+        if set(first_by_slot) != set(range(1, frame_size + 1)):
+            raise ValueError(f"VM state frame slots are not contiguous: {sorted(first_by_slot)}")
+        order = [slot for slot, _position in sorted(first_by_slot.items(), key=lambda item: item[1])]
+        if order == list(range(1, frame_size + 1)):
+            raise ValueError("VM state frame retained identity role-to-slot ordering")
+        frame_slot_orders.append(order)
+        for slot, position in first_by_slot.items():
+            access_tail = wrap_body[position:]
+            if not re.match(rf"{re.escape(frame_name)}\s*\[\s*{slot}\s*\]\s*=", access_tail):
+                raise ValueError("a VM state frame is read before its role is initialized")
+            first_accesses.append((position, frame_index, slot))
+
+    frame_sizes = [len(order) for order in frame_slot_orders]
+    sorted_sizes = sorted(frame_sizes)
+    if sorted_sizes == [4, 5]:
+        vm_layout_template = "dual-partitioned"
+        state_role_order = ["InstrPoint", "Flow", "Top", "Vararg", "Lupvals", "Stk", "Varargsz", "Inst", "Enum"]
+        direct_roles: list[str] = []
+    elif sorted_sizes == [2, 3, 4]:
+        vm_layout_template = "tiered-partitioned"
+        state_role_order = ["InstrPoint", "Flow", "Top", "Vararg", "Lupvals", "Stk", "Varargsz", "Inst", "Enum"]
+        direct_roles = []
+    elif sorted_sizes == [3, 3]:
+        vm_layout_template = "hybrid-locals"
+        state_role_order = ["InstrPoint", "Flow", "Top", "Stk", "Inst", "Enum"]
+        direct_roles = ["Vararg", "Lupvals", "Varargsz"]
+    else:
+        raise ValueError(f"unsupported VM state frame topology: {frame_sizes}")
+    first_accesses.sort()
+    if len(first_accesses) != len(state_role_order):
+        raise ValueError(
+            f"VM layout initialized {len(first_accesses)} framed roles, expected {len(state_role_order)}"
+        )
+    role_slots = {
+        role: {"frame": frame_index + 1, "slot": slot}
+        for role, (_position, frame_index, slot) in zip(state_role_order, first_accesses)
+    }
+    flow_position = role_slots["Flow"]
+    flow_accessor = frame_names[flow_position["frame"] - 1] + f"[{flow_position['slot']}]"
+    layout_shape_sequence = [f"T:{vm_layout_template}"]
+    layout_shape_sequence.extend(
+        f"F:{index + 1}:{frame_sizes[index]}:" + ",".join(str(slot) for slot in frame_slot_orders[index])
+        for index in range(len(frame_names))
+    )
+    layout_shape_sequence.extend(
+        f"R:{role}:F{placement['frame']}S{placement['slot']}" for role, placement in role_slots.items()
+    )
+    layout_material = "|".join(layout_shape_sequence)
+    vm_layout = {
+        "template": vm_layout_template,
+        "frames": len(frame_names),
+        "frame_sizes": frame_sizes,
+        "slot_orders": frame_slot_orders,
+        "role_slots": role_slots,
+        "direct_roles": direct_roles,
+        "fingerprint": hashlib.sha256(layout_material.encode("ascii")).hexdigest()[:16],
+        "shape_sequence": layout_shape_sequence,
+    }
+
     # Protected-payload checks must fan out across four randomized native-fault
     # paths rather than repeating one searchable direct error call.
     reject_declaration = re.compile(
@@ -304,8 +420,8 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     )
     if stable_dispatch:
         raise ValueError(f"stable continuation identifier leaked: {stable_dispatch.group(0)}")
-    if not re.search(rf"\b{re.escape(flow_name)}\s*\[\s*{flow_map[3]}\s*\]", continuation_init.group(0)):
-        raise ValueError("continuation entry mask is not bound to the current Flow state")
+    if not re.search(rf"{re.escape(flow_accessor)}\s*\[\s*{flow_map[3]}\s*\]", continuation_init.group(0)):
+        raise ValueError("continuation entry mask is not bound through the selected VM Flow carrier")
 
     periodic_calls = list(re.finditer(rf"\b({IDENT})\s*\(\s*false\s*\)\s*;", source))
     if len(periodic_calls) != 1:
@@ -619,12 +735,15 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         "block": block_map_slots,
         "flow": flow_map,
         "flow_cache": flow_cache_map,
+        "vm_layout": vm_layout,
         "continuation": continuation,
         "identifiers": {
             "Chunk": chunk,
             "Block": block_name,
             "Flow": flow_name,
+            "FlowAccessor": flow_accessor,
             "FlowCache": flow_cache_name,
+            "Wrap": wrap_name,
             "DispatchState": dispatch_state,
             "DispatchLane": dispatch_lane,
             **aliases,
@@ -647,7 +766,7 @@ def main() -> int:
     parser.add_argument(
         "--include-shape",
         action="store_true",
-        help="include the normalized dispatcher token sequence for multi-build similarity analysis",
+        help="include normalized VM-layout and dispatcher sequences for multi-build similarity analysis",
     )
     args = parser.parse_args()
     try:
@@ -655,15 +774,19 @@ def main() -> int:
         display = json_ready(first)
         if not args.include_shape:
             display["continuation"].pop("shape_sequence", None)
+            display["vm_layout"].pop("shape_sequence", None)
         print("PASS runtime slot ABI " + json.dumps(display, sort_keys=True))
         if args.compare:
             second = derive_runtime_layout(args.compare.read_text("latin1"))
             changed = [name for name in ("chunk", "block", "flow", "flow_cache") if first[name] != second[name]]
             if not changed:
                 raise ValueError("independent builds unexpectedly reused the complete runtime slot ABI")
+            if first["vm_layout"]["fingerprint"] == second["vm_layout"]["fingerprint"]:
+                raise ValueError("independent builds unexpectedly reused the VM state layout")
             if first["continuation"]["fingerprint"] == second["continuation"]["fingerprint"]:
                 raise ValueError("independent builds unexpectedly reused the continuation graph")
             print("PASS independent runtime slot ABI differs: " + ", ".join(changed))
+            print("PASS independent VM state layout differs")
             print("PASS independent continuation graph differs")
     except (OSError, ValueError) as error:
         raise SystemExit(str(error)) from error

@@ -15,6 +15,7 @@ CORE = [
     ROOT / "IronBrew2" / "Obfuscator" / "Encryption" / "ConstantEncryption.cs",
     ROOT / "IronBrew2" / "Obfuscator" / "Opcodes" / "OpMutated.cs",
     ROOT / "IronBrew2" / "Obfuscator" / "VM Generation" / "DispatcherTemplate.cs",
+    ROOT / "IronBrew2" / "Obfuscator" / "VM Generation" / "VMLayout.cs",
     ROOT / "IronBrew2" / "Obfuscator" / "VM Generation" / "Generator.cs",
     ROOT / "IronBrew2" / "Bytecode Library" / "Bytecode" / "Serializer.cs",
     *sorted((ROOT / "IronBrew2" / "Obfuscator" / "Control Flow").rglob("*.cs")),
@@ -39,6 +40,7 @@ expected = {
     "payload.serializer",
     "runtime.guard",
     "vm.generator",
+    "vm.layout",
 }
 if purposes != expected:
     raise SystemExit(f"unexpected core BuildSeed purposes: recovered={sorted(purposes)}, expected={sorted(expected)}")

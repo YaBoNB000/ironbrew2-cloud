@@ -687,7 +687,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 
 			Random r = _context.Seed.GetStream("vm.generator");
 			BuildRandom dispatcherRandom = _context.Seed.GetStream("dispatcher.template");
+			BuildRandom layoutRandom = _context.Seed.GetStream("vm.layout");
 			Random guardRandom = _context.Seed.GetStream("runtime.guard");
+			VMLayout vmLayout = VMLayoutSelector.Select(layoutRandom);
 
 			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
 			                                 .Where(t => t.IsSubclassOf(typeof(VOpcode)))
@@ -798,7 +800,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"PayloadHead","PayloadTag","PayloadFlags","PayloadFeatures","PayloadVersion","OuterSeed","PayloadHash","PayloadIndex","PayloadDecoded","PayloadByte","PayloadKey",
 				"EnvelopePos","EnvelopeRead32","EnvelopeRealLength","EnvelopeEntropyLength","EnvelopeRecordCount","EnvelopeDataCount","EnvelopeEntropyCount","EnvelopeNonce","EnvelopeDigest","EnvelopeTag","EnvelopeExpected",
 				"EnvelopeHash","EnvelopeIndex","EnvelopeDataRecords","EnvelopeEntropyRecords","EnvelopeDataLength","EnvelopeEntropySeenLength","EnvelopeKind","EnvelopeOrdinal","EnvelopeLength","EnvelopeRecord",
-				"EntropyHash","EnvelopeByteIndex","EnvelopeState","EnvelopeBody","EnvelopeBodyIndex","EnvelopeKey"
+				"EntropyHash","EnvelopeByteIndex","EnvelopeState","EnvelopeBody","EnvelopeBodyIndex","EnvelopeKey",
+				"LayoutFrameA","LayoutFrameB","LayoutFrameC"
 				};
 			string[] luaKws = {"and","break","do","else","elseif","end","false","for","function","if","in","local","nil","not","or","repeat","return","then","true","until","while"};
 			var idents = new Dictionary<string,string>();
@@ -826,12 +829,13 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				return s;
 			}
 
-			int[] GenerateRuntimeSlotPermutation(int count)
+			int[] GenerateRuntimeSlotPermutation(int count, Random random = null)
 			{
+				random ??= r;
 				int[] slots = Enumerable.Range(1, count).ToArray();
 				for (int index = slots.Length - 1; index > 0; index--)
 				{
-					int swapIndex = r.Next(index + 1);
+					int swapIndex = random.Next(index + 1);
 					(slots[index], slots[swapIndex]) = (slots[swapIndex], slots[index]);
 				}
 				// Never emit the legacy identity layout, even in the unlikely event that
@@ -927,6 +931,98 @@ namespace IronBrew2.Obfuscator.VM_Generation
 
 				rewritten.Append(RewriteCode(code.Substring(plainStart)));
 				return rewritten.ToString();
+			}
+
+			string ApplyVMLayout(string code, VMLayout layout)
+			{
+				// These are the invocation-mutable values shared by the VM loop and its
+				// in-scope opcode handlers. Layouts alter their actual carriers rather
+				// than merely renaming locals or permuting a pre-existing table.
+				string[] stateKeys = {
+					"InstrPoint", "Flow", "Top", "Vararg", "Lupvals", "Stk", "Varargsz", "Inst", "Enum"
+				};
+				string[] frameKeys = {"LayoutFrameA", "LayoutFrameB", "LayoutFrameC"};
+				int[] capacities;
+				var candidates = new List<string>();
+				switch (layout)
+				{
+					case VMLayout.DualPartitioned:
+						capacities = new[] {4, 5};
+						candidates.AddRange(stateKeys);
+						break;
+					case VMLayout.TieredPartitioned:
+						capacities = new[] {2, 3, 4};
+						candidates.AddRange(stateKeys);
+						break;
+					case VMLayout.HybridLocals:
+						capacities = new[] {3, 3};
+						// Invocation-only vararg/upvalue state stays lexical while the six hot
+						// cursor, flow, stack and decode values move through two frames.
+						candidates.AddRange(new[] {"InstrPoint", "Flow", "Top", "Stk", "Inst", "Enum"});
+						break;
+					default:
+						throw new InvalidOperationException("Unknown VM layout template.");
+				}
+
+				candidates.Shuffle(layoutRandom);
+				var replacements = new Dictionary<string, string>();
+				var frameNames = new List<string>();
+				int candidateOffset = 0;
+				for (int frameIndex = 0; frameIndex < capacities.Length; frameIndex++)
+				{
+					string frameName = idents[frameKeys[frameIndex]];
+					frameNames.Add(frameName);
+					List<string> group = candidates.Skip(candidateOffset).Take(capacities[frameIndex])
+						.OrderBy(key => Array.IndexOf(stateKeys, key)).ToList();
+					candidateOffset += capacities[frameIndex];
+					int[] slots = GenerateRuntimeSlotPermutation(group.Count, layoutRandom);
+					for (int roleIndex = 0; roleIndex < group.Count; roleIndex++)
+						replacements[idents[group[roleIndex]]] = frameName + "[" + slots[roleIndex] + "]";
+				}
+				if (candidateOffset != candidates.Count)
+					throw new InvalidOperationException("VM layout did not assign every selected state role.");
+
+				Match wrapMatch = Regex.Match(code,
+					@"\blocal\s+function\s+" + Regex.Escape(idents["Wrap"]) + @"\s*\(");
+				if (!wrapMatch.Success)
+					throw new InvalidOperationException("VM layout could not locate the Wrap closure.");
+				Match rootMatch = Regex.Match(code.Substring(wrapMatch.Index),
+					@"\blocal\s+" + Regex.Escape(idents["Root"]) + @"\s*=\s*" +
+					Regex.Escape(idents["Deserialize"]) + @"\s*\(\s*\)\s*;");
+				if (!rootMatch.Success)
+					throw new InvalidOperationException("VM layout could not locate the root-deserialization boundary.");
+				int wrapEnd = wrapMatch.Index + rootMatch.Index;
+				string wrap = code.Substring(wrapMatch.Index, wrapEnd - wrapMatch.Index);
+
+				// Declarations must become keyed assignments before identifier accesses
+				// are rewritten. In particular, bare `local Inst;` cannot become a table
+				// expression statement in Lua 5.1.
+				foreach (string identifier in replacements.Keys)
+				{
+					string escaped = Regex.Escape(identifier);
+					wrap = Regex.Replace(wrap, @"\blocal\s+" + escaped + @"\s*;", identifier + "=nil;");
+					wrap = Regex.Replace(wrap, @"\blocal\s+" + escaped + @"\s*=", identifier + "=");
+				}
+				foreach (KeyValuePair<string, string> replacement in replacements)
+					wrap = Regex.Replace(wrap, @"\b" + Regex.Escape(replacement.Key) + @"\b", replacement.Value);
+
+				// Declaration order is independent from role partitioning and slot order.
+				// All frames remain invocation-local and therefore die with the closure.
+				frameNames.Shuffle(layoutRandom);
+				string frameInit = string.Concat(frameNames.Select(name => "local " + name + "={};"));
+				var closureAnchor = new Regex(@"\breturn\s+function\s*\(\s*\.\.\.\s*\)");
+				Match closureMatch = closureAnchor.Match(wrap);
+				if (!closureMatch.Success)
+					throw new InvalidOperationException("VM layout could not locate the invocation closure.");
+				wrap = wrap.Insert(closureMatch.Index + closureMatch.Length, frameInit);
+
+				foreach (KeyValuePair<string, string> replacement in replacements)
+				{
+					if (Regex.IsMatch(wrap, @"\blocal\s+" + Regex.Escape(replacement.Key) + @"\b") ||
+					    !wrap.Contains(replacement.Value, StringComparison.Ordinal))
+						throw new InvalidOperationException("VM layout left a selected state role in its original carrier.");
+				}
+				return code.Substring(0, wrapMatch.Index) + wrap + code.Substring(wrapEnd);
 			}
 
 			bool useRepeat = r.Next(2) == 0;
@@ -1910,6 +2006,11 @@ end;";
 				vm = ApplyRuntimeSlotPermutation(vm, idents[blockAlias], blockSlots);
 			vm = ApplyRuntimeSlotPermutation(vm, idents["Flow"], flowSlots);
 			vm = ApplyRuntimeSlotPermutation(vm, idents["FlowCache"], flowCacheSlots);
+
+			// Apply the selected carrier topology only after the nested Flow ABI was
+			// permuted, so accesses such as Frame[x][flowSlot] stay consistent with
+			// helper functions that still receive Flow as a direct parameter.
+			vm = ApplyVMLayout(vm, vmLayout);
 
 			return vm;
 		}

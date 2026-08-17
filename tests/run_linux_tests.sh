@@ -319,11 +319,14 @@ for index in range(1, runs + 1):
     layouts.append(json.loads(line[len(marker):]))
 
 continuations = [layout["continuation"] for layout in layouts]
+vm_layouts = [layout["vm_layout"] for layout in layouts]
 counts = [continuation["opcodes"] for continuation in continuations]
 fingerprints = [continuation["fingerprint"] for continuation in continuations]
 structure_fingerprints = [continuation["structure_fingerprint"] for continuation in continuations]
 templates = [continuation["template"] for continuation in continuations]
 update_orders = [continuation["state_update_order"] for continuation in continuations]
+vm_layout_fingerprints = [layout["fingerprint"] for layout in vm_layouts]
+vm_layout_templates = [layout["template"] for layout in vm_layouts]
 domain_vectors = [json.dumps(layout["domains"], sort_keys=True) for layout in layouts]
 slot_abis = [json.dumps({key: layout[key] for key in ("chunk", "block", "flow", "flow_cache")}, sort_keys=True)
              for layout in layouts]
@@ -338,6 +341,11 @@ if len(set(structure_fingerprints)) != runs:
 expected_templates = {"lane-partitioned", "token-threaded", "depth-layered"}
 if set(templates) != expected_templates:
     raise SystemExit(f"not all dispatcher templates were emitted: {sorted(set(templates))}")
+expected_vm_layouts = {"dual-partitioned", "tiered-partitioned", "hybrid-locals"}
+if set(vm_layout_templates) != expected_vm_layouts:
+    raise SystemExit(f"not all VM layout templates were emitted: {sorted(set(vm_layout_templates))}")
+if len(set(vm_layout_fingerprints)) != runs:
+    raise SystemExit("a VM state carrier layout was reused across builds")
 if len(set(update_orders)) < 2:
     raise SystemExit(f"dispatcher transition ordering did not vary: {update_orders}")
 if len(set(domain_vectors)) != runs:
@@ -363,10 +371,21 @@ if max_similarity > 0.35 or mean_similarity > 0.08:
     raise SystemExit(
         f"normalized dispatcher structures remain too similar: max={max_similarity:.3f}, mean={mean_similarity:.3f}"
     )
+layout_bigrams = [bigrams(layout["shape_sequence"]) for layout in vm_layouts]
+layout_similarities = [jaccard(left, right) for left, right in combinations(layout_bigrams, 2)]
+max_layout_similarity = max(layout_similarities)
+mean_layout_similarity = sum(layout_similarities) / len(layout_similarities)
+if max_layout_similarity > 0.45 or mean_layout_similarity > 0.10:
+    raise SystemExit(
+        f"normalized VM layouts remain too similar: max={max_layout_similarity:.3f}, "
+        f"mean={mean_layout_similarity:.3f}"
+    )
 print(
     f"PASS {runs}-build execution-model barrier: counts={sorted(set(counts))}, "
-    f"templates={sorted(set(templates))}, unique graphs/structures/domains/ABIs={runs}, "
-    f"normalized bigram similarity max={max_similarity:.3f} mean={mean_similarity:.3f}"
+    f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, "
+    f"unique graphs/structures/layouts/domains/ABIs={runs}, "
+    f"dispatcher similarity max={max_similarity:.3f} mean={mean_similarity:.3f}, "
+    f"VM-layout similarity max={max_layout_similarity:.3f} mean={mean_layout_similarity:.3f}"
 )
 PY
 echo "PASS randomized opcode handlers and non-identity runtime layouts: $RANDOM_RUNS/$RANDOM_RUNS"
