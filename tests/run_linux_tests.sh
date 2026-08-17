@@ -110,7 +110,7 @@ echo "PASS entropy record modification, deletion and reordering rejection after 
 # Each case leaves exactly the named prototype, complete block-manifest,
 # authenticated column parser/consumption, or capsule-integrity layer as the
 # first rejecting boundary.
-for payload_case in prototype-tag block-manifest column-framing column-consumption capsule-integrity; do
+for payload_case in prototype-tag initial-chunk-state successor-chunk-state block-manifest column-framing column-consumption capsule-integrity; do
     payload_file="$WORK/payload-$payload_case.lua"
     "$LUAC" -p "$payload_file"
     set +e
@@ -120,7 +120,7 @@ for payload_case in prototype-tag block-manifest column-framing column-consumpti
     assert_payload_rejected "$payload_code" "$WORK/payload-$payload_case.stdout" \
         "$WORK/payload-$payload_case.stderr" "v4 $payload_case tamper"
 done
-echo "PASS v4 prototype, block-manifest, column framing/consumption and constant-capsule tamper rejection"
+echo "PASS v4 prototype, attested chunk-chain, block-manifest, column framing/consumption and constant-capsule tamper rejection"
 
 # The trusted test executor must pass every retained hard-AND behavior contract.
 # Compatibility paths model proxy-backed globals, empty C-upvalue results and
@@ -237,7 +237,8 @@ chunk_slots = derive_runtime_layout(source)["chunk"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
     r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
-    r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
+    r"(?:[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*=\s*nil(?:\s*,\s*nil)*;\s*)?"
+    r"(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
 if not match:
@@ -275,7 +276,8 @@ chunk_slots = derive_runtime_layout(source)["chunk"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
     r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
-    r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
+    r"(?:[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*=\s*nil(?:\s*,\s*nil)*;\s*)?"
+    r"(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
 if not match:
@@ -409,7 +411,8 @@ block_slots = layout["block"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
     r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
-    r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
+    r"(?:[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*=\s*nil(?:\s*,\s*nil)*;\s*)?"
+    r"(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
 if not match:
@@ -422,6 +425,8 @@ initial_route_slot = chunk_slots[14]
 block_start_slot = block_slots[1]
 block_body_slot = block_slots[3]
 block_successors_slot = block_slots[5]
+block_chunk_successors_slot = block_slots[10]
+initial_chunk_state_slot = chunk_slots[16]
 find_entry = (
     "do local b;for _,v in pairs(" + root + f"[{blocks_slot}]) do "
     f"if v[{block_start_slot}]==1 then b=v;break;end;end;"
@@ -434,6 +439,7 @@ probes = {
           f"string.sub(b[{block_body_slot}],2);end;\n"
     ),
     "initial-state": root + f"[{initial_state_slot}]=(" + root + f"[{initial_state_slot}]+1)%4294967296;\n",
+    "initial-chunk-state": root + f"[{initial_chunk_state_slot}]=(" + root + f"[{initial_chunk_state_slot}]+1)%4294967296;\n",
     "dispatcher-state": root + f"[{initial_route_slot}]=1;\n",
     "missing-edge": (
         find_entry
@@ -442,7 +448,13 @@ probes = {
     "wrapped-edge-state": (
         find_entry
         + f"assert(b);local changed=false;for k,v in pairs(b[{block_successors_slot}]) do "
-          f"b[{block_successors_slot}][k]=(v+1)%4294967296;changed=true;break;end;"
+          f"b[{block_successors_slot}][k]=(v+1)%4294967296;changed=true;end;"
+          "assert(changed);end;\n"
+    ),
+    "wrapped-edge-chunk-state": (
+        find_entry
+        + f"assert(b);local changed=false;for k,v in pairs(b[{block_chunk_successors_slot}]) do "
+          f"b[{block_chunk_successors_slot}][k]=(v+1)%4294967296;changed=true;end;"
           "assert(changed);end;\n"
     ),
 }
@@ -450,7 +462,7 @@ for name, probe in probes.items():
     modified = source[:match.end(1)] + probe + source[match.end(1):]
     (out_dir / ("flow-" + name + ".lua")).write_text(modified, "latin1")
 PY
-for flow_case in block-body initial-state dispatcher-state missing-edge wrapped-edge-state; do
+for flow_case in block-body initial-state initial-chunk-state dispatcher-state missing-edge wrapped-edge-state wrapped-edge-chunk-state; do
     flow_file="$WORK/flow-$flow_case.lua"
     "$LUAC" -p "$flow_file"
     set +e
@@ -460,10 +472,10 @@ for flow_case in block-body initial-state dispatcher-state missing-edge wrapped-
     assert_payload_rejected "$flow_code" "$WORK/flow-$flow_case.stdout" \
         "$WORK/flow-$flow_case.stderr" "flow $flow_case tamper"
 done
-echo "PASS block body and flow edge/state tamper rejection"
+echo "PASS block body, flow edge/state and chunk-state-chain tamper rejection"
 
 # Force a CLOSURE and its 30 pseudo upvalue-binding instructions across the
-# 24-instruction page boundary. OpClosure must carry the same Flow state while
+# 16-instruction page boundary. OpClosure must carry the same Flow state while
 # fetching pseudo instructions in the next block.
 "$LUA" tests/closure_boundary.lua > "$WORK/closure-boundary-baseline.out"
 rm -rf temp out.lua
@@ -498,12 +510,31 @@ block_slots = layout["block"]
 pattern = re.compile(
     r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
     r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
-    r"([A-Za-z_]\w*)\s*=\s*nil;\s*(return\s+[A-Za-z_]\w*\(\2\b)"
+    r"(?:[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*=\s*nil(?:\s*,\s*nil)*;\s*)?"
+    r"(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
 if not match:
     raise SystemExit("could not locate the generated root prototype")
 root = match.group(2)
+cleanup_candidates = []
+cleanup_region = source[match.end(1):match.start(3)]
+for cleanup in re.finditer(
+    r"((?:[A-Za-z_]\w*\s*,\s*)*[A-Za-z_]\w*)\s*=\s*"
+    r"(nil(?:\s*,\s*nil)*)\s*;",
+    cleanup_region,
+):
+    names = [name.strip() for name in cleanup.group(1).split(",")]
+    nils = [value.strip() for value in cleanup.group(2).split(",")]
+    if len(names) == len(nils) and len(names) >= 4:
+        cleanup_candidates.append(names)
+if not cleanup_candidates:
+    raise SystemExit("paged deserializer cleanup assignment not found")
+source_state_names = max(cleanup_candidates, key=len)
+lifecycle_probe = (
+    "assert(" + " and ".join(name + "==nil" for name in source_state_names)
+    + ",'payload page/ciphertext source survived deserializer cleanup');"
+)
 probe = (
     "_G.__ib2_lazy_opaque=function() "
     "assert(next(" + root + f"[{chunk_slots[1]}])==nil,'decoded instructions escaped invocation-local cache');"
@@ -514,13 +545,17 @@ probe = (
     f"if type(block[{block_slots[3]}])=='string' then n=n+1;end;end;end;"
     "return n;end;\n"
 )
-source = source[:match.end(1)] + probe + source[match.end(1):]
+source = (
+    source[:match.end(1)] + probe
+    + source[match.end(1):match.start(3)] + lifecycle_probe
+    + source[match.start(3):]
+)
 Path(sys.argv[2]).write_text(source, "latin1")
 PY
 "$LUAC" -p "$WORK/lazy-instrumented.lua"
 run_executor "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
 grep -Eq '^lazy-blocks:[1-9][0-9]*:executed-constant:37$' "$WORK/lazy-instrumented.out"
-echo "PASS ephemeral instruction/constant cache and opaque block retention"
+echo "PASS paged-source release, ephemeral instruction/constant cache and opaque block retention"
 
 # Exercise Lua 5.1's SETLIST C == 0 data word without checking in a huge table
 # constructor. A test-only luac wrapper patches the one-element fixture after

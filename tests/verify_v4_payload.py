@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import hashlib
 import math
 from pathlib import Path
+import re
 import struct
 import sys
 import zlib
@@ -20,6 +21,8 @@ MOD32 = 1 << 32
 INTEGRITY_DOMAIN = 0
 BLOCK_INTEGRITY_DOMAIN = 0
 FLOW_DOMAIN = 0
+CHUNK_STATE_DOMAIN = 0
+PAYLOAD_ATTESTATION = 0
 ENVELOPE_INTEGRITY_DOMAIN = 0
 ENTROPY_DIGEST_DOMAIN = 0
 ENVELOPE_MASK_DOMAIN = 0
@@ -43,7 +46,7 @@ POLY31_INVERSE = pow(31, -1, MOD32)
 
 
 def activate_domains(domains: BuildDomains) -> None:
-    global INTEGRITY_DOMAIN, BLOCK_INTEGRITY_DOMAIN, FLOW_DOMAIN
+    global INTEGRITY_DOMAIN, BLOCK_INTEGRITY_DOMAIN, FLOW_DOMAIN, CHUNK_STATE_DOMAIN
     global ENVELOPE_INTEGRITY_DOMAIN, ENTROPY_DIGEST_DOMAIN, ENVELOPE_MASK_DOMAIN
     global CONSTANT_INTEGRITY_DOMAIN, CONSTANT_MASK_DOMAIN, PROTOTYPE_INTEGRITY_DOMAIN
     global OPCODE_PERMUTATION_DOMAIN, SCHEMA_DOMAIN, CONSTANT_TAG_DOMAIN, BLOCK_COLUMN_DOMAIN
@@ -51,6 +54,7 @@ def activate_domains(domains: BuildDomains) -> None:
     INTEGRITY_DOMAIN = domains.integrity
     BLOCK_INTEGRITY_DOMAIN = domains.block_integrity
     FLOW_DOMAIN = domains.flow
+    CHUNK_STATE_DOMAIN = domains.chunk_state
     ENVELOPE_INTEGRITY_DOMAIN = domains.envelope_integrity
     ENTROPY_DIGEST_DOMAIN = domains.entropy_digest
     ENVELOPE_MASK_DOMAIN = domains.envelope_mask
@@ -101,7 +105,8 @@ class Block:
     verifier: int
     tag: int
     tag_offset: int
-    successors: list[tuple[int, int]]
+    successors: list[tuple[int, int, int]]
+    successor_offsets: list[int]
     body_start: int
     body_end: int
     entry_state: int
@@ -121,6 +126,10 @@ class Prototype:
     binding: int
     parameter_offset: int | None = None
     instruction_count: int = 0
+    initial_wrapped_state: int = 0
+    initial_wrapped_chunk_state: int = 0
+    initial_wrapped_chunk_offset: int = 0
+    initial_route: int = 0
     capsules: list[Capsule] = field(default_factory=list)
     blocks: list[Block] = field(default_factory=list)
     children: list["Prototype"] = field(default_factory=list)
@@ -135,6 +144,7 @@ class PayloadInfo:
     payload: bytes
     head: int
     seed: int
+    attestation_token: int
     flags: int
     envelope: bytes
     records: list[Record]
@@ -147,6 +157,7 @@ class PayloadInfo:
     nonce: int
     data_count: int
     entropy_count: int
+    page_lengths: list[int]
     shannon_entropy: float
 
 
@@ -317,6 +328,31 @@ def recover_outer_seed(stored_integrity: int, flags: int, encrypted: bytes) -> i
     return value ^ INTEGRITY_DOMAIN
 
 
+def binder_seed(head: int, attestation: int) -> int:
+    return hash_bytes(0, f"{head}|{attestation}".encode("ascii"))
+
+
+def recover_attestation_token(source: str, head: int, seed: int) -> int:
+    # The strict guard must compare against the token it eventually publishes.
+    # Large-literal scrambling may represent that token as one arithmetic pair,
+    # so evaluate both raw uint literals and generated pair forms, then bind
+    # candidates through the same decimal head|token transcript as EnvBinder.
+    candidates = {
+        int(value)
+        for value in re.findall(r"(?<![\w.])(\d+)(?![\w.])", source)
+    }
+    for left, operator, right in re.findall(r"\(\s*(\d+)\s*([+\-*])\s*(\d+)\s*\)", source):
+        lhs, rhs = int(left), int(right)
+        candidates.add(lhs + rhs if operator == "+" else lhs - rhs if operator == "-" else lhs * rhs)
+    matches = {
+        candidate for candidate in candidates
+        if 0 < candidate <= MASK32 and binder_seed(head, candidate) == seed
+    }
+    if len(matches) != 1:
+        raise ValueError(f"could not uniquely recover environment attestation token: {sorted(matches)}")
+    return matches.pop()
+
+
 def shannon_entropy(data: bytes) -> float:
     counts = [0] * 256
     for value in data:
@@ -468,6 +504,55 @@ def flow_key(entry_state: int, from_pc: int, to_pc: int, prototype: Prototype) -
     return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
 
 
+def chunk_state(entry_state: int, block_start: int, count: int, prototype: Prototype) -> int:
+    value = (
+        entry_state * 22695477
+        + block_start * 65537
+        + count * 257
+        + prototype.k1 * 251
+        + prototype.k2 * 17
+        + prototype.k3
+        + CHUNK_STATE_DOMAIN
+        + prototype.binding
+        + PAYLOAD_ATTESTATION
+    ) & MASK32
+    return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
+
+
+def initial_chunk_key(prototype: Prototype) -> int:
+    value = (
+        prototype.k1 * 65537
+        + prototype.k2 * 257
+        + prototype.k3
+        + CHUNK_STATE_DOMAIN
+        + prototype.binding
+        + PAYLOAD_ATTESTATION
+    ) & MASK32
+    return (value * 22695477 + 1) & MASK32
+
+
+def chunk_chain_key(
+    source_chunk_state: int,
+    source_entry_state: int,
+    from_pc: int,
+    to_pc: int,
+    prototype: Prototype,
+) -> int:
+    value = (
+        source_chunk_state * LCG_MULTIPLIER
+        + source_entry_state * 22695477
+        + from_pc * 257
+        + to_pc * 65537
+        + prototype.k1 * 251
+        + prototype.k2 * 17
+        + prototype.k3
+        + CHUNK_STATE_DOMAIN
+        + prototype.binding
+        + PAYLOAD_ATTESTATION
+    ) & MASK32
+    return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
+
+
 def recover_entry_state(verifier: int, block_start: int, prototype: Prototype) -> int:
     to_pc = block_start ^ FLOW_VERIFIER_MASK
     value = ((verifier - LCG_INCREMENT) * LCG_INVERSE) & MASK32
@@ -495,9 +580,10 @@ def block_integrity(data: bytes | bytearray, prototype: Prototype, block: Block)
         value = hash_bytes(value, capsule_data)
     value = hash_word(value, block.verifier)
     value = hash_word(value, len(block.successors))
-    for destination, wrapped_state in block.successors:
+    for destination, wrapped_state, wrapped_chunk_state in block.successors:
         value = hash_word(value, destination)
         value = hash_word(value, wrapped_state)
+        value = hash_word(value, wrapped_chunk_state)
     encoded_body = bytes(data[block.body_start:block.body_end])
     value = hash_word(value, len(encoded_body))
     return hash_bytes(value, encoded_body)
@@ -560,8 +646,10 @@ def parse_prototype(
         elif step == 2:
             prototype.instruction_count = cursor.u32()
             block_count = cursor.u32()
-            initial_wrapped_state = cursor.u32()
-            initial_route = cursor.u32() ^ binding
+            prototype.initial_wrapped_state = cursor.u32()
+            prototype.initial_wrapped_chunk_offset = cursor.position
+            prototype.initial_wrapped_chunk_state = cursor.u32()
+            prototype.initial_route = cursor.u32() ^ binding
             if prototype.instruction_count < 1 or block_count < 1 or block_count > prototype.instruction_count:
                 raise ValueError("invalid block/instruction count")
             for _ in range(block_count):
@@ -574,7 +662,11 @@ def parse_prototype(
                 tag_offset = cursor.position
                 tag = cursor.u32()
                 successor_count = cursor.u32()
-                successors = [(cursor.u32(), cursor.u32()) for _ in range(successor_count)]
+                successors: list[tuple[int, int, int]] = []
+                successor_offsets: list[int] = []
+                for _ in range(successor_count):
+                    successor_offsets.append(cursor.position)
+                    successors.append((cursor.u32(), cursor.u32(), cursor.u32()))
                 body_length = cursor.u32()
                 body_start = cursor.position
                 cursor.take(body_length)
@@ -590,7 +682,7 @@ def parse_prototype(
                     raise ValueError("flow verifier inversion mismatch")
                 prototype.blocks.append(
                     Block(start_pc, count, route, references, verifier, tag, tag_offset, successors,
-                          body_start, cursor.position, entry_state)
+                          successor_offsets, body_start, cursor.position, entry_state)
                 )
         elif step == 3:
             child_count = cursor.u32()
@@ -618,18 +710,34 @@ def parse_prototype(
             if occupied[pc]:
                 raise ValueError("overlapping instruction blocks")
             occupied[pc] = True
-        if any(destination not in starts for destination, _ in block.successors):
+        if any(destination not in starts for destination, _, _ in block.successors):
             raise ValueError("successor does not name a block start")
         if block_integrity(data, prototype, block) != block.tag:
             raise ValueError("complete block manifest authentication mismatch")
         validate_columnar_block(data, prototype, block)
-        for destination, wrapped_state in block.successors:
-            expected_state = next(item.entry_state for item in prototype.blocks if item.start_pc == destination)
+        source_chunk_state = chunk_state(block.entry_state, block.start_pc, block.count, prototype)
+        for destination, wrapped_state, wrapped_chunk_state in block.successors:
+            destination_block = next(item for item in prototype.blocks if item.start_pc == destination)
             recovered = wrapped_state ^ flow_key(
                 block.entry_state, block.start_pc + block.count - 1, destination, prototype
             )
-            if recovered != expected_state:
+            if recovered != destination_block.entry_state:
                 raise ValueError("wrapped successor state mismatch")
+            recovered_chunk_state = wrapped_chunk_state ^ chunk_chain_key(
+                source_chunk_state,
+                block.entry_state,
+                block.start_pc + block.count - 1,
+                destination,
+                prototype,
+            )
+            expected_chunk_state = chunk_state(
+                destination_block.entry_state,
+                destination_block.start_pc,
+                destination_block.count,
+                prototype,
+            )
+            if recovered_chunk_state != expected_chunk_state:
+                raise ValueError("attestation-bound wrapped successor chunk-state mismatch")
     if not prototype.blocks or not all(occupied[1:]):
         raise ValueError("instruction blocks do not cover the prototype")
     entry = next((block for block in prototype.blocks if block.start_pc == 1), None)
@@ -637,11 +745,15 @@ def parse_prototype(
         raise ValueError("prototype has no entry block")
     initial_key_value = (k1 * 65537 + k2 * 257 + k3 + FLOW_DOMAIN + binding) & MASK32
     initial_key = (initial_key_value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
-    if initial_wrapped_state ^ initial_key != entry.entry_state:
+    if prototype.initial_wrapped_state ^ initial_key != entry.entry_state:
         raise ValueError("initial block state mismatch")
+    recovered_initial_chunk_state = prototype.initial_wrapped_chunk_state ^ initial_chunk_key(prototype)
+    expected_initial_chunk_state = chunk_state(entry.entry_state, entry.start_pc, entry.count, prototype)
+    if recovered_initial_chunk_state != expected_initial_chunk_state:
+        raise ValueError("attestation-bound initial chunk-state mismatch")
     routed = [block for block in prototype.blocks if block.route_token != 0]
-    if initial_route:
-        if len(routed) != len(prototype.blocks) or entry.route_token != initial_route:
+    if prototype.initial_route:
+        if len(routed) != len(prototype.blocks) or entry.route_token != prototype.initial_route:
             raise ValueError("incomplete dispatcher route manifest")
         routes = [block.route_token for block in prototype.blocks]
         if len(routes) != len(set(routes)) or any(route <= prototype.instruction_count for route in routes):
@@ -654,6 +766,7 @@ def parse_prototype(
 
 
 def parse_and_verify(path: Path) -> PayloadInfo:
+    global PAYLOAD_ATTESTATION
     source = path.read_text("latin1")
     domains = extract_build_domains(source)
     activate_domains(domains)
@@ -673,6 +786,8 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         raise ValueError("could not recover the environment-bound outer serializer seed")
     if head == seed:
         raise ValueError("strict EnvironmentLock unexpectedly exposed the serializer seed in the payload head")
+    attestation_token = recover_attestation_token(source, head, seed)
+    PAYLOAD_ATTESTATION = attestation_token
     envelope = stream_xor(encrypted, seed)
     if len(envelope) < 32:
         raise ValueError("entropy envelope is shorter than its fixed header")
@@ -690,7 +805,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
     expected = 32 + record_count * 7 + real_length + entropy_length
     if not ENTROPY_MIN <= entropy_length <= ENTROPY_MAX:
         raise ValueError(f"entropy contribution outside 64–96 KiB: {entropy_length}")
-    if not (1 <= data_count <= 32 and 8 <= entropy_count <= 64):
+    if not (1 <= data_count <= 65535 and 8 <= entropy_count <= 64):
         raise ValueError("invalid entropy envelope record counts")
     if record_count != data_count + entropy_count or nonce == 0 or expected != len(envelope):
         raise ValueError("invalid entropy envelope framing")
@@ -743,13 +858,32 @@ def parse_and_verify(path: Path) -> PayloadInfo:
     if digest != entropy_digest:
         raise ValueError("entropy digest mismatch")
 
-    masked_body = b"".join(data_records[index] for index in range(1, data_count + 1))
     mask_state = seed ^ nonce ^ entropy_digest ^ ENVELOPE_MASK_DOMAIN ^ real_length
-    protected_body = stream_xor(masked_body, mask_state)
-    try:
-        body = zlib.decompress(protected_body, -15) if features & 1 else protected_body
-    except zlib.error as error:
-        raise ValueError(f"restored body is not a valid raw DEFLATE stream: {error}") from error
+    protected_pages: list[bytes] = []
+    plain_pages: list[bytes] = []
+    page_lengths: list[int] = []
+    for ordinal in range(1, data_count + 1):
+        masked_page = data_records[ordinal]
+        framed_page = stream_xor(masked_page, mask_state)
+        for _ in masked_page:
+            mask_state = (mask_state * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
+        if len(framed_page) < 5 or len(framed_page) > 16384:
+            raise ValueError("bounded payload page has invalid framed length")
+        raw_length = struct.unpack_from("<I", framed_page)[0]
+        if not 1 <= raw_length <= 6144:
+            raise ValueError("bounded payload page has invalid raw length")
+        encoded_page = framed_page[4:]
+        try:
+            plain_page = zlib.decompress(encoded_page, -15) if features & 1 else encoded_page
+        except zlib.error as error:
+            raise ValueError(f"payload page {ordinal} is not an independent raw DEFLATE stream: {error}") from error
+        if len(plain_page) != raw_length:
+            raise ValueError("bounded payload page raw-length mismatch")
+        protected_pages.append(framed_page)
+        plain_pages.append(plain_page)
+        page_lengths.append(raw_length)
+    protected_body = b"".join(protected_pages)
+    body = b"".join(plain_pages)
     if not body:
         raise ValueError("restored serialized body is empty")
     root = parse_prototype(body, 0, len(body), seed)
@@ -760,9 +894,9 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         raise ValueError(f"entropy records are not high entropy enough: {entropy_score:.4f} bits/byte")
 
     return PayloadInfo(
-        path, source, domains, literals, payload, head, seed, flags, envelope, records, entropy,
+        path, source, domains, literals, payload, head, seed, attestation_token, flags, envelope, records, entropy,
         protected_body, body, root, entropy_length, entropy_digest, nonce,
-        data_count, entropy_count, entropy_score
+        data_count, entropy_count, page_lengths, entropy_score
     )
 
 
@@ -810,16 +944,34 @@ def split_evenly(data: bytes, count: int) -> dict[int, bytes]:
 
 
 def envelope_for_body(info: PayloadInfo, body: bytes) -> bytes:
-    if info.flags & 1:
-        compressor = zlib.compressobj(level=9, wbits=-15)
-        protected = compressor.compress(body) + compressor.flush()
+    if sum(info.page_lengths) == len(body):
+        raw_pages: list[bytes] = []
+        position = 0
+        for length in info.page_lengths:
+            raw_pages.append(body[position:position + length])
+            position += length
     else:
-        protected = body
-    mask_state = info.seed ^ info.nonce ^ info.entropy_digest ^ ENVELOPE_MASK_DOMAIN ^ len(protected)
-    data_records = split_evenly(stream_xor(protected, mask_state), info.data_count)
+        raw_pages = list(split_evenly(body, info.data_count).values())
+
+    framed_pages: list[bytes] = []
+    for raw_page in raw_pages:
+        if info.flags & 1:
+            compressor = zlib.compressobj(level=9, wbits=-15)
+            encoded_page = compressor.compress(raw_page) + compressor.flush()
+        else:
+            encoded_page = raw_page
+        framed_pages.append(struct.pack("<I", len(raw_page)) + encoded_page)
+    real_length = sum(map(len, framed_pages))
+    mask_state = info.seed ^ info.nonce ^ info.entropy_digest ^ ENVELOPE_MASK_DOMAIN ^ real_length
+    masked_stream = stream_xor(b"".join(framed_pages), mask_state)
+    data_records: dict[int, bytes] = {}
+    position = 0
+    for ordinal, framed_page in enumerate(framed_pages, 1):
+        data_records[ordinal] = masked_stream[position:position + len(framed_page)]
+        position += len(framed_page)
     entropy_records = {record.ordinal: record.data for record in info.records if record.kind == ENTROPY_KIND}
     envelope = bytearray(struct.pack(
-        "<8I", len(protected), info.entropy_length, len(info.records), info.data_count,
+        "<8I", real_length, info.entropy_length, len(info.records), len(framed_pages),
         info.entropy_count, info.nonce, info.entropy_digest, 0
     ))
     for record in info.records:
@@ -867,6 +1019,38 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
     prototype_variant = bytearray(info.body)
     prototype_variant[info.root.tag_offset] ^= 1
     write_body_variant(info, output_dir, "prototype-tag", prototype_variant)
+
+    # Initial chunk state: repair the prototype tag after changing only the
+    # attestation-bound wrapped state. Parsing/authentication passes, but the
+    # first Fetch must reject the independently invalid chunk-state chain.
+    initial_chunk_variant = bytearray(info.body)
+    initial_chunk_variant[info.root.initial_wrapped_chunk_offset] ^= 1
+    patch_u32(initial_chunk_variant, info.root.tag_offset, prototype_integrity(initial_chunk_variant, info.root))
+    write_body_variant(info, output_dir, "initial-chunk-state", initial_chunk_variant)
+
+    # Successor chunk state: alter one wrapped chain edge while repairing both
+    # its block manifest and the root prototype tag. Flow wrapping remains valid,
+    # leaving the attestation/VM-state chunk chain as the rejecting boundary.
+    chain_block = next((block for block in info.root.blocks if block.start_pc == 1 and block.successors), None)
+    if chain_block is None:
+        raise ValueError("root prototype has no successor edge for chunk-chain tamper")
+    successor_chain_variant = bytearray(info.body)
+    original_successors = list(chain_block.successors)
+    for successor_index, (destination, wrapped_state, wrapped_chunk_state) in enumerate(original_successors):
+        patch_u32(
+            successor_chain_variant,
+            chain_block.successor_offsets[successor_index] + 8,
+            wrapped_chunk_state ^ 1,
+        )
+        chain_block.successors[successor_index] = (destination, wrapped_state, wrapped_chunk_state ^ 1)
+    patch_u32(
+        successor_chain_variant,
+        chain_block.tag_offset,
+        block_integrity(successor_chain_variant, info.root, chain_block),
+    )
+    chain_block.successors[:] = original_successors
+    patch_u32(successor_chain_variant, info.root.tag_offset, prototype_integrity(successor_chain_variant, info.root))
+    write_body_variant(info, output_dir, "successor-chunk-state", successor_chain_variant)
 
     # Block manifest: alter the first block's opaque body, then repair the root
     # prototype tag. Outer/envelope/prototype checks pass; the complete block tag
@@ -968,6 +1152,7 @@ def describe(info: PayloadInfo) -> str:
         f"PASS authenticated v4 payload: features={info.flags & 15}, "
         f"prototypes={count_prototypes(info.root)}, blocks={count_blocks(info.root)}, "
         f"column_layouts={len(set(column_orders))}, capsules={count_capsules(info.root)}, entropy={info.entropy_length} bytes, "
+        f"pages={info.data_count}, max_page={max(info.page_lengths)}, chunk_chain=attested, "
         f"records={len(info.records)}, H={info.shannon_entropy:.4f} bits/byte, "
         f"entropy_sha256={hashlib.sha256(info.entropy).hexdigest()}"
     )

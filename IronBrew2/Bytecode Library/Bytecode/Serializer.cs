@@ -19,12 +19,21 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private const int MaxBlockInstructions = DispatcherFlatteningPlanner.MaxBlockInstructions;
 		private const int EntropyMinBytes = 64 * 1024;
 		private const int EntropyMaxBytes = 96 * 1024;
+		private const int PayloadPageMinBytes = 2048;
+		private const int PayloadPageMaxBytes = 6144;
 
 		private sealed class EntropyRecord
 		{
 			public byte Kind { get; init; }
 			public ushort Ordinal { get; init; }
 			public byte[] Data { get; init; }
+		}
+
+		private sealed class ChunkSuccessor
+		{
+			public int Destination { get; init; }
+			public uint WrappedEntryState { get; init; }
+			public uint WrappedChunkState { get; init; }
 		}
 
 		private readonly ObfuscationContext _context;
@@ -51,8 +60,10 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		public byte[] SerializeLChunk(Chunk chunk)
 		{
 			byte[] plain = SerializeBody(chunk);
-			byte[] payload = _settings.BytecodeCompress ? Deflate(plain) : plain;
-			byte[] envelope = WrapEntropyEnvelope(payload, _context.XorSeed);
+			// The serialized VM body is framed before compression. Each bounded page is
+			// an independent raw-DEFLATE stream, so the runtime never needs the complete
+			// compressed stream or the complete plaintext VM buffer.
+			byte[] envelope = WrapEntropyEnvelope(plain, _context.XorSeed, _settings.BytecodeCompress);
 
 			uint state = _context.XorSeed;
 			byte[] encrypted = new byte[envelope.Length];
@@ -85,9 +96,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return hash;
 		}
 
-		private byte[] WrapEntropyEnvelope(byte[] payload, uint seed)
+		private byte[] WrapEntropyEnvelope(byte[] body, uint seed, bool compressPages)
 		{
-			if (payload == null || payload.Length == 0)
+			if (body == null || body.Length == 0)
 				throw new InvalidOperationException("Cannot envelope an empty protected payload.");
 
 			int entropyLength = _random.Next(EntropyMinBytes, EntropyMaxBytes + 1);
@@ -95,31 +106,51 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			uint nonce = NextState32();
 
 			List<byte[]> entropyParts = SplitRandom(entropy, _random.Next(12, 21));
-			List<byte[]> dataParts = SplitRandom(payload, _random.Next(4, 9));
-			uint entropyDigest = ComputeEntropyDigest(entropyParts, seed, nonce, entropyLength);
-
-			uint maskState = seed ^ nonce ^ entropyDigest ^ _context.Domains.EnvelopeMaskDomain ^ (uint)payload.Length;
-			byte[] maskedPayload = new byte[payload.Length];
-			for (int index = 0; index < payload.Length; index++)
+			int pageSize = _random.Next(PayloadPageMinBytes, PayloadPageMaxBytes + 1);
+			var framedPages = new List<byte[]>((body.Length + pageSize - 1) / pageSize);
+			for (int offset = 0; offset < body.Length; offset += pageSize)
 			{
-				maskedPayload[index] = (byte)(payload[index] ^ (byte)(maskState >> 24));
-				maskState = unchecked(maskState * 1664525u + 1013904223u);
+				int rawLength = Math.Min(pageSize, body.Length - offset);
+				var rawPage = new byte[rawLength];
+				Buffer.BlockCopy(body, offset, rawPage, 0, rawLength);
+				byte[] encodedPage = compressPages ? Deflate(rawPage) : rawPage;
+				var framedPage = new byte[encodedPage.Length + 4];
+				WriteUInt32(framedPage, 0, (uint)rawLength);
+				Buffer.BlockCopy(encodedPage, 0, framedPage, 4, encodedPage.Length);
+				framedPages.Add(framedPage);
 			}
-			dataParts = SplitAtLengths(maskedPayload, dataParts.Select(part => part.Length));
+			if (framedPages.Count > ushort.MaxValue)
+				throw new InvalidOperationException("Protected payload requires too many bounded pages.");
 
-			var records = new List<EntropyRecord>(entropyParts.Count + dataParts.Count);
+			uint framedLength = checked((uint)framedPages.Sum(page => (long)page.Length));
+			uint entropyDigest = ComputeEntropyDigest(entropyParts, seed, nonce, entropyLength);
+			uint maskState = seed ^ nonce ^ entropyDigest ^ _context.Domains.EnvelopeMaskDomain ^ framedLength;
+			var maskedPages = new List<byte[]>(framedPages.Count);
+			foreach (byte[] framedPage in framedPages)
+			{
+				var maskedPage = new byte[framedPage.Length];
+				for (int index = 0; index < framedPage.Length; index++)
+				{
+					maskedPage[index] = (byte)(framedPage[index] ^ (byte)(maskState >> 24));
+					maskState = unchecked(maskState * 1664525u + 1013904223u);
+				}
+				maskedPages.Add(maskedPage);
+			}
+
+			var records = new List<EntropyRecord>(entropyParts.Count + maskedPages.Count);
 			for (int index = 0; index < entropyParts.Count; index++)
 				records.Add(new EntropyRecord {Kind = _context.Domains.EntropyRecordKind, Ordinal = (ushort)(index + 1), Data = entropyParts[index]});
-			for (int index = 0; index < dataParts.Count; index++)
-				records.Add(new EntropyRecord {Kind = _context.Domains.DataRecordKind, Ordinal = (ushort)(index + 1), Data = dataParts[index]});
+			for (int index = 0; index < maskedPages.Count; index++)
+				records.Add(new EntropyRecord {Kind = _context.Domains.DataRecordKind, Ordinal = (ushort)(index + 1), Data = maskedPages[index]});
 			ShuffleEntropyRecords(records);
 
-			// 8 x u32 fields. The final field is patched with a keyed envelope tag.
-			var envelope = new List<byte>(32 + records.Count * 7 + entropyLength + payload.Length);
-			WriteUInt32(envelope, (uint)payload.Length);
+			// 8 x u32 fields. RealLength is the total framed-page length, not the
+			// plaintext body length; each page carries its own bounded raw length.
+			var envelope = new List<byte>(checked(32 + records.Count * 7 + entropyLength + (int)framedLength));
+			WriteUInt32(envelope, framedLength);
 			WriteUInt32(envelope, (uint)entropyLength);
 			WriteUInt32(envelope, (uint)records.Count);
-			WriteUInt32(envelope, (uint)dataParts.Count);
+			WriteUInt32(envelope, (uint)maskedPages.Count);
 			WriteUInt32(envelope, (uint)entropyParts.Count);
 			WriteUInt32(envelope, nonce);
 			WriteUInt32(envelope, entropyDigest);
@@ -261,6 +292,31 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private uint FlowVerifier(uint entryState, int blockStart, ushort k1, ushort k2, ushort k3, uint binding) =>
 			FlowKey(entryState, blockStart, blockStart ^ _context.Domains.FlowVerifierMask, k1, k2, k3, binding);
 
+		private uint ChunkState(uint entryState, int blockStart, int count, ushort k1, ushort k2, ushort k3,
+			uint binding, uint attestation)
+		{
+			uint value = unchecked(entryState * 22695477u + (uint)blockStart * 65537u + (uint)count * 257u +
+			                       (uint)k1 * 251u + (uint)k2 * 17u + k3 +
+			                       _context.Domains.ChunkStateDomain + binding + attestation);
+			return unchecked(value * 1664525u + 1013904223u);
+		}
+
+		private uint InitialChunkKey(ushort k1, ushort k2, ushort k3, uint binding, uint attestation)
+		{
+			uint value = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3 +
+			                       _context.Domains.ChunkStateDomain + binding + attestation);
+			return unchecked(value * 22695477u + 1u);
+		}
+
+		private uint ChunkChainKey(uint sourceChunkState, uint sourceEntryState, int fromPc, int toPc,
+			ushort k1, ushort k2, ushort k3, uint binding, uint attestation)
+		{
+			uint value = unchecked(sourceChunkState * 1664525u + sourceEntryState * 22695477u +
+			                       (uint)fromPc * 257u + (uint)toPc * 65537u + (uint)k1 * 251u +
+			                       (uint)k2 * 17u + k3 + _context.Domains.ChunkStateDomain + binding + attestation);
+			return unchecked(value * 1664525u + 1013904223u);
+		}
+
 		private ushort BlockFieldMask(uint entryState, int pc, int slot, ushort k1, ushort k2, ushort k3)
 		{
 			uint low = entryState & 0xFFFFu;
@@ -296,7 +352,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 		private uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
 			uint routeToken, IReadOnlyList<int> constantReferences, IReadOnlyList<byte[]> constantCapsules,
-			uint verifier, IReadOnlyList<KeyValuePair<int, uint>> successors, ushort k1, ushort k2, ushort k3,
+			uint verifier, IReadOnlyList<ChunkSuccessor> successors, ushort k1, ushort k2, ushort k3,
 			uint binding)
 		{
 			uint hash = HashWord(entryState ^ _context.Domains.BlockIntegrityDomain ^ binding, (uint)start);
@@ -317,10 +373,11 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			}
 			hash = HashWord(hash, verifier);
 			hash = HashWord(hash, (uint)successors.Count);
-			foreach (KeyValuePair<int, uint> successor in successors)
+			foreach (ChunkSuccessor successor in successors)
 			{
-				hash = HashWord(hash, (uint)successor.Key);
-				hash = HashWord(hash, successor.Value);
+				hash = HashWord(hash, (uint)successor.Destination);
+				hash = HashWord(hash, successor.WrappedEntryState);
+				hash = HashWord(hash, successor.WrappedChunkState);
 			}
 			hash = HashWord(hash, (uint)body.Length);
 			return HashBytes(hash, body);
@@ -543,6 +600,11 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				do state = NextState32(); while (!usedBlockStates.Add(state));
 				blockStates.Add(block, state);
 			}
+			uint payloadAttestation = _settings.AntiDump ? _context.Binder.AttestationToken : _context.XorSeed;
+			var blockChunkStates = instructionBlocks.ToDictionary(
+				block => block,
+				block => ChunkState(blockStates[block], block.Start + 1, block.Count, k1, k2, k3,
+					_context.XorSeed, payloadAttestation));
 
 			// Eligible prototypes receive unrelated route tokens. A token is never a
 			// valid linear PC, so each cross-block transfer must be resolved by the VM's
@@ -651,6 +713,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 						WriteUInt32Local((uint)chunk.Instructions.Count);
 						WriteUInt32Local((uint)instructionBlocks.Count);
 						WriteUInt32Local(blockStates[controlFlow.EntryBlock] ^ InitialFlowKey(k1, k2, k3, _context.XorSeed));
+						WriteUInt32Local(blockChunkStates[controlFlow.EntryBlock] ^
+						                 InitialChunkKey(k1, k2, k3, _context.XorSeed, payloadAttestation));
 						// Store the first route under the attestation-derived binding. In the
 						// non-dispatcher case seed^seed decodes back to the zero sentinel.
 						WriteUInt32Local((dispatcherFlattened ? blockRoutes[controlFlow.EntryBlock] : 0u) ^ _context.XorSeed);
@@ -691,13 +755,22 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 							uint routeToken = dispatcherFlattened ? blockRoutes[block] : 0u;
 							uint verifier = FlowVerifier(entryState, start + 1, k1, k2, k3, _context.XorSeed);
-							var successorRecords = new List<KeyValuePair<int, uint>>();
+							uint sourceChunkState = blockChunkStates[block];
+							var successorRecords = new List<ChunkSuccessor>();
 							foreach (ControlFlowBlock successor in block.Successors.OrderBy(value => value.Start))
 							{
 								int successorStart = successor.Start + 1;
 								uint wrappedState = blockStates[successor] ^
 								                    FlowKey(entryState, block.EndExclusive, successorStart, k1, k2, k3, _context.XorSeed);
-								successorRecords.Add(new KeyValuePair<int, uint>(successorStart, wrappedState));
+								uint wrappedChunkState = blockChunkStates[successor] ^ ChunkChainKey(
+									sourceChunkState, entryState, block.EndExclusive, successorStart, k1, k2, k3,
+									_context.XorSeed, payloadAttestation);
+								successorRecords.Add(new ChunkSuccessor
+								{
+									Destination = successorStart,
+									WrappedEntryState = wrappedState,
+									WrappedChunkState = wrappedChunkState
+								});
 							}
 							byte[] encodedBlockBody = blockBody.ToArray();
 							uint blockTag = ComputeBlockIntegrity(encodedBlockBody, entryState, start + 1, count,
@@ -713,10 +786,11 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							WriteUInt32Local(verifier);
 							WriteUInt32Local(blockTag);
 							WriteUInt32Local((uint)successorRecords.Count);
-							foreach (KeyValuePair<int, uint> successor in successorRecords)
+							foreach (ChunkSuccessor successor in successorRecords)
 							{
-								WriteUInt32Local((uint)successor.Key);
-								WriteUInt32Local(successor.Value);
+								WriteUInt32Local((uint)successor.Destination);
+								WriteUInt32Local(successor.WrappedEntryState);
+								WriteUInt32Local(successor.WrappedChunkState);
 							}
 
 							WriteUInt32Local((uint)encodedBlockBody.Length);

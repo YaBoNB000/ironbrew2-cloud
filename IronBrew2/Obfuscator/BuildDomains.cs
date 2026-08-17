@@ -25,6 +25,7 @@ namespace IronBrew2.Obfuscator
 		public uint IntegrityDomain { get; }
 		public uint BlockIntegrityDomain { get; }
 		public uint FlowDomain { get; }
+		public uint ChunkStateDomain { get; }
 		public uint EnvelopeIntegrityDomain { get; }
 		public uint EntropyDigestDomain { get; }
 		public uint EnvelopeMaskDomain { get; }
@@ -47,6 +48,7 @@ namespace IronBrew2.Obfuscator
 			IntegrityDomain = NextWord(random, used);
 			BlockIntegrityDomain = NextWord(random, used);
 			FlowDomain = NextWord(random, used);
+			ChunkStateDomain = NextWord(random, used);
 			EnvelopeIntegrityDomain = NextWord(random, used);
 			EntropyDigestDomain = NextWord(random, used);
 			EnvelopeMaskDomain = NextWord(random, used);

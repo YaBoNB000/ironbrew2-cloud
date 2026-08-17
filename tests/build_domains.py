@@ -16,6 +16,7 @@ class BuildDomains:
     integrity: int
     block_integrity: int
     flow: int
+    chunk_state: int
     envelope_integrity: int
     entropy_digest: int
     envelope_mask: int
@@ -55,8 +56,7 @@ def extract_build_domains(source: str) -> BuildDomains:
     envelope_integrity = _one(
         source,
         rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)"
-        rf"\s*\*\s*31\s*\)\s*%\s*4294967296\s*;\s*for\s+{ident}\s*=\s*1\s*,\s*#{ident}\s+do\s*"
-        rf"if\s+{ident}\s*<\s*29\s+or\s+{ident}\s*>\s*32",
+        rf"\s*\*\s*31\s*\)\s*%\s*4294967296\s*;\s*local\s+function\s+{ident}\s*\(\s*\)",
         "envelope integrity domain",
     )
     # This pattern also captures the hash identifier for its back-reference, so recover
@@ -86,6 +86,12 @@ def extract_build_domains(source: str) -> BuildDomains:
         rf"\s*;\s*return\s*\(\s*{ident}\s*\*\s*1664525",
         "flow domain",
     )
+    chunk_state = _one(
+        source,
+        rf"{ident}\s*\(\s*{ident}\s*,\s*22695477\s*\)\s*\+\s*{ident}\s*\*\s*65537\s*\+\s*{ident}\s*\*\s*257"
+        rf".+?\+\s*(\d+)\s*\+\s*{ident}\s*\+\s*{ident}\s*\)\s*%\s*4294967296",
+        "chunk-state domain",
+    )
     flow_verifier_mask = _one(
         source,
         rf"return\s+{ident}\(\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)"
@@ -114,7 +120,7 @@ def extract_build_domains(source: str) -> BuildDomains:
     prototype_integrity = _one(
         source,
         rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)\s*\*\s*31"
-        rf"\s*\+\s*#{ident}\s*\)\s*%\s*4294967296\s*;\s*for\s+{ident}\s*=\s*1\s*,\s*#{ident}",
+        rf"\s*\+\s*{ident}\s*\)\s*%\s*4294967296\s*;\s*local\s+{ident}\s*=\s*\{{\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*\}}",
         "prototype integrity domain",
     )
     block_integrity = _one(
@@ -138,8 +144,7 @@ def extract_build_domains(source: str) -> BuildDomains:
     )
     constant_tag_permutation = _one(
         source,
-        rf"local\s+{ident}\s*=\s*{ident}\(\s*4\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*(\d+)\s*\)"
-        rf"\s*;\s*local\s+{ident}\s*=\s*\{{\s*\}}\s*;\s*for\s+{ident}\s*=\s*1\s*,\s*#{ident}",
+        rf"local\s+{ident}\s*=\s*{ident}\(\s*4\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*(\d+)\s*\)",
         "constant-tag permutation domain",
     )
     block_column = _one(
@@ -152,8 +157,8 @@ def extract_build_domains(source: str) -> BuildDomains:
     record_candidates = {
         (int(match.group(1)), int(match.group(2)))
         for match in re.finditer(
-            rf"{ident}\s*=\s*{ident}\s*\+\s*7\s*;(?:(?!elseif).){{1,700}}?"
-            rf"if\s+{ident}\s*==\s*(\d+)\s+then\b(?:(?!elseif).){{1,900}}?"
+            rf"local\s+{ident}\s*=\s*\{{\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*\}}\s*;"
+            rf"\s*if\s+{ident}\s*==\s*(\d+)\s+then\b(?:(?!elseif).){{1,1200}}?"
             rf"elseif\s+{ident}\s*==\s*(\d+)\s+then\b",
             source,
             re.S,
@@ -170,6 +175,7 @@ def extract_build_domains(source: str) -> BuildDomains:
         integrity=integrity,
         block_integrity=block_integrity,
         flow=flow,
+        chunk_state=chunk_state,
         envelope_integrity=envelope_integrity,
         entropy_digest=entropy_digest,
         envelope_mask=envelope_mask,
@@ -190,6 +196,7 @@ def extract_build_domains(source: str) -> BuildDomains:
         values.integrity,
         values.block_integrity,
         values.flow,
+        values.chunk_state,
         values.envelope_integrity,
         values.entropy_digest,
         values.envelope_mask,

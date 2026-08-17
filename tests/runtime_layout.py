@@ -161,11 +161,12 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
 
     counts = _expect(
         rf"{re.escape(chunk)}\[(\d+)\]\s*=\s*{re.escape(block_count)};\s*"
-        rf"{re.escape(chunk)}\[(\d+)\]\s*=\s*{IDENT}\(\);",
+        rf"{re.escape(chunk)}\[(\d+)\]\s*=\s*({IDENT})\(\);\s*"
+        rf"{re.escape(chunk)}\[(\d+)\]\s*=\s*\3\(\);",
         source[capsules.end():],
-        "could not recover Chunk block-count/initial-state slots",
+        "could not recover Chunk block-count/initial flow/chunk-state slots",
     )
-    chunk_map.update({11: int(counts.group(1)), 12: int(counts.group(2))})
+    chunk_map.update({11: int(counts.group(1)), 12: int(counts.group(2)), 16: int(counts.group(4))})
 
     dispatcher_init = _expect(
         rf"local\s+({IDENT})\s*=\s*\{{\}};\s*local\s+{IDENT}\s*=\s*0;\s*"
@@ -183,55 +184,59 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     chunk_map.update({13: int(dispatcher_pair.group(1)), 14: int(dispatcher_pair.group(2))})
 
     # Params is the sole remaining Chunk semantic after all keyed fields above.
-    remaining_old = set(range(1, 16)) - set(chunk_map)
-    remaining_new = set(range(1, 16)) - set(chunk_map.values())
+    remaining_old = set(range(1, 17)) - set(chunk_map)
+    remaining_new = set(range(1, 17)) - set(chunk_map.values())
     if len(remaining_old) != 1 or len(remaining_new) != 1 or remaining_old != {3}:
         raise ValueError("could not infer the remaining Chunk parameter slot")
     chunk_map[3] = remaining_new.pop()
 
-    # Block is built by nine explicit keyed assignments in semantic order.
+    # Block is built by ten explicit keyed assignments in semantic order.
     block_match = _expect(
         rf"local\s+({IDENT})\s*=\s*\{{\}};\s*"
-        + "".join(rf"\1\[(\d+)\]\s*=\s*[^;]+;\s*" for _ in range(9)),
+        + "".join(rf"\1\[(\d+)\]\s*=\s*[^;]+;\s*" for _ in range(10)),
         source,
         "could not recover keyed Block constructor",
     )
     block_name = block_match.group(1)
-    block_map_slots = {index: int(block_match.group(index + 1)) for index in range(1, 10)}
+    block_map_slots = {index: int(block_match.group(index + 1)) for index in range(1, 11)}
 
-    # Flow updates CurrentPC, CurrentBlock and EntryState in one keyed tuple.
-    triples = list(re.finditer(
-        rf"({IDENT})\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*=\s*"
-        rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT};",
+    # Flow updates CurrentPC, CurrentBlock, EntryState and its authenticated
+    # cache in one keyed tuple.
+    flow_tuples = list(re.finditer(
+        rf"({IDENT})\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*=\s*"
+        rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT};",
         source,
     ))
-    flow_candidates = [match for match in triples if match.group(1) != chunk and
-                       all(1 <= int(match.group(index)) <= 4 for index in (2, 3, 4))]
+    flow_candidates = [match for match in flow_tuples if match.group(1) != chunk and
+                       set(int(match.group(index)) for index in (2, 3, 4, 5)) == set(range(1, 5))]
     if len(flow_candidates) != 1:
-        raise ValueError(f"expected one Flow tuple assignment, found {len(flow_candidates)}")
+        raise ValueError(f"expected one four-role Flow tuple assignment, found {len(flow_candidates)}")
     flow_match = flow_candidates[0]
     flow_name = flow_match.group(1)
-    flow_map = {1: int(flow_match.group(2)), 2: int(flow_match.group(3)), 3: int(flow_match.group(4))}
-    missing_flow = (set(range(1, 5)) - set(flow_map.values()))
-    if len(missing_flow) != 1:
-        raise ValueError("could not infer Flow cache slot")
-    flow_map[4] = missing_flow.pop()
+    flow_map = {
+        1: int(flow_match.group(2)),
+        2: int(flow_match.group(3)),
+        3: int(flow_match.group(4)),
+        4: int(flow_match.group(5)),
+    }
 
-    # FlowCache has three semantic keyed assignments and is then stored in Flow.
+    # FlowCache now authenticates the current block, entry state and chunk state;
+    # all three roles are assigned in one keyed tuple before it enters Flow.
     cache_match = _expect(
         rf"(?:local\s+)?({IDENT})\s*=\s*\{{\}};\s*"
-        rf"\1\[(\d+)\]\s*=\s*{IDENT};\s*"
-        rf"\1\[(\d+)\]\s*=\s*{IDENT};\s*"
-        rf"\1\[(\d+)\]\s*=\s*{IDENT};\s*"
-        rf"{re.escape(flow_name)}\[{flow_map[4]}\]\s*=\s*\1;",
+        rf"\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*=\s*"
+        rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT};\s*"
+        rf"{re.escape(flow_name)}\[[^\]]+\]\s*,\s*{re.escape(flow_name)}\[[^\]]+\]\s*,\s*"
+        rf"{re.escape(flow_name)}\[[^\]]+\]\s*,\s*{re.escape(flow_name)}\[{flow_map[4]}\]\s*=\s*"
+        rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*\1;",
         source,
-        "could not recover keyed FlowCache constructor",
+        "could not recover keyed FlowCache chunk-state constructor",
     )
     flow_cache_name = cache_match.group(1)
     flow_cache_map = {1: int(cache_match.group(2)), 2: int(cache_match.group(3)), 3: int(cache_match.group(4))}
 
-    _permutation(chunk_map, 15, "Chunk")
-    _permutation(block_map_slots, 9, "Block")
+    _permutation(chunk_map, 16, "Chunk")
+    _permutation(block_map_slots, 10, "Block")
     _permutation(flow_map, 4, "Flow")
     _permutation(flow_cache_map, 3, "FlowCache")
 

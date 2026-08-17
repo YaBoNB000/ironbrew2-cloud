@@ -30,9 +30,9 @@ local function gBit(Bit, Start, End)
 end;
 
 -- DEFLATE(RFC 1951)解压器,与 C# 端 DeflateStream / Python zlib / Java Deflater 兼容
-local function inflate(d)
+local function inflate(d, expected)
 	local p = 1;
-	local function rd() local b = Byte(d, p); p = p + 1; return b; end;
+	local function rd() if p > #d then error('invalid protected payload', 0); end; local b = Byte(d, p); p = p + 1; return b; end;
 	local bb, bc = 0, 0;
 	local function gb(n)
 		while bc < n do bb = bb + rd() * 2^bc; bc = bc + 8; end;
@@ -42,7 +42,7 @@ local function inflate(d)
 		return v;
 	end;
 	local out = {};
-	local function em(c) out[#out + 1] = c; end;
+	local function em(c) if #out >= expected then error('invalid protected payload', 0); end; out[#out + 1] = c; end;
 	-- MSB-first 读 n 位:Huffman 码是 MSB-first 打包(fixed 距离码用),extra bits 是 LSB-first(用 gb)
 	local function gbr(n) local v = 0; for i = 1, n do v = v * 2 + gb(1); end; return v; end;
 	local LB = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
@@ -150,55 +150,62 @@ local function inflate(d)
 		end;
 		if bf == 1 then break; end;
 	end;
+	if #out ~= expected then error('invalid protected payload', 0); end;
 	local res = {};
 	for i = 1, #out do res[i] = Char(out[i]); end;
 	return Concat(res);
 end;
 
--- v4 固定头：head/salt 4B | integrity 4B | version+flags 1B。
--- feature bit 8 表示认证 entropy envelope；固定配置必须同时带 block、dispatcher 与 envelope。
-local PayloadHead = Byte(ByteString, 1, 1)
-         + Byte(ByteString, 2, 2) * 256
-         + Byte(ByteString, 3, 3) * 65536
-         + Byte(ByteString, 4, 4) * 16777216;
-local PayloadTag = Byte(ByteString, 5, 5)
-         + Byte(ByteString, 6, 6) * 256
-         + Byte(ByteString, 7, 7) * 65536
-         + Byte(ByteString, 8, 8) * 16777216;
-local PayloadFlags = Byte(ByteString, 9, 9);
+-- v4 fixed header: head/salt 4B | integrity 4B | version+flags 1B.
+-- The Base91 result remains ciphertext. Envelope bytes are authenticated while
+-- scanned, but only compact ciphertext record descriptors survive that scan.
+if #ByteString < 41 then error('invalid protected payload', 0); end;
+local PayloadCiphertext = ByteString;
+local PayloadHead = Byte(PayloadCiphertext, 1, 1)
+         + Byte(PayloadCiphertext, 2, 2) * 256
+         + Byte(PayloadCiphertext, 3, 3) * 65536
+         + Byte(PayloadCiphertext, 4, 4) * 16777216;
+local PayloadTag = Byte(PayloadCiphertext, 5, 5)
+         + Byte(PayloadCiphertext, 6, 6) * 256
+         + Byte(PayloadCiphertext, 7, 7) * 65536
+         + Byte(PayloadCiphertext, 8, 8) * 16777216;
+local PayloadFlags = Byte(PayloadCiphertext, 9, 9);
 local PayloadFeatures = PayloadFlags % 16;
 local PayloadVersion = (PayloadFlags - PayloadFeatures) / 16;
 if PayloadVersion ~= 4 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
 __IB2_SEED__
 local OuterSeed = Xs;
+local PayloadAttestation = __IB2_PAYLOAD_ATTESTATION__;
 
--- 在解密前验证整个密文；随后 envelope 再独立认证 record framing 与物理顺序。
 local PayloadHash = (BitXOR(Xs, __IB2_DOMAIN_INTEGRITY__) * 31 + PayloadFlags) % 4294967296;
-for PayloadIndex = 10, #ByteString do
-	PayloadHash = (PayloadHash * 31 + Byte(ByteString, PayloadIndex, PayloadIndex)) % 4294967296;
+for PayloadIndex = 10, #PayloadCiphertext do
+    PayloadHash = (PayloadHash * 31 + Byte(PayloadCiphertext, PayloadIndex, PayloadIndex)) % 4294967296;
 end;
 if PayloadHash ~= PayloadTag then error('invalid protected payload', 0); end;
 
--- 整体流式 XOR 解密(第 10 字节起) → authenticated entropy envelope。
-local PayloadDecoded = {};
-for PayloadIndex = 10, #ByteString do
-	local PayloadByte = Byte(ByteString, PayloadIndex, PayloadIndex);
-	local PayloadKey = (Xs - Xs % 16777216) / 16777216;
-	Xs = (Xs * 1664525 + 1013904223) % 4294967296;
-	PayloadDecoded[PayloadIndex - 9] = Char(BitXOR(PayloadByte, PayloadKey));
-end
-ByteString = Concat(PayloadDecoded);
-PayloadDecoded = nil;
-
--- Envelope header: real length | entropy length | total/data/entropy counts |
--- nonce | entropy digest | envelope tag. Records are kind:u8, ordinal:u16,
--- length:u32, bytes. Real data and CSPRNG entropy records are physically shuffled.
-local EnvelopePos = 1;
+-- The outer XOR stream is consumed once to authenticate envelope framing. Record
+-- bodies are discarded immediately; descriptors retain only ciphertext offset,
+-- length, and the outer PRNG state at the first record byte.
+local EnvelopeCipherPos = 10;
+local EnvelopeCipherState = Xs;
+local EnvelopePlainPos = 0;
+local EnvelopeHash = (BitXOR(OuterSeed, __IB2_DOMAIN_ENVELOPE_INTEGRITY__) * 31) % 4294967296;
+local function EnvelopeRead8()
+    if EnvelopeCipherPos > #PayloadCiphertext then error('invalid protected payload', 0); end;
+    local CipherByte = Byte(PayloadCiphertext, EnvelopeCipherPos, EnvelopeCipherPos);
+    local KeyByte = (EnvelopeCipherState - EnvelopeCipherState % 16777216) / 16777216;
+    local PlainByte = BitXOR(CipherByte, KeyByte);
+    EnvelopeCipherState = (EnvelopeCipherState * 1664525 + 1013904223) % 4294967296;
+    EnvelopeCipherPos = EnvelopeCipherPos + 1;
+    EnvelopePlainPos = EnvelopePlainPos + 1;
+    if EnvelopePlainPos < 29 or EnvelopePlainPos > 32 then
+        EnvelopeHash = (EnvelopeHash * 31 + PlainByte) % 4294967296;
+    end;
+    return PlainByte;
+end;
 local function EnvelopeRead32()
-	if EnvelopePos + 3 > #ByteString then error('invalid protected payload', 0); end;
-	local W, X, Y, Z = Byte(ByteString, EnvelopePos, EnvelopePos + 3);
-	EnvelopePos = EnvelopePos + 4;
-	return W + X * 256 + Y * 65536 + Z * 16777216;
+    local W, X, Y, Z = EnvelopeRead8(), EnvelopeRead8(), EnvelopeRead8(), EnvelopeRead8();
+    return W + X * 256 + Y * 65536 + Z * 16777216;
 end;
 local EnvelopeRealLength = EnvelopeRead32();
 local EnvelopeEntropyLength = EnvelopeRead32();
@@ -209,138 +216,191 @@ local EnvelopeNonce = EnvelopeRead32();
 local EnvelopeDigest = EnvelopeRead32();
 local EnvelopeTag = EnvelopeRead32();
 local EnvelopeExpected = 32 + EnvelopeRecordCount * 7 + EnvelopeRealLength + EnvelopeEntropyLength;
-if EnvelopeRealLength < 1 or EnvelopeRealLength > 67108864
+if EnvelopeRealLength < 5 or EnvelopeRealLength > 83886080
 or EnvelopeEntropyLength < 65536 or EnvelopeEntropyLength > 98304
-or EnvelopeDataCount < 1 or EnvelopeDataCount > 32
+or EnvelopeDataCount < 1 or EnvelopeDataCount > 65535
 or EnvelopeEntropyCount < 8 or EnvelopeEntropyCount > 64
 or EnvelopeRecordCount ~= EnvelopeDataCount + EnvelopeEntropyCount
-or EnvelopeNonce == 0 or EnvelopeExpected ~= #ByteString then error('invalid protected payload', 0); end;
+or EnvelopeNonce == 0 or EnvelopeExpected ~= #PayloadCiphertext - 9 then error('invalid protected payload', 0); end;
 
-local EnvelopeHash = (BitXOR(OuterSeed, __IB2_DOMAIN_ENVELOPE_INTEGRITY__) * 31) % 4294967296;
-for EnvelopeIndex = 1, #ByteString do
-	if EnvelopeIndex < 29 or EnvelopeIndex > 32 then
-		EnvelopeHash = (EnvelopeHash * 31 + Byte(ByteString, EnvelopeIndex, EnvelopeIndex)) % 4294967296;
-	end;
-end;
-if EnvelopeHash ~= EnvelopeTag then error('invalid protected payload', 0); end;
-
-local EnvelopeDataRecords = {};
-local EnvelopeEntropyRecords = {};
+local PayloadPageDescriptors = {};
+local EntropyDescriptors = {};
 local EnvelopeDataLength = 0;
 local EnvelopeEntropySeenLength = 0;
 for EnvelopeIndex = 1, EnvelopeRecordCount do
-	if EnvelopePos + 6 > #ByteString then error('invalid protected payload', 0); end;
-	local EnvelopeKind = Byte(ByteString, EnvelopePos, EnvelopePos);
-	local EnvelopeOrdinal = Byte(ByteString, EnvelopePos + 1, EnvelopePos + 1)
-		+ Byte(ByteString, EnvelopePos + 2, EnvelopePos + 2) * 256;
-	local EnvelopeLength = Byte(ByteString, EnvelopePos + 3, EnvelopePos + 3)
-		+ Byte(ByteString, EnvelopePos + 4, EnvelopePos + 4) * 256
-		+ Byte(ByteString, EnvelopePos + 5, EnvelopePos + 5) * 65536
-		+ Byte(ByteString, EnvelopePos + 6, EnvelopePos + 6) * 16777216;
-	EnvelopePos = EnvelopePos + 7;
-	if EnvelopeLength < 1 or EnvelopePos + EnvelopeLength - 1 > #ByteString then error('invalid protected payload', 0); end;
-	local EnvelopeRecord = Sub(ByteString, EnvelopePos, EnvelopePos + EnvelopeLength - 1);
-	EnvelopePos = EnvelopePos + EnvelopeLength;
-	if EnvelopeKind == __IB2_DATA_RECORD_KIND__ then
-		if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeDataCount or EnvelopeDataRecords[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
-		EnvelopeDataRecords[EnvelopeOrdinal] = EnvelopeRecord;
-		EnvelopeDataLength = EnvelopeDataLength + EnvelopeLength;
-	elseif EnvelopeKind == __IB2_ENTROPY_RECORD_KIND__ then
-		if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeEntropyCount or EnvelopeEntropyRecords[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
-		EnvelopeEntropyRecords[EnvelopeOrdinal] = EnvelopeRecord;
-		EnvelopeEntropySeenLength = EnvelopeEntropySeenLength + EnvelopeLength;
-	else
-		error('invalid protected payload', 0);
-	end;
+    local EnvelopeKind = EnvelopeRead8();
+    local OrdinalLow, OrdinalHigh = EnvelopeRead8(), EnvelopeRead8();
+    local EnvelopeOrdinal = OrdinalLow + OrdinalHigh * 256;
+    local EnvelopeLength = EnvelopeRead32();
+    if EnvelopeLength < 1 or EnvelopeCipherPos + EnvelopeLength - 1 > #PayloadCiphertext then error('invalid protected payload', 0); end;
+    local Descriptor = {EnvelopeCipherPos, EnvelopeLength, EnvelopeCipherState};
+    if EnvelopeKind == __IB2_DATA_RECORD_KIND__ then
+        if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeDataCount or PayloadPageDescriptors[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
+        PayloadPageDescriptors[EnvelopeOrdinal] = Descriptor;
+        EnvelopeDataLength = EnvelopeDataLength + EnvelopeLength;
+    elseif EnvelopeKind == __IB2_ENTROPY_RECORD_KIND__ then
+        if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeEntropyCount or EntropyDescriptors[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
+        EntropyDescriptors[EnvelopeOrdinal] = Descriptor;
+        EnvelopeEntropySeenLength = EnvelopeEntropySeenLength + EnvelopeLength;
+    else
+        error('invalid protected payload', 0);
+    end;
+    for EnvelopeByteIndex = 1, EnvelopeLength do EnvelopeRead8(); end;
 end;
-if EnvelopePos ~= #ByteString + 1 or EnvelopeDataLength ~= EnvelopeRealLength
-or EnvelopeEntropySeenLength ~= EnvelopeEntropyLength then error('invalid protected payload', 0); end;
+if EnvelopeCipherPos ~= #PayloadCiphertext + 1 or EnvelopeDataLength ~= EnvelopeRealLength
+or EnvelopeEntropySeenLength ~= EnvelopeEntropyLength or EnvelopeHash ~= EnvelopeTag then error('invalid protected payload', 0); end;
 
--- Digest entropy in logical ordinal order. Every entropy byte contributes to
--- the state that masks the real stream, even when its record appears later.
+-- Entropy is authenticated in logical order without retaining any entropy record.
 local EntropyHash = (BitXOR(OuterSeed, __IB2_DOMAIN_ENTROPY_DIGEST__) * 31 + EnvelopeNonce) % 4294967296;
 EntropyHash = (EntropyHash * 31 + EnvelopeEntropyLength) % 4294967296;
 EntropyHash = (EntropyHash * 31 + EnvelopeEntropyCount) % 4294967296;
 for EnvelopeIndex = 1, EnvelopeEntropyCount do
-	local EnvelopeRecord = EnvelopeEntropyRecords[EnvelopeIndex];
-	if EnvelopeRecord == nil then error('invalid protected payload', 0); end;
-	EntropyHash = (EntropyHash * 31 + EnvelopeIndex) % 4294967296;
-	EntropyHash = (EntropyHash * 31 + #EnvelopeRecord) % 4294967296;
-	for EnvelopeByteIndex = 1, #EnvelopeRecord do
-		EntropyHash = (EntropyHash * 31 + Byte(EnvelopeRecord, EnvelopeByteIndex, EnvelopeByteIndex)) % 4294967296;
-	end;
+    local Descriptor = EntropyDescriptors[EnvelopeIndex];
+    if Descriptor == nil then error('invalid protected payload', 0); end;
+    EntropyHash = (EntropyHash * 31 + EnvelopeIndex) % 4294967296;
+    EntropyHash = (EntropyHash * 31 + Descriptor[2]) % 4294967296;
+    local DescriptorState = Descriptor[3];
+    for DescriptorOffset = 0, Descriptor[2] - 1 do
+        local KeyByte = (DescriptorState - DescriptorState % 16777216) / 16777216;
+        local PlainByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + DescriptorOffset, Descriptor[1] + DescriptorOffset), KeyByte);
+        EntropyHash = (EntropyHash * 31 + PlainByte) % 4294967296;
+        DescriptorState = (DescriptorState * 1664525 + 1013904223) % 4294967296;
+    end;
 end;
+EntropyDescriptors = nil;
 if EntropyHash ~= EnvelopeDigest then error('invalid protected payload', 0); end;
 
-local EnvelopeState = BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), __IB2_DOMAIN_ENVELOPE_MASK__), EnvelopeRealLength) % 4294967296;
-local EnvelopeBody = {};
-local EnvelopeBodyIndex = 0;
-for EnvelopeIndex = 1, EnvelopeDataCount do
-	local EnvelopeRecord = EnvelopeDataRecords[EnvelopeIndex];
-	if EnvelopeRecord == nil then error('invalid protected payload', 0); end;
-	for EnvelopeByteIndex = 1, #EnvelopeRecord do
-		EnvelopeBodyIndex = EnvelopeBodyIndex + 1;
-		local EnvelopeKey = (EnvelopeState - EnvelopeState % 16777216) / 16777216;
-		EnvelopeBody[EnvelopeBodyIndex] = Char(BitXOR(Byte(EnvelopeRecord, EnvelopeByteIndex, EnvelopeByteIndex), EnvelopeKey));
-		EnvelopeState = (EnvelopeState * 1664525 + 1013904223) % 4294967296;
-	end;
+-- Assign each logical page its inner mask state and authenticate its bounded raw
+-- length. No page content is retained until the source reader requests it.
+local EnvelopeMaskState = BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), __IB2_DOMAIN_ENVELOPE_MASK__), EnvelopeRealLength) % 4294967296;
+local PayloadSourceLength = 0;
+for PageOrdinal = 1, EnvelopeDataCount do
+    local Descriptor = PayloadPageDescriptors[PageOrdinal];
+    if Descriptor == nil or Descriptor[2] < 5 or Descriptor[2] > 16384 then error('invalid protected payload', 0); end;
+    Descriptor[4] = EnvelopeMaskState;
+    local DescriptorState = Descriptor[3];
+    local RawLength = 0;
+    local Multiplier = 1;
+    for FramingIndex = 0, 3 do
+        local OuterKey = (DescriptorState - DescriptorState % 16777216) / 16777216;
+        local InnerKey = (EnvelopeMaskState - EnvelopeMaskState % 16777216) / 16777216;
+        local NestedByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + FramingIndex, Descriptor[1] + FramingIndex), OuterKey);
+        RawLength = RawLength + BitXOR(NestedByte, InnerKey) * Multiplier;
+        Multiplier = Multiplier * 256;
+        DescriptorState = (DescriptorState * 1664525 + 1013904223) % 4294967296;
+        EnvelopeMaskState = (EnvelopeMaskState * 1664525 + 1013904223) % 4294967296;
+    end;
+    if RawLength < 1 or RawLength > 6144 then error('invalid protected payload', 0); end;
+    Descriptor[5] = RawLength;
+    PayloadSourceLength = PayloadSourceLength + RawLength;
+    if PayloadSourceLength > 67108864 then error('invalid protected payload', 0); end;
+    for PageByteIndex = 5, Descriptor[2] do
+        EnvelopeMaskState = (EnvelopeMaskState * 1664525 + 1013904223) % 4294967296;
+    end;
 end;
-if EnvelopeBodyIndex ~= EnvelopeRealLength then error('invalid protected payload', 0); end;
-ByteString = Concat(EnvelopeBody);
-EnvelopeBody = nil;
-EnvelopeDataRecords = nil;
-EnvelopeEntropyRecords = nil;
-if gBit(PayloadFeatures, 1, 1) == 1 then
-	ByteString = inflate(ByteString);
-end
+
+local PayloadPageOrdinal = 0;
+local PayloadPage = nil;
+local PayloadPagePosition = 1;
+local function LoadPayloadPage()
+    PayloadPage = nil;
+    PayloadPageOrdinal = PayloadPageOrdinal + 1;
+    local Descriptor = PayloadPageDescriptors[PayloadPageOrdinal];
+    if Descriptor == nil then error('invalid protected payload', 0); end;
+    local DescriptorState = Descriptor[3];
+    local MaskState = Descriptor[4];
+    local EncodedParts = {};
+    local FramedLength = 0;
+    local Multiplier = 1;
+    for PageByteIndex = 0, Descriptor[2] - 1 do
+        local OuterKey = (DescriptorState - DescriptorState % 16777216) / 16777216;
+        local InnerKey = (MaskState - MaskState % 16777216) / 16777216;
+        local NestedByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + PageByteIndex, Descriptor[1] + PageByteIndex), OuterKey);
+        local PlainByte = BitXOR(NestedByte, InnerKey);
+        if PageByteIndex < 4 then
+            FramedLength = FramedLength + PlainByte * Multiplier;
+            Multiplier = Multiplier * 256;
+        else
+            EncodedParts[PageByteIndex - 3] = Char(PlainByte);
+        end;
+        DescriptorState = (DescriptorState * 1664525 + 1013904223) % 4294967296;
+        MaskState = (MaskState * 1664525 + 1013904223) % 4294967296;
+    end;
+    if FramedLength ~= Descriptor[5] then error('invalid protected payload', 0); end;
+    local EncodedPage = Concat(EncodedParts);
+    EncodedParts = nil;
+    if gBit(PayloadFeatures, 1, 1) == 1 then
+        PayloadPage = inflate(EncodedPage, FramedLength);
+    else
+        if #EncodedPage ~= FramedLength then error('invalid protected payload', 0); end;
+        PayloadPage = EncodedPage;
+    end;
+    EncodedPage = nil;
+    PayloadPagePosition = 1;
+end;
+
+-- Source abstraction: root reads bounded pages; child prototypes and opaque block
+-- or capsule slices use the same readers over a local string source.
+ByteString = nil;
 local Pos = 1;
+local ActiveSourceLength = PayloadSourceLength;
+local SourceIsPaged = true;
+local ActivePrototypeHash = nil;
+local function TrackPrototypeByte(Value)
+    if ActivePrototypeHash ~= nil then ActivePrototypeHash = (ActivePrototypeHash * 31 + Value) % 4294967296; end;
+end;
+local function SourceRead8()
+    local Value;
+    if SourceIsPaged then
+        if Pos > PayloadSourceLength then error('invalid protected payload', 0); end;
+        if PayloadPage == nil or PayloadPagePosition > #PayloadPage then LoadPayloadPage(); end;
+        Value = Byte(PayloadPage, PayloadPagePosition, PayloadPagePosition);
+        PayloadPagePosition = PayloadPagePosition + 1;
+    else
+        if Pos > ActiveSourceLength then error('invalid protected payload', 0); end;
+        Value = Byte(ByteString, Pos, Pos);
+    end;
+    Pos = Pos + 1;
+    TrackPrototypeByte(Value);
+    return Value;
+end;
+local function SourceReadBytes(Length)
+    if Length < 0 or Pos + Length - 1 > ActiveSourceLength then error('invalid protected payload', 0); end;
+    local Parts = {};
+    for Index = 1, Length do Parts[Index] = Char(SourceRead8()); end;
+    return Concat(Parts);
+end;
 
 local function gBits32()
-    local W, X, Y, Z = Byte(ByteString, Pos, Pos + 3);
-    Pos	= Pos + 4;
-    return (Z*16777216) + (Y*65536) + (X*256) + W;
+    local W, X, Y, Z = SourceRead8(), SourceRead8(), SourceRead8(), SourceRead8();
+    return Z * 16777216 + Y * 65536 + X * 256 + W;
 end;
-
-local function gBits8()
-    local F = Byte(ByteString, Pos, Pos);
-    Pos = Pos + 1;
-    return F;
-end;
-
+local function gBits8() return SourceRead8(); end;
 local function gBits16()
-    local W, X = Byte(ByteString, Pos, Pos + 2);
-    Pos	= Pos + 2;
-    return (X*256) + W;
+    local W, X = SourceRead8(), SourceRead8();
+    return X * 256 + W;
 end;
 
 local function gFloat()
-	local Left = gBits32();
-	local Right = gBits32();
-	local IsNormal = 1;
-	local Mantissa = (gBit(Right, 1, 20) * (2 ^ 32))
-					+ Left;
-	local Exponent = gBit(Right, 21, 31);
-	local Sign = ((-1) ^ gBit(Right, 32));
-	if (Exponent == 0) then
-		if (Mantissa == 0) then
-			return Sign * 0; -- +-0
-		else
-			Exponent = 1;
-			IsNormal = 0;
-		end;
-	elseif (Exponent == 2047) then
+    local Left = gBits32();
+    local Right = gBits32();
+    local IsNormal = 1;
+    local Mantissa = (gBit(Right, 1, 20) * (2 ^ 32)) + Left;
+    local Exponent = gBit(Right, 21, 31);
+    local Sign = ((-1) ^ gBit(Right, 32));
+    if Exponent == 0 then
+        if Mantissa == 0 then return Sign * 0; else Exponent = 1; IsNormal = 0; end;
+    elseif Exponent == 2047 then
         return (Mantissa == 0) and (Sign * (1 / 0)) or (Sign * (0 / 0));
-	end;
-	return LDExp(Sign, Exponent - 1023) * (IsNormal + (Mantissa / (2 ^ 52)));
+    end;
+    return LDExp(Sign, Exponent - 1023) * (IsNormal + (Mantissa / (2 ^ 52)));
 end;
 
 local gSizet = gBits32;
 local function gString(Len, Idx, K1, K2, K3)
-    if (not Len) then Len = gSizet(); end;
-    if (Len == 0) then return ''; end;
-
-    local Enc = Sub(ByteString, Pos, Pos + Len - 1);
-    Pos = Pos + Len;
+    if not Len then Len = gSizet(); end;
+    if Len == 0 then return ''; end;
+    local Enc = SourceReadBytes(Len);
     local State = (K1 + K2 + K3 + Idx * 257) % 65536;
     local Out = {};
     for I = 1, Len do
@@ -353,6 +413,14 @@ end;
 local function U32(V)
     if V < 0 then return V + 4294967296; end;
     return V;
+end;
+
+-- Exact uint32 multiplication for stock Lua 5.1 doubles. Direct products by
+-- the chunk-chain multipliers exceed the 53-bit exact-integer range.
+local function U32Mul(A, B)
+    local ALow, BLow = A % 65536, B % 65536;
+    local AHigh, BHigh = (A - ALow) / 65536, (B - BLow) / 65536;
+    return (ALow * BLow + ((ALow * BHigh + AHigh * BLow) % 65536) * 65536) % 4294967296;
 end;
 
 local function OpcodeKey(I, K1, K2, K3)
@@ -384,6 +452,25 @@ local function FlowVerifier(EntryState, BlockStart, K1, K2, K3)
     return FlowKey(EntryState, BlockStart, BitXOR(BlockStart, __IB2_FLOW_VERIFIER_MASK__), K1, K2, K3);
 end;
 
+local function ChunkState(EntryState, BlockStart, Count, K1, K2, K3)
+    local Value = (U32Mul(EntryState, 22695477) + BlockStart * 65537 + Count * 257
+        + K1 * 251 + K2 * 17 + K3 + __IB2_DOMAIN_CHUNK_STATE__ + OuterSeed + PayloadAttestation) % 4294967296;
+    return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
+end;
+
+local function InitialChunkKey(K1, K2, K3)
+    local Value = (K1 * 65537 + K2 * 257 + K3 + __IB2_DOMAIN_CHUNK_STATE__
+        + OuterSeed + PayloadAttestation) % 4294967296;
+    return (U32Mul(Value, 22695477) + 1) % 4294967296;
+end;
+
+local function ChunkChainKey(SourceChunkState, SourceEntryState, FromPC, ToPC, K1, K2, K3)
+    local Value = (U32Mul(SourceChunkState, 1664525) + U32Mul(SourceEntryState, 22695477)
+        + FromPC * 257 + ToPC * 65537 + K1 * 251 + K2 * 17 + K3
+        + __IB2_DOMAIN_CHUNK_STATE__ + OuterSeed + PayloadAttestation) % 4294967296;
+    return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
+end;
+
 local function BlockFieldKey(EntryState, I, Slot, K1, K2, K3)
     local Low = EntryState % 65536;
     local High = (EntryState - Low) / 65536;
@@ -409,13 +496,16 @@ local function ComputeConstantIntegrity(EncodedBody, Index, K1, K2, K3)
     return Hash;
 end;
 
-local function ComputePrototypeIntegrity(Body, K1, K2, K3)
+local function BeginPrototypeIntegrity(Length, K1, K2, K3)
     local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
-    local Hash = (BitXOR(Keyed, __IB2_DOMAIN_PROTOTYPE_INTEGRITY__) * 31 + #Body) % 4294967296;
-    for I = 1, #Body do
-        if I < 7 or I > 10 then Hash = (Hash * 31 + Byte(Body, I, I)) % 4294967296; end;
+    local Hash = (BitXOR(Keyed, __IB2_DOMAIN_PROTOTYPE_INTEGRITY__) * 31 + Length) % 4294967296;
+    local Words = {K1, K2, K3};
+    for WordIndex = 1, 3 do
+        local Word = Words[WordIndex];
+        Hash = (Hash * 31 + Word % 256) % 4294967296;
+        Hash = (Hash * 31 + (Word - Word % 256) / 256) % 4294967296;
     end;
-    return Hash;
+    ActivePrototypeHash = Hash;
 end;
 
 local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteToken, References, ConstCapsules, Verifier, SuccessorRecords, K1, K2, K3)
@@ -440,6 +530,7 @@ local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteT
         local SuccessorRecord = SuccessorRecords[SuccessorIndex];
         Hash = (Hash * 31 + SuccessorRecord[1]) % 4294967296;
         Hash = (Hash * 31 + SuccessorRecord[2]) % 4294967296;
+        Hash = (Hash * 31 + SuccessorRecord[3]) % 4294967296;
     end;
     Hash = (Hash * 31 + #Body) % 4294967296;
     for I = 1, #Body do Hash = (Hash * 31 + Byte(Body, I, I)) % 4294967296; end;
@@ -483,7 +574,8 @@ local function DeriveBlockPermutation(Count, EntryState, K1, K2, K3, Domain)
 end;
 
 local function Deserialize()
-    local PrototypeLength = #ByteString;
+    local PrototypeLength = ActiveSourceLength;
+    ActivePrototypeHash = nil;
     local Instrs = {};
     local Functions = {};
 		local Lines = {};
@@ -495,7 +587,7 @@ local function Deserialize()
     local K2 = gBits16();
     local K3 = gBits16();
     local PrototypeTag = gBits32();
-    if ComputePrototypeIntegrity(ByteString, K1, K2, K3) ~= PrototypeTag then error('invalid protected payload', 0); end;
+    BeginPrototypeIntegrity(PrototypeLength, K1, K2, K3);
     Chunk[5], Chunk[6], Chunk[7] = K1, K2, K3;
     local OpcodeBank = DerivePermutation(__IB2_OPCODE_COUNT__, K1, K2, K3, __IB2_DOMAIN_OPCODE_PERMUTATION__);
     Chunk[8] = OpcodeBank;
@@ -612,7 +704,7 @@ local function Wrap(Chunk, Upvalues, Env)
     end;
 end;	
 local Root = Deserialize();
-ByteString = nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
@@ -623,7 +715,7 @@ end)()(...);
     end;
 end;	
 local Root = Deserialize();
-ByteString = nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
@@ -741,7 +833,7 @@ local function Wrap(Chunk, Upvalues, Env)
 	end;
 end;	
 local Root = Deserialize();
-ByteString = nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
@@ -761,7 +853,7 @@ end)()(...);
 	end;
 end;	
 local Root = Deserialize();
-ByteString = nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
