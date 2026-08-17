@@ -156,20 +156,19 @@ local function inflate(d, expected)
 	return Concat(res);
 end;
 
--- v4 fixed header: head/salt 4B | integrity 4B | version+flags 1B.
--- The Base91 result remains ciphertext. Envelope bytes are authenticated while
--- scanned, but only compact ciphertext record descriptors survive that scan.
+-- v4 Build-local outer grammar. The field positions are generated into this VM
+-- rather than carried by a generic format selector in the payload.
 if #ByteString < 41 then error('invalid protected payload', 0); end;
 local PayloadCiphertext = ByteString;
-local PayloadHead = Byte(PayloadCiphertext, 1, 1)
-         + Byte(PayloadCiphertext, 2, 2) * 256
-         + Byte(PayloadCiphertext, 3, 3) * 65536
-         + Byte(PayloadCiphertext, 4, 4) * 16777216;
-local PayloadTag = Byte(PayloadCiphertext, 5, 5)
-         + Byte(PayloadCiphertext, 6, 6) * 256
-         + Byte(PayloadCiphertext, 7, 7) * 65536
-         + Byte(PayloadCiphertext, 8, 8) * 16777216;
-local PayloadFlags = Byte(PayloadCiphertext, 9, 9);
+local PayloadHead = Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__, __IB2_OUTER_HEAD_OFFSET__)
+         + Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__ + 1, __IB2_OUTER_HEAD_OFFSET__ + 1) * 256
+         + Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__ + 2, __IB2_OUTER_HEAD_OFFSET__ + 2) * 65536
+         + Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__ + 3, __IB2_OUTER_HEAD_OFFSET__ + 3) * 16777216;
+local PayloadTag = Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__, __IB2_OUTER_TAG_OFFSET__)
+         + Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__ + 1, __IB2_OUTER_TAG_OFFSET__ + 1) * 256
+         + Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__ + 2, __IB2_OUTER_TAG_OFFSET__ + 2) * 65536
+         + Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__ + 3, __IB2_OUTER_TAG_OFFSET__ + 3) * 16777216;
+local PayloadFlags = Byte(PayloadCiphertext, __IB2_OUTER_FLAGS_OFFSET__, __IB2_OUTER_FLAGS_OFFSET__);
 local PayloadFeatures = PayloadFlags % 16;
 local PayloadVersion = (PayloadFlags - PayloadFeatures) / 16;
 if PayloadVersion ~= 4 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
@@ -198,7 +197,7 @@ local function EnvelopeRead8()
     EnvelopeCipherState = (EnvelopeCipherState * 1664525 + 1013904223) % 4294967296;
     EnvelopeCipherPos = EnvelopeCipherPos + 1;
     EnvelopePlainPos = EnvelopePlainPos + 1;
-    if EnvelopePlainPos < 29 or EnvelopePlainPos > 32 then
+    if EnvelopePlainPos < __IB2_ENVELOPE_INTEGRITY_START__ or EnvelopePlainPos > __IB2_ENVELOPE_INTEGRITY_END__ then
         EnvelopeHash = (EnvelopeHash * 31 + PlainByte) % 4294967296;
     end;
     return PlainByte;
@@ -207,15 +206,10 @@ local function EnvelopeRead32()
     local W, X, Y, Z = EnvelopeRead8(), EnvelopeRead8(), EnvelopeRead8(), EnvelopeRead8();
     return W + X * 256 + Y * 65536 + Z * 16777216;
 end;
-local EnvelopeRealLength = EnvelopeRead32();
-local EnvelopeEntropyLength = EnvelopeRead32();
-local EnvelopeRecordCount = EnvelopeRead32();
-local EnvelopeDataCount = EnvelopeRead32();
-local EnvelopeEntropyCount = EnvelopeRead32();
-local EnvelopeNonce = EnvelopeRead32();
-local EnvelopeDigest = EnvelopeRead32();
-local EnvelopeTag = EnvelopeRead32();
-local EnvelopeExpected = 32 + EnvelopeRecordCount * 7 + EnvelopeRealLength + EnvelopeEntropyLength;
+local EnvelopeRealLength, EnvelopeEntropyLength, EnvelopeRecordCount, EnvelopeDataCount;
+local EnvelopeEntropyCount, EnvelopeNonce, EnvelopeDigest, EnvelopeTag;
+__IB2_ENVELOPE_HEADER_READS__
+local EnvelopeExpected = 32 + EnvelopeRecordCount * __IB2_RECORD_HEADER_WIDTH__ + EnvelopeRealLength + EnvelopeEntropyLength;
 if EnvelopeRealLength < 5 or EnvelopeRealLength > 83886080
 or EnvelopeEntropyLength < 65536 or EnvelopeEntropyLength > 98304
 or EnvelopeDataCount < 1 or EnvelopeDataCount > 65535
@@ -227,11 +221,17 @@ local PayloadPageDescriptors = {};
 local EntropyDescriptors = {};
 local EnvelopeDataLength = 0;
 local EnvelopeEntropySeenLength = 0;
+local function EnvelopeReadWidth(Width)
+    local Value, Multiplier = 0, 1;
+    for FieldIndex = 1, Width do
+        Value = Value + EnvelopeRead8() * Multiplier;
+        Multiplier = Multiplier * 256;
+    end;
+    return Value;
+end;
 for EnvelopeIndex = 1, EnvelopeRecordCount do
-    local EnvelopeKind = EnvelopeRead8();
-    local OrdinalLow, OrdinalHigh = EnvelopeRead8(), EnvelopeRead8();
-    local EnvelopeOrdinal = OrdinalLow + OrdinalHigh * 256;
-    local EnvelopeLength = EnvelopeRead32();
+    local EnvelopeKind, EnvelopeOrdinal, EnvelopeLength;
+    __IB2_RECORD_FIELD_READS__
     if EnvelopeLength < 1 or EnvelopeCipherPos + EnvelopeLength - 1 > #PayloadCiphertext then error('invalid protected payload', 0); end;
     local Descriptor = {EnvelopeCipherPos, EnvelopeLength, EnvelopeCipherState};
     if EnvelopeKind == __IB2_DATA_RECORD_KIND__ then
@@ -272,21 +272,24 @@ if EntropyHash ~= EnvelopeDigest then error('invalid protected payload', 0); end
 
 -- Assign each logical page its inner mask state and authenticate its bounded raw
 -- length. No page content is retained until the source reader requests it.
-local EnvelopeMaskState = BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), __IB2_DOMAIN_ENVELOPE_MASK__), EnvelopeRealLength) % 4294967296;
+local EnvelopeMaskState = BitXOR(BitXOR(BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), __IB2_DOMAIN_ENVELOPE_MASK__), __IB2_DOMAIN_PAYLOAD_FORMAT__), __IB2_DOMAIN_DECODE_PIPELINE__), EnvelopeRealLength) % 4294967296;
 local PayloadSourceLength = 0;
 for PageOrdinal = 1, EnvelopeDataCount do
     local Descriptor = PayloadPageDescriptors[PageOrdinal];
-    if Descriptor == nil or Descriptor[2] < 5 or Descriptor[2] > 16384 then error('invalid protected payload', 0); end;
+    if Descriptor == nil or Descriptor[2] < __IB2_PAGE_MIN_FRAME__ or Descriptor[2] > 16384 then error('invalid protected payload', 0); end;
     Descriptor[4] = EnvelopeMaskState;
     local DescriptorState = Descriptor[3];
     local RawLength = 0;
     local Multiplier = 1;
-    for FramingIndex = 0, 3 do
+    local LengthOffset = __IB2_PAGE_LENGTH_OFFSET__;
+    for PageByteIndex = 0, Descriptor[2] - 1 do
         local OuterKey = (DescriptorState - DescriptorState % 16777216) / 16777216;
         local InnerKey = (EnvelopeMaskState - EnvelopeMaskState % 16777216) / 16777216;
-        local NestedByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + FramingIndex, Descriptor[1] + FramingIndex), OuterKey);
-        RawLength = RawLength + BitXOR(NestedByte, InnerKey) * Multiplier;
-        Multiplier = Multiplier * 256;
+        if PageByteIndex >= LengthOffset and PageByteIndex < LengthOffset + __IB2_PAGE_LENGTH_WIDTH__ then
+            local NestedByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + PageByteIndex, Descriptor[1] + PageByteIndex), OuterKey);
+            RawLength = RawLength + BitXOR(NestedByte, InnerKey) * Multiplier;
+            Multiplier = Multiplier * 256;
+        end;
         DescriptorState = (DescriptorState * 1664525 + 1013904223) % 4294967296;
         EnvelopeMaskState = (EnvelopeMaskState * 1664525 + 1013904223) % 4294967296;
     end;
@@ -294,9 +297,6 @@ for PageOrdinal = 1, EnvelopeDataCount do
     Descriptor[5] = RawLength;
     PayloadSourceLength = PayloadSourceLength + RawLength;
     if PayloadSourceLength > 67108864 then error('invalid protected payload', 0); end;
-    for PageByteIndex = 5, Descriptor[2] do
-        EnvelopeMaskState = (EnvelopeMaskState * 1664525 + 1013904223) % 4294967296;
-    end;
 end;
 
 local PayloadPageOrdinal = 0;
@@ -312,21 +312,40 @@ local function LoadPayloadPage()
     local EncodedParts = {};
     local FramedLength = 0;
     local Multiplier = 1;
+    local EncodedIndex = 1;
+    local LengthOffset = __IB2_PAGE_LENGTH_OFFSET__;
     for PageByteIndex = 0, Descriptor[2] - 1 do
         local OuterKey = (DescriptorState - DescriptorState % 16777216) / 16777216;
         local InnerKey = (MaskState - MaskState % 16777216) / 16777216;
         local NestedByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + PageByteIndex, Descriptor[1] + PageByteIndex), OuterKey);
         local PlainByte = BitXOR(NestedByte, InnerKey);
-        if PageByteIndex < 4 then
+        if PageByteIndex >= LengthOffset and PageByteIndex < LengthOffset + __IB2_PAGE_LENGTH_WIDTH__ then
             FramedLength = FramedLength + PlainByte * Multiplier;
             Multiplier = Multiplier * 256;
         else
-            EncodedParts[PageByteIndex - 3] = Char(PlainByte);
+            EncodedParts[EncodedIndex] = PlainByte;
+            EncodedIndex = EncodedIndex + 1;
         end;
         DescriptorState = (DescriptorState * 1664525 + 1013904223) % 4294967296;
         MaskState = (MaskState * 1664525 + 1013904223) % 4294967296;
     end;
     if FramedLength ~= Descriptor[5] then error('invalid protected payload', 0); end;
+    if __IB2_PAGE_PIPELINE__ == 1 then
+        local Left, Right = 1, #EncodedParts;
+        while Left < Right do
+            EncodedParts[Left], EncodedParts[Right] = EncodedParts[Right], EncodedParts[Left];
+            Left, Right = Left + 1, Right - 1;
+        end;
+    elseif __IB2_PAGE_PIPELINE__ == 2 then
+        local PipelineState = BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), __IB2_DOMAIN_DECODE_PIPELINE__), (PayloadPageOrdinal * 2654435769) % 4294967296);
+        for PipelineIndex = 1, #EncodedParts do
+            local TransformedByte = EncodedParts[PipelineIndex];
+            local PlainByte = BitXOR(TransformedByte, (PipelineState - PipelineState % 16777216) / 16777216);
+            EncodedParts[PipelineIndex] = PlainByte;
+            PipelineState = (PipelineState * 1664525 + 1013904223 + PlainByte + PipelineIndex - 1) % 4294967296;
+        end;
+    end;
+    for EncodedPartIndex = 1, #EncodedParts do EncodedParts[EncodedPartIndex] = Char(EncodedParts[EncodedPartIndex]); end;
     local EncodedPage = Concat(EncodedParts);
     EncodedParts = nil;
     if gBit(PayloadFeatures, 1, 1) == 1 then
@@ -526,6 +545,31 @@ local function InstructionStateSeal(State, Index, CurrentChunkState, EntryState,
     local Value = (U32Mul(State, 22695477) + Index * 257 + CurrentChunkState
         + U32Mul(EntryState, 1664525) + BlockTag
         + __IB2_DOMAIN_INSTRUCTION_STATE__ + PayloadAttestation) % 4294967296;
+    return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
+end;
+
+local function BeginOpcodeState(CurrentChunkState, EntryState, BlockStart, K1, K2, K3)
+    local Value = (U32Mul(CurrentChunkState, 22695477) + U32Mul(EntryState, 1664525)
+        + BlockStart * 65537 + K1 * 251 + K2 * 17 + K3
+        + __IB2_DOMAIN_OPCODE_STATE__ + PayloadAttestation) % 4294967296;
+    return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
+end;
+
+local function AdvanceOpcodeState(State, Digest, Index, CurrentChunkState, EntryState)
+    local Value = (U32Mul(State, 1664525) + Digest + Index * 257
+        + CurrentChunkState * 17 + EntryState + __IB2_DOMAIN_OPCODE_STATE__ + PayloadAttestation) % 4294967296;
+    return (U32Mul(Value, 22695477) + 1) % 4294967296;
+end;
+
+local function OpcodeStateKey(State, Index)
+    local Low = State % 65536;
+    local High = (State - Low) / 65536;
+    return (Low * ((Index % 251) + 1) + High * 17 + (__IB2_DOMAIN_OPCODE_STATE__ % 65536)) % 65536;
+end;
+
+local function OpcodeStateSeal(State, Index, CurrentChunkState, EntryState, BlockTag)
+    local Value = (U32Mul(State, 22695477) + Index * 65537 + CurrentChunkState
+        + U32Mul(EntryState, 1664525) + BlockTag + __IB2_DOMAIN_OPCODE_STATE__ + PayloadAttestation) % 4294967296;
     return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
 end;
 

@@ -465,7 +465,7 @@ local function GuardPayloadExpectedSeal()
         + GuardState * 4099 + GuardSeal + GuardAttestation + __IB2_PAYLOAD_SEAL_SALT__) % 2147483647;
 end;
 
-local function GuardBindPayload(GuardVMState, GuardChunkState, GuardEntryState, GuardInstructionPoint)
+local function GuardBindPayload(GuardVMState, GuardChunkState, GuardEntryState, GuardInstructionPoint, GuardOpcodeState, GuardOpcodeSeal)
     if GuardTripped then return GuardReject(); end;
     if GuardSeal ~= (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647 then
         return GuardReject();
@@ -477,15 +477,20 @@ local function GuardBindPayload(GuardVMState, GuardChunkState, GuardEntryState, 
     local GuardChunkHigh = (GuardChunkState - GuardChunkLow) / 65536;
     local GuardEntryLow = GuardEntryState % 65536;
     local GuardEntryHigh = (GuardEntryState - GuardEntryLow) / 65536;
+    local GuardOpcodeLow = GuardOpcodeState % 65536;
+    local GuardOpcodeHigh = (GuardOpcodeState - GuardOpcodeLow) / 65536;
     GuardPayloadState = (GuardPayloadState * 4093 + GuardVMLow * 257 + GuardVMHigh * 17
         + GuardChunkLow * 251 + GuardChunkHigh * 29 + GuardEntryLow * 13 + GuardEntryHigh * 7
+        + GuardOpcodeLow * 19 + GuardOpcodeHigh * 11 + (GuardOpcodeSeal % 65521) * 37
         + GuardInstructionPoint * 31 + GuardState + GuardAttestation + __IB2_PAYLOAD_STATE_SALT__) % 2147483647;
     GuardPayloadState = GuardBXor(GuardPayloadState,
-        (GuardVMState % 2147483648 + GuardChunkState % 2147483648) % 2147483648) % 2147483647;
+        (GuardVMState % 2147483648 + GuardChunkState % 2147483648
+            + GuardOpcodeState % 2147483648 + GuardOpcodeSeal % 2147483648) % 2147483648) % 2147483647;
     GuardPayloadActive = true;
     -- Payload execution changes GuardState, and the new GuardState immediately
     -- reseals payload state. Periodic probes perform the inverse update below.
-    GuardState = (GuardState + GuardPayloadState % 65521 + GuardInstructionPoint * 17 + GuardEpoch) % 2147483647;
+    GuardState = (GuardState + GuardPayloadState % 65521 + GuardInstructionPoint * 17
+        + GuardOpcodeState % 32749 + GuardOpcodeSeal % 16381 + GuardEpoch) % 2147483647;
     GuardSeal = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
     GuardPayloadSeal = GuardPayloadExpectedSeal();
     return false;

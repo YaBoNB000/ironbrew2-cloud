@@ -222,25 +222,49 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     }
 
     # FlowCache authenticates source block, entry state, chunk state,
-    # instruction state and instruction seal as one randomized five-role tuple.
+    # instruction state/seal, and opcode state/seal as one randomized tuple.
     cache_match = _expect(
         rf"(?:local\s+)?({IDENT})\s*=\s*\{{\}};\s*"
         rf"\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*"
-        rf"\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*=\s*"
-        rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT};\s*"
+        rf"\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*=\s*"
+        rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT};\s*"
         rf"{re.escape(flow_name)}\[[^\]]+\]\s*,\s*{re.escape(flow_name)}\[[^\]]+\]\s*,\s*"
         rf"{re.escape(flow_name)}\[[^\]]+\]\s*,\s*{re.escape(flow_name)}\[{flow_map[4]}\]\s*=\s*"
         rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*\1;",
         source,
-        "could not recover keyed five-role FlowCache constructor",
+        "could not recover keyed seven-role FlowCache constructor",
     )
     flow_cache_name = cache_match.group(1)
-    flow_cache_map = {index: int(cache_match.group(index + 1)) for index in range(1, 6)}
+    flow_cache_map = {index: int(cache_match.group(index + 1)) for index in range(1, 8)}
+    cache_roles = _expect(
+        rf"=\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*,\s*"
+        rf"({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*;",
+        cache_match.group(0),
+        "could not recover seven FlowCache state roles",
+    ).groups()
+    # The live Guard chain must consume independently carried instruction,
+    # chunk, entry, opcode and opcode-seal roles rather than a single key.
+    bind_call = _expect(
+        rf"if\s+({IDENT})\s*\(\s*{re.escape(cache_roles[3])}\s*,\s*{re.escape(cache_roles[2])}\s*,\s*"
+        rf"{re.escape(cache_roles[1])}\s*,\s*{IDENT}\s*,\s*{re.escape(cache_roles[5])}\s*,\s*"
+        rf"{re.escape(cache_roles[6])}\s*\)\s*then",
+        source,
+        "runtime state roles are not independently bound into the Guard chain",
+    )
+    guard_bind_name = bind_call.group(1)
+    guard_bind = _expect(
+        rf"local\s+function\s+{re.escape(guard_bind_name)}\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*,\s*"
+        rf"({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)",
+        source,
+        "runtime Guard binding does not expose six dispersed state inputs",
+    )
+    if len(set(guard_bind.groups())) != 6:
+        raise ValueError("runtime Guard state inputs are not independent locals")
 
     _permutation(chunk_map, 16, "Chunk")
     _permutation(block_map_slots, 10, "Block")
     _permutation(flow_map, 4, "Flow")
-    _permutation(flow_cache_map, 5, "FlowCache")
+    _permutation(flow_cache_map, 7, "FlowCache")
 
     # Alias consistency checks cover parser and transition aliases. Opcode-handler
     # behavior is subsequently exercised by the differential suite.
@@ -250,8 +274,9 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
                           rf"if\s+not\s+\1\s+or\s+\1\[{block_start_slot}\]",
         "CurrentBlock": rf"local\s+({IDENT})\s*=\s*{re.escape(flow_name)}\[{flow_map[2]}\];.*?"
                         rf"\1\[{block_map_slots[5]}\]",
-        "NextBlock": rf"local\s+({IDENT})\s*=\s*{re.escape(chunk)}\[{chunk_map[10]}\]\s+and\s+"
-                     rf"{re.escape(chunk)}\[{chunk_map[10]}\]\[[^\]]+\];.*?\1\[{block_map_slots[8]}\]",
+        "NextBlock": rf"(?:local\s+{IDENT}\s*=\s*{IDENT}\[{chunk_map[10]}\];\s*)?"
+                     rf"local\s+({IDENT})\s*=\s*(?:{IDENT}\[{chunk_map[10]}\]|{IDENT})\s*and\s*"
+                     rf"(?:{IDENT}\[{chunk_map[10]}\]|{IDENT})\[[^\]]+\];.*?\1\[{block_map_slots[8]}\]",
     }
     aliases: dict[str, str] = {"Block": block_name}
     for label, pattern in alias_checks.items():
@@ -263,16 +288,25 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     # frame tables, then routes state roles through numeric frame slots. Names,
     # role partitions, declaration order and slots are all excluded from template
     # classification but retained in the per-build structural fingerprint.
-    root_boundary = _expect(
-        rf"local\s+({IDENT})\s*=\s*({IDENT})\s*\(\s*\)\s*;.*?"
-        rf"return\s+({IDENT})\s*\(\s*\1\s*,\s*\{{\s*\}}\s*,",
-        source,
-        "could not recover the generated root invocation",
-        re.S,
-    )
-    wrap_name = root_boundary.group(3)
+    invocation_pattern = rf"return\s+({IDENT})\s*\(\s*({IDENT})\s*,\s*\{{\s*\}}\s*,"
+    invocation_candidates = []
+    for candidate in re.finditer(invocation_pattern, source):
+        wrap_candidate = candidate.group(1)
+        if re.search(rf"local\s+function\s+{re.escape(wrap_candidate)}\s*\(", source[:candidate.start()]):
+            invocation_candidates.append(candidate)
+    if len(invocation_candidates) != 1:
+        raise ValueError(f"could not uniquely recover the generated root invocation: {len(invocation_candidates)}")
+    root_invocation = invocation_candidates[0]
+    wrap_name, root_name = root_invocation.group(1, 2)
+    root_declarations = list(re.finditer(
+        rf"local\s+{re.escape(root_name)}\s*=\s*{IDENT}\s*\(\s*\)\s*;",
+        source[:root_invocation.start()],
+    ))
+    if not root_declarations:
+        raise ValueError("could not recover the generated root deserialization boundary")
+    root_boundary = root_declarations[-1]
     wrap_declaration = _expect(
-        rf"local\s+function\s+{re.escape(wrap_name)}\s*\(\s*{re.escape(chunk)}\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)",
+        rf"local\s+function\s+{re.escape(wrap_name)}\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)",
         source[:root_boundary.start()],
         "could not recover the VM Wrap closure",
     )
@@ -378,7 +412,7 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     # paths rather than repeating one searchable direct error call.
     reject_declaration = re.compile(
         rf"local\s+function\s+({IDENT})\s*\(\s*({IDENT})\s*\)\s*"
-        rf"local\s+({IDENT})\s*;\s*return\s+([^;]+);\s*end;"
+        rf"local\s+({IDENT})\s*;\s*return\s*([^;]+);\s*end;"
     )
     reject_paths: dict[str, str] = {}
     expected_fault_shapes = {"void[code]", "void(code)", "code+void", "#void+code"}
@@ -516,8 +550,13 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     fault_assignments = [
         int(match.group(1))
         for match in re.finditer(rf"\b{re.escape(guard_fault)}\s*=\s*(\d+)\s*;", source)
+        if int(match.group(1)) != 0
     ]
-    if len(fault_assignments) != 2 or fault_assignments[0] != 0 or fault_assignments[1] == 0:
+    bare_fault_reset = re.search(
+        rf"(?<!local\s)\b{re.escape(guard_fault)}\s*=\s*0\s*;",
+        source,
+    )
+    if len(fault_assignments) != 1 or bare_fault_reset:
         raise ValueError(f"sticky guard fault word assignments are invalid: {fault_assignments}")
     if fault_init.start() >= periodic_calls[0].start():
         raise ValueError("sticky guard fault word is declared after periodic probing")
@@ -543,9 +582,11 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     if not node_tokens or len(node_tokens) != len(set(node_tokens)):
         raise ValueError("continuation state tokens are missing or non-unique")
     fault_decode_uses = len(re.findall(decoded_state, loop_body))
-    fault_identifier_uses = len(re.findall(rf"\b{re.escape(guard_fault)}\b", loop_body))
-    if fault_identifier_uses != fault_decode_uses or not len(node_tokens) <= fault_decode_uses <= 2 * len(node_tokens):
-        raise ValueError("sticky guard fault word is used outside continuation decode comparisons")
+    # Lexically scoped opcode/super-operator locals may reuse the minified fault
+    # identifier. Validate the continuation expressions themselves rather than
+    # treating every same-spelled local in the dispatcher body as one binding.
+    if not len(node_tokens) <= fault_decode_uses <= 2 * len(node_tokens):
+        raise ValueError("sticky guard fault word is missing from continuation decode comparisons")
 
     step_mask_assignment = (
         rf"{re.escape(dispatch_step_mask)}\s*=\s*{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
@@ -629,13 +670,13 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
             raise ValueError("continuation path retained the same lane across adjacent nodes")
 
     lane_branch_pattern = re.compile(
-        rf"(?:if|elseif)\s+{re.escape(dispatch_lane)}\s*==\s*({arithmetic_raw})\s+then"
+        rf"(?:if|elseif)\s+{re.escape(dispatch_lane)}\s*==\s*({arithmetic_raw})\s*then"
     )
     inline_lane_pattern = re.compile(
-        rf"(?:if|elseif)\s+{re.escape(dispatch_lane)}\s*==\s*({arithmetic_raw})\s+and\s*\("
+        rf"(?:if|elseif)\s+{re.escape(dispatch_lane)}\s*==\s*({arithmetic_raw})\s*and\s*\("
     )
     depth_branch_pattern = re.compile(
-        rf"(?:if|elseif)\s+{re.escape(dispatch_steps)}\s*==\s*({arithmetic_raw})\s+then"
+        rf"(?:if|elseif)\s+{re.escape(dispatch_steps)}\s*==\s*({arithmetic_raw})\s*then"
     )
     lane_branches = [_arithmetic_value(match.group(1)) for match in lane_branch_pattern.finditer(loop_body)]
     inline_lanes = [_arithmetic_value(match.group(1)) for match in inline_lane_pattern.finditer(loop_body)]

@@ -18,6 +18,9 @@ class BuildDomains:
     flow: int
     chunk_state: int
     instruction_state: int
+    opcode_state: int
+    payload_format: int
+    decode_pipeline: int
     envelope_integrity: int
     entropy_digest: int
     envelope_mask: int
@@ -76,12 +79,19 @@ def extract_build_domains(source: str) -> BuildDomains:
         raise ValueError(f"could not uniquely recover entropy digest domain: {sorted(entropy_matches)}")
     entropy_digest = entropy_matches.pop()
 
-    envelope_mask = _one(
-        source,
-        rf"local\s+{ident}\s*=\s*{ident}\(\s*{ident}\(\s*{ident}\(\s*{ident}\(\s*{ident}\s*,\s*{ident}\s*\)"
-        rf"\s*,\s*{ident}\s*\)\s*,\s*(\d+)\s*\)\s*,\s*{ident}\s*\)\s*%\s*4294967296",
-        "envelope mask domain",
-    )
+    envelope_domain_triples = {
+        tuple(map(int, match.groups()))
+        for match in re.finditer(
+            rf"local\s+{ident}\s*=\s*{ident}\(\s*{ident}\(\s*{ident}\(\s*{ident}\(\s*{ident}\(\s*{ident}\("
+            rf"\s*{ident}\s*,\s*{ident}\s*\)\s*,\s*{ident}\s*\)\s*,\s*(\d+)\s*\)\s*,\s*(\d+)\s*\)\s*,\s*(\d+)\s*\)"
+            rf"\s*,\s*{ident}\s*\)\s*%\s*4294967296",
+            source,
+            re.S,
+        )
+    }
+    if len(envelope_domain_triples) != 1:
+        raise ValueError(f"could not uniquely recover envelope/payload/pipeline domains: {sorted(envelope_domain_triples)}")
+    envelope_mask, payload_format, decode_pipeline = envelope_domain_triples.pop()
     flow = _one(
         source,
         rf"\+\s*{ident}\s*\*\s*17\s*\+\s*{ident}\s*\+\s*(\d+)\s*\+\s*{ident}\s*\)\s*%\s*4294967296"
@@ -118,6 +128,12 @@ def extract_build_domains(source: str) -> BuildDomains:
         rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*(\d+)\s*,\s*{ident}\s*\)\s*\*\s*31\s*\+\s*{ident}\s*\)"
         rf"\s*%\s*4294967296\s*;\s*{ident}\s*=\s*\(\s*{ident}\s*\*\s*31\s*\+\s*{ident}",
         "instruction-state domain",
+    )
+    opcode_state = _one(
+        source,
+        rf"return\s*\(\s*{ident}\s*\*\s*\(\s*\(\s*{ident}\s*%\s*251\s*\)\s*\+\s*1\s*\)"
+        rf"\s*\+\s*{ident}\s*\*\s*17\s*\+\s*\(\s*(\d+)\s*%\s*65536\s*\)\s*\)\s*%\s*65536",
+        "opcode-state domain",
     )
     constant_integrity = _one(
         source,
@@ -192,6 +208,9 @@ def extract_build_domains(source: str) -> BuildDomains:
         flow=flow,
         chunk_state=chunk_state,
         instruction_state=instruction_state,
+        opcode_state=opcode_state,
+        payload_format=payload_format,
+        decode_pipeline=decode_pipeline,
         envelope_integrity=envelope_integrity,
         entropy_digest=entropy_digest,
         envelope_mask=envelope_mask,
@@ -215,6 +234,9 @@ def extract_build_domains(source: str) -> BuildDomains:
         values.flow,
         values.chunk_state,
         values.instruction_state,
+        values.opcode_state,
+        values.payload_format,
+        values.decode_pipeline,
         values.envelope_integrity,
         values.entropy_digest,
         values.envelope_mask,

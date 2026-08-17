@@ -59,12 +59,14 @@ namespace IronBrew2.Obfuscator
 		// 它们不是秘密，但会让旧 Build 的固定解析坐标无法直接复用。
 		public BuildSeed Seed;
 		public BuildDomains Domains;
+		public PayloadFormatLayout PayloadFormat;
 		
 		public ObfuscationContext(Chunk chunk, ObfuscationSettings settings, BuildSeed seed)
 		{
 			HeadChunk = chunk;
 			Seed = seed ?? throw new ArgumentNullException(nameof(seed));
 			Domains = new BuildDomains(Seed.GetStream("payload.domains"));
+			PayloadFormat = new PayloadFormatLayout(Domains);
 
 			BuildRandom schemaRandom = Seed.GetStream("bytecode.schema");
 			InstructionSteps1 = Enumerable.Range(0, (int) InstructionStep1.StepCount).Select(i => (InstructionStep1) i).ToArray();

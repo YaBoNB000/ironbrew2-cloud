@@ -10,6 +10,7 @@ using IronBrew2.Bytecode_Library.Bytecode;
 using IronBrew2.Bytecode_Library.IR;
 using IronBrew2.Extensions;
 using IronBrew2.Obfuscator.AntiDump;
+using IronBrew2.Obfuscator.Control_Flow;
 using IronBrew2.Obfuscator.Opcodes;
 
 namespace IronBrew2.Obfuscator.VM_Generation
@@ -268,25 +269,35 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				FoldMutations(mutations, used, _c);
 		}
 
-		public List<OpSuperOperator> GenerateSuperOperators(Chunk chunk, int maxSize, int minSize = 5)
+		private static bool[] BuildSuperOperatorBarrierMap(Chunk chunk)
 		{
-			List<OpSuperOperator> results = new List<OpSuperOperator>();
-
-			bool[] skip = new bool[chunk.Instructions.Count + 1];
-
-			for (int i = 0; i < chunk.Instructions.Count - 1; i++)
+			var barriers = new bool[chunk.Instructions.Count + 1];
+			void Mark(int index)
 			{
-				switch (chunk.Instructions[i].OpCode)
+				if (index >= 0 && index < chunk.Instructions.Count)
+					barriers[index] = true;
+			}
+
+			// Treat both semantic CFG entries and serializer-imposed bounded-block cuts
+			// as hard fusion boundaries. Marking the preceding instruction still allows
+			// a new fusion to begin at the destination block.
+			ControlFlowGraph graph = ControlFlowGraph.Build(chunk, DispatcherFlatteningPlanner.MaxBlockInstructions);
+			foreach (ControlFlowBlock block in graph.Blocks)
+				if (block.Start > 0) Mark(block.Start - 1);
+
+			for (int index = 0; index < chunk.Instructions.Count; index++)
+			{
+				Instruction instruction = chunk.Instructions[index];
+				if (instruction.InstructionType == InstructionType.Data)
+					Mark(index);
+
+				switch (instruction.OpCode)
 				{
 					case Opcode.Closure:
-					{
-						skip[i] = true;
-						for (int j = 0; j < ((Chunk) chunk.Instructions[i].RefOperands[0]).UpvalueCount; j++)
-							skip[i + j + 1] = true;
-							
+						Mark(index);
+						if (instruction.RefOperands.Length > 0 && instruction.RefOperands[0] is Chunk child)
+							for (int binding = 1; binding <= child.UpvalueCount; binding++) Mark(index + binding);
 						break;
-					}
-
 					case Opcode.Eq:
 					case Opcode.Lt:
 					case Opcode.Le:
@@ -294,25 +305,40 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					case Opcode.TestSet:
 					case Opcode.TForLoop:
 					case Opcode.SetList:
-					case Opcode.LoadBool when chunk.Instructions[i].C != 0:
-						skip[i + 1] = true;
+						Mark(index);
+						Mark(index + 1);
 						break;
-
+					case Opcode.LoadBool when instruction.C != 0:
+						Mark(index);
+						Mark(index + 1);
+						break;
 					case Opcode.ForLoop:
 					case Opcode.ForPrep:
 					case Opcode.Jmp:
-						chunk.Instructions[i].UpdateRegisters();
-						
-						skip[i + 1] = true;
-						skip[i + chunk.Instructions[i].B + 1] = true;
+						instruction.UpdateRegisters();
+						Mark(index);
+						Mark(index + 1);
+						Mark(index + instruction.B + 1);
+						break;
+					case Opcode.Return:
+					case Opcode.TailCall:
+						Mark(index);
+						Mark(index + 1);
 						break;
 				}
-				
-				if (chunk.Instructions[i].CustomData.WrittenOpcode is OpSuperOperator su && su.SubOpcodes != null)
-					for (int j = 0; j < su.SubOpcodes.Length; j++)
-						skip[i + j] = true;
+
+				if (instruction.CustomData?.WrittenOpcode is OpSuperOperator existing && existing.SubOpcodes != null)
+					for (int member = 0; member < existing.SubOpcodes.Length; member++) Mark(index + member);
 			}
-			
+			return barriers;
+		}
+
+		public List<OpSuperOperator> GenerateSuperOperators(Chunk chunk, int maxSize, int minSize = 5)
+		{
+			List<OpSuperOperator> results = new List<OpSuperOperator>();
+
+			bool[] skip = BuildSuperOperatorBarrierMap(chunk);
+
 			int c = 0;
 			while (c < chunk.Instructions.Count)
 			{
@@ -351,52 +377,15 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			}
 
 			foreach (var _c in chunk.Functions)
-				results.AddRange(GenerateSuperOperators(_c, maxSize));
+				results.AddRange(GenerateSuperOperators(_c, maxSize, minSize));
 			
 			return results;
 		}
 
 		public void FoldAdditionalSuperOperators(Chunk chunk, List<OpSuperOperator> operators, ref int folded)
 		{
-			bool[] skip = new bool[chunk.Instructions.Count + 1];
-			for (int i = 0; i < chunk.Instructions.Count - 1; i++)
-			{
-				switch (chunk.Instructions[i].OpCode)
-				{
-					case Opcode.Closure:
-					{
-						skip[i] = true;
-						for (int j = 0; j < ((Chunk) chunk.Instructions[i].RefOperands[0]).UpvalueCount; j++)
-							skip[i + j + 1] = true;
-							
-						break;
-					}
+			bool[] skip = BuildSuperOperatorBarrierMap(chunk);
 
-					case Opcode.Eq:
-					case Opcode.Lt:
-					case Opcode.Le:
-					case Opcode.Test:
-					case Opcode.TestSet:
-					case Opcode.TForLoop:
-					case Opcode.SetList:
-					case Opcode.LoadBool when chunk.Instructions[i].C != 0:
-						skip[i + 1] = true;
-						break;
-
-					case Opcode.ForLoop:
-					case Opcode.ForPrep:
-					case Opcode.Jmp:
-						chunk.Instructions[i].UpdateRegisters();
-						skip[i + 1] = true;
-						skip[i + chunk.Instructions[i].B + 1] = true;
-						break;
-				}
-				
-				if (chunk.Instructions[i].CustomData.WrittenOpcode is OpSuperOperator su && su.SubOpcodes != null)
-					for (int j = 0; j < su.SubOpcodes.Length; j++)
-						skip[i + j] = true;
-			}
-			
 			int c = 0;
 			while (c < chunk.Instructions.Count)
 			{
@@ -715,27 +704,30 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			
 			if (settings.SuperOperators)
 			{
+				// Short fusions deliberately stay inside straight-line regions. The barrier
+				// map excludes every control-flow edge, CLOSURE binding word and SETLIST
+				// data word, while the small cap prevents giant recognizable handlers.
 				int folded = 0;
-				
-				var megaOperators = GenerateSuperOperators(_context.HeadChunk, 80, 60).OrderBy(t => r.Next())
-					.Take(settings.MaxMegaSuperOperators).ToList();
-				
-				Console.WriteLine("Created " + megaOperators.Count + " mega super operators.");
-				
-				virtuals.AddRange(megaOperators);
-				
-				FoldAdditionalSuperOperators(_context.HeadChunk, megaOperators, ref folded);
-				
-				var miniOperators = GenerateSuperOperators(_context.HeadChunk, 10).OrderBy(t => r.Next())
-					.Take(settings.MaxMiniSuperOperators).ToList();
-				
-				Console.WriteLine("Created " + miniOperators.Count + " mini super operators.");
-				
-				virtuals.AddRange(miniOperators);
-				
-				FoldAdditionalSuperOperators(_context.HeadChunk, miniOperators, ref folded);
-				
-				Console.WriteLine("Folded " + folded + " instructions into super operators.");
+				int operatorLimit = Math.Min(settings.MaxMiniSuperOperators, 24);
+				var shortOperators = GenerateSuperOperators(_context.HeadChunk, 6, 2)
+					.OrderBy(_ => r.Next()).Take(operatorLimit).ToList();
+				virtuals.AddRange(shortOperators);
+				FoldAdditionalSuperOperators(_context.HeadChunk, shortOperators, ref folded);
+				uint structureSignature = 2166136261u;
+				foreach (OpSuperOperator superOperator in shortOperators)
+				{
+					structureSignature = (structureSignature ^ (uint)superOperator.SubOpcodes.Length) * 16777619u;
+					foreach (VOpcode subOpcode in superOperator.SubOpcodes)
+					{
+						VOpcode semanticOpcode = subOpcode is OpMutated mutated ? mutated.Mutated : subOpcode;
+						foreach (char character in semanticOpcode.GetType().Name)
+							structureSignature = (structureSignature ^ character) * 16777619u;
+					}
+				}
+				string lengthProfile = string.Join(",", shortOperators.GroupBy(op => op.SubOpcodes.Length)
+					.OrderBy(group => group.Key).Select(group => group.Key + ":" + group.Count()));
+				Console.WriteLine("Created " + shortOperators.Count + " short super operators; folded " + folded
+					+ " sequences; lengths " + lengthProfile + "; structure " + structureSignature.ToString("x8") + ".");
 			}
 
 			AddOpcodeAliases(virtuals, r);
@@ -765,6 +757,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
 				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier","CurrentChunkState",
 				"InstructionDigest","BeginInstructionState","AdvanceInstructionState","InstructionStateSeal","PreviousInstructionState","CurrentInstructionState","CurrentInstructionSeal","Digest",
+				"BeginOpcodeState","AdvanceOpcodeState","OpcodeStateKey","OpcodeStateSeal","PreviousOpcodeState","CurrentOpcodeState","CurrentOpcodeSeal",
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
 				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
@@ -774,7 +767,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
 				"GuardEpoch","GuardState","GuardSeal","GuardTripped","GuardFaultWord","GuardLuaProbe","GuardProbeValue","GuardFunction",
 				"GuardPayloadState","GuardPayloadSeal","GuardPayloadActive","GuardPayloadExpectedSeal","GuardBindPayload","GuardPayloadLow","GuardPayloadHigh",
-				"GuardVMState","GuardChunkState","GuardEntryState","GuardInstructionPoint","GuardVMLow","GuardVMHigh","GuardChunkLow","GuardChunkHigh","GuardEntryLow","GuardEntryHigh",
+				"GuardVMState","GuardChunkState","GuardEntryState","GuardInstructionPoint","GuardVMLow","GuardVMHigh","GuardChunkLow","GuardChunkHigh","GuardEntryLow","GuardEntryHigh","GuardOpcodeState","GuardOpcodeSeal","GuardOpcodeLow","GuardOpcodeHigh",
 				"GuardProbe","Force","GuardScore","GuardHeavy",
 				"GuardCurrentIsC","GuardCurrentIsL","GuardNativeMisses","GuardOK1","GuardOK2","GuardOK3","GuardOK4",
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
@@ -809,6 +802,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"DescriptorState","DescriptorOffset","EnvelopeMaskState","PayloadSourceLength","PageOrdinal","PayloadPageOrdinal","PayloadPage","PayloadPagePosition","LoadPayloadPage",
 				"SourceRead8","SourceReadBytes","ActiveSourceLength","SourceIsPaged","ActivePrototypeHash","TrackPrototypeByte","FramedLength","EncodedParts","EncodedPage",
 				"PageByteIndex","FramingIndex","MaskState","InnerKey","OuterKey","NestedByte","PlainByte","RawLength","Multiplier","SavedSourceLength","SavedSourceMode",
+				"CipherByte","KeyByte","EnvelopeReadWidth","Width","FieldIndex","LengthOffset","EncodedIndex","Left","Right","PipelineState","PipelineIndex","TransformedByte","EncodedPartIndex",
 				"ChunkState","InitialChunkKey","ChunkChainKey","SourceChunkState","SourceEntryState","CurrentChunkState","WrappedChunkState","ChunkSuccessors",
 				"TargetIndex","TargetInstruction","ReferencedConstants","ResolveConstant","BeginPrototypeIntegrity","Words","WordIndex","Word",
 				"LayoutFrameA","LayoutFrameB","LayoutFrameC"
@@ -1078,6 +1072,26 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			string ApplyBuildDomains(string code)
 			{
 				BuildDomains domains = _context.Domains;
+				PayloadFormatLayout format = _context.PayloadFormat;
+				string EnvelopeTarget(EnvelopeHeaderField field) => field switch
+				{
+					EnvelopeHeaderField.FramedLength => "EnvelopeRealLength",
+					EnvelopeHeaderField.EntropyLength => "EnvelopeEntropyLength",
+					EnvelopeHeaderField.RecordCount => "EnvelopeRecordCount",
+					EnvelopeHeaderField.DataCount => "EnvelopeDataCount",
+					EnvelopeHeaderField.EntropyCount => "EnvelopeEntropyCount",
+					EnvelopeHeaderField.Nonce => "EnvelopeNonce",
+					EnvelopeHeaderField.EntropyDigest => "EnvelopeDigest",
+					EnvelopeHeaderField.Integrity => "EnvelopeTag",
+					_ => throw new InvalidOperationException("Unknown envelope header field.")
+				};
+				string RecordRead(EnvelopeRecordField field) => field switch
+				{
+					EnvelopeRecordField.Kind => "EnvelopeKind = EnvelopeRead8();",
+					EnvelopeRecordField.Ordinal => $"EnvelopeOrdinal = EnvelopeReadWidth({format.RecordOrdinalWidth});",
+					EnvelopeRecordField.Length => $"EnvelopeLength = EnvelopeReadWidth({format.RecordLengthWidth});",
+					_ => throw new InvalidOperationException("Unknown envelope record field.")
+				};
 				var replacements = new Dictionary<string, string>
 				{
 					["__IB2_DOMAIN_INTEGRITY__"] = domains.IntegrityDomain.ToString(),
@@ -1085,6 +1099,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					["__IB2_DOMAIN_FLOW__"] = domains.FlowDomain.ToString(),
 					["__IB2_DOMAIN_CHUNK_STATE__"] = domains.ChunkStateDomain.ToString(),
 					["__IB2_DOMAIN_INSTRUCTION_STATE__"] = domains.InstructionStateDomain.ToString(),
+					["__IB2_DOMAIN_OPCODE_STATE__"] = domains.OpcodeStateDomain.ToString(),
+					["__IB2_DOMAIN_PAYLOAD_FORMAT__"] = domains.PayloadFormatDomain.ToString(),
+					["__IB2_DOMAIN_DECODE_PIPELINE__"] = domains.DecodePipelineDomain.ToString(),
 					["__IB2_DOMAIN_ENVELOPE_INTEGRITY__"] = domains.EnvelopeIntegrityDomain.ToString(),
 					["__IB2_DOMAIN_ENTROPY_DIGEST__"] = domains.EntropyDigestDomain.ToString(),
 					["__IB2_DOMAIN_ENVELOPE_MASK__"] = domains.EnvelopeMaskDomain.ToString(),
@@ -1099,12 +1116,24 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					["__IB2_BLOCK_FIELD_STRIDE__"] = domains.BlockFieldStride.ToString(),
 					["__IB2_FLOW_VERIFIER_MASK__"] = domains.FlowVerifierMask.ToString(),
 					["__IB2_ENTROPY_RECORD_KIND__"] = domains.EntropyRecordKind.ToString(),
-					["__IB2_DATA_RECORD_KIND__"] = domains.DataRecordKind.ToString()
+					["__IB2_DATA_RECORD_KIND__"] = domains.DataRecordKind.ToString(),
+					["__IB2_OUTER_HEAD_OFFSET__"] = (format.OuterHeadOffset + 1).ToString(),
+					["__IB2_OUTER_TAG_OFFSET__"] = (format.OuterIntegrityOffset + 1).ToString(),
+					["__IB2_OUTER_FLAGS_OFFSET__"] = (format.OuterFlagsOffset + 1).ToString(),
+					["__IB2_ENVELOPE_INTEGRITY_START__"] = (format.EnvelopeIntegrityOffset + 1).ToString(),
+					["__IB2_ENVELOPE_INTEGRITY_END__"] = (format.EnvelopeIntegrityOffset + 4).ToString(),
+					["__IB2_ENVELOPE_HEADER_READS__"] = string.Join("\n", format.EnvelopeHeaderOrder.Select(field => EnvelopeTarget(field) + " = EnvelopeRead32();")),
+					["__IB2_RECORD_HEADER_WIDTH__"] = format.RecordHeaderWidth.ToString(),
+					["__IB2_RECORD_FIELD_READS__"] = string.Join("\n    ", format.EnvelopeRecordOrder.Select(RecordRead)),
+					["__IB2_PAGE_MIN_FRAME__"] = (format.PageLengthWidth + 1).ToString(),
+					["__IB2_PAGE_LENGTH_WIDTH__"] = format.PageLengthWidth.ToString(),
+					["__IB2_PAGE_LENGTH_OFFSET__"] = format.PageLengthSuffix ? $"Descriptor[2] - {format.PageLengthWidth}" : "0",
+					["__IB2_PAGE_PIPELINE__"] = format.PipelineVariant.ToString()
 				};
 				foreach (KeyValuePair<string, string> replacement in replacements)
 					code = code.Replace(replacement.Key, replacement.Value);
-				if (Regex.IsMatch(code, @"__IB2_(?:DOMAIN|BLOCK_FIELD|FLOW_VERIFIER|ENTROPY_RECORD|DATA_RECORD)"))
-					throw new InvalidOperationException("A per-build runtime domain placeholder was not replaced.");
+				if (Regex.IsMatch(code, @"__IB2_(?:DOMAIN|BLOCK_FIELD|FLOW_VERIFIER|ENTROPY_RECORD|DATA_RECORD|OUTER_|ENVELOPE_|RECORD_|PAGE_)"))
+					throw new InvalidOperationException("A per-build runtime layout or domain placeholder was not replaced.");
 				return code;
 			}
 
@@ -1520,7 +1549,7 @@ local function DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkSta
     return Cons;
 end;
 
-local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkState, TargetIndex)
+local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkState, PreviousOpcodeState, TargetIndex)
     local K1, K2, K3 = Chunk[5], Chunk[6], Chunk[7];
     local References = Block[4];
     local Body = Block[3];
@@ -1625,7 +1654,7 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
         local Mask = gBit(Descriptor, 4, 6);
         Inst =
         {
-            ColumnRead16(2),
+            BitXOR(ColumnRead16(2), OpcodeStateKey(PreviousOpcodeState, TargetIndex)),
             BitXOR(BitXOR(ColumnRead16(3), FieldKey(TargetIndex, 1, K1, K2, K3)), BlockFieldKey(EntryState, TargetIndex, 1, K1, K2, K3)),
             nil,
             nil
@@ -1669,16 +1698,19 @@ local function GetInstruction(Chunk, Index, Flow)
     local EntryState;
     local CurrentChunkState;
     local PreviousInstructionState;
+    local PreviousOpcodeState;
     if not CurrentBlock then
         if Index ~= 1 then error('invalid protected payload', 0); end;
         __IB2_FIRST_BLOCK_CHECK__
         EntryState = U32(BitXOR(Chunk[12], InitialFlowKey(Chunk[5], Chunk[6], Chunk[7])));
         CurrentChunkState = U32(BitXOR(Chunk[16], InitialChunkKey(Chunk[5], Chunk[6], Chunk[7])));
         PreviousInstructionState = BeginInstructionState(CurrentChunkState, EntryState, Block[1], Block[7], Chunk[5], Chunk[6], Chunk[7]);
+        PreviousOpcodeState = BeginOpcodeState(CurrentChunkState, EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]);
     elseif CurrentBlock ~= Block or Index ~= LastIndex + 1 then
         if Index ~= Block[1] or not FlowCache or FlowCache[1] ~= CurrentBlock
         or FlowCache[2] ~= Flow[3]
-        or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5] then
+        or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5]
+        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7] then
             error('invalid protected payload', 0);
         end;
         local WrappedState = CurrentBlock[5][Block[1]];
@@ -1688,14 +1720,17 @@ local function GetInstruction(Chunk, Index, Flow)
         CurrentChunkState = U32(BitXOR(WrappedChunkState, ChunkChainKey(
             FlowCache[3], Flow[3], LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
         PreviousInstructionState = BeginInstructionState(CurrentChunkState, EntryState, Block[1], Block[7], Chunk[5], Chunk[6], Chunk[7]);
+        PreviousOpcodeState = BeginOpcodeState(CurrentChunkState, EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]);
     else
         if not FlowCache or FlowCache[1] ~= CurrentBlock or FlowCache[2] ~= Flow[3]
-        or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5] then
+        or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5]
+        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7] then
             error('invalid protected payload', 0);
         end;
         EntryState = Flow[3];
         CurrentChunkState = FlowCache[3];
         PreviousInstructionState = FlowCache[4];
+        PreviousOpcodeState = FlowCache[6];
     end;
 
     if FlowVerifier(EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]) ~= Block[6]
@@ -1703,14 +1738,18 @@ local function GetInstruction(Chunk, Index, Flow)
         error('invalid protected payload', 0);
     end;
 
-    local Inst, Digest = DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkState, Index);
+    local Inst, Digest = DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkState, PreviousOpcodeState, Index);
     local CurrentInstructionState = AdvanceInstructionState(
         PreviousInstructionState, Digest, Index, CurrentChunkState, EntryState);
     local CurrentInstructionSeal = InstructionStateSeal(
         CurrentInstructionState, Index, CurrentChunkState, EntryState, Block[7]);
+    local CurrentOpcodeState = AdvanceOpcodeState(
+        PreviousOpcodeState, Digest, Index, CurrentChunkState, EntryState);
+    local CurrentOpcodeSeal = OpcodeStateSeal(
+        CurrentOpcodeState, Index, CurrentChunkState, EntryState, Block[7]);
     FlowCache = {};
-    FlowCache[1], FlowCache[2], FlowCache[3], FlowCache[4], FlowCache[5] =
-        Block, EntryState, CurrentChunkState, CurrentInstructionState, CurrentInstructionSeal;
+    FlowCache[1], FlowCache[2], FlowCache[3], FlowCache[4], FlowCache[5], FlowCache[6], FlowCache[7] =
+        Block, EntryState, CurrentChunkState, CurrentInstructionState, CurrentInstructionSeal, CurrentOpcodeState, CurrentOpcodeSeal;
     Flow[1], Flow[2], Flow[3], Flow[4] = Index, Block, EntryState, FlowCache;
     __IB2_GUARD_BIND__
     return Inst;
@@ -1749,7 +1788,7 @@ end;";
 				// the live GuardState/GuardSeal chain before opcode execution.
 				blockRuntime = blockRuntime
 					.Replace("__IB2_FIRST_BLOCK_CHECK__", "if GuardProbe(true) then Chunk[2], Chunk[15], Flow[4] = {}, 0, nil; return GuardDecoy(); end;")
-					.Replace("__IB2_GUARD_BIND__", "if GuardBindPayload(CurrentInstructionState, CurrentChunkState, EntryState, Index) then return GuardDecoy(); end;");
+					.Replace("__IB2_GUARD_BIND__", "if GuardBindPayload(CurrentInstructionState, CurrentChunkState, EntryState, Index, CurrentOpcodeState, CurrentOpcodeSeal) then return GuardDecoy(); end;");
 			}
 			else
 			{
@@ -2073,7 +2112,7 @@ end;";
 			int[] chunkSlots = GenerateRuntimeSlotPermutation(16);
 			int[] blockSlots = GenerateRuntimeSlotPermutation(10);
 			int[] flowSlots = GenerateRuntimeSlotPermutation(4);
-			int[] flowCacheSlots = GenerateRuntimeSlotPermutation(3);
+			int[] flowCacheSlots = GenerateRuntimeSlotPermutation(7);
 			vm = ApplyRuntimeSlotPermutation(vm, idents["Chunk"], chunkSlots);
 			foreach (string blockAlias in new[] {"Block", "CurrentBlock", "NextBlock", "SuccessorBlock"})
 				vm = ApplyRuntimeSlotPermutation(vm, idents[blockAlias], blockSlots);

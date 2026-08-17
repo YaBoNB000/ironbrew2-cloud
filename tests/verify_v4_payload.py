@@ -35,6 +35,9 @@ CONSTANT_TAG_DOMAIN = 0
 BLOCK_COLUMN_DOMAIN = 0
 CODE_DATA_PERMUTATION_DOMAIN = 0
 INSTRUCTION_STATE_DOMAIN = 0
+OPCODE_STATE_DOMAIN = 0
+PAYLOAD_FORMAT_DOMAIN = 0
+DECODE_PIPELINE_DOMAIN = 0
 FLOW_VERIFIER_MASK = 0
 BLOCK_FIELD_STRIDE = 0
 ENTROPY_KIND = 0
@@ -52,7 +55,8 @@ def activate_domains(domains: BuildDomains) -> None:
     global ENVELOPE_INTEGRITY_DOMAIN, ENTROPY_DIGEST_DOMAIN, ENVELOPE_MASK_DOMAIN
     global CONSTANT_INTEGRITY_DOMAIN, CONSTANT_MASK_DOMAIN, PROTOTYPE_INTEGRITY_DOMAIN
     global OPCODE_PERMUTATION_DOMAIN, SCHEMA_DOMAIN, CONSTANT_TAG_DOMAIN, BLOCK_COLUMN_DOMAIN
-    global CODE_DATA_PERMUTATION_DOMAIN, INSTRUCTION_STATE_DOMAIN
+    global CODE_DATA_PERMUTATION_DOMAIN, INSTRUCTION_STATE_DOMAIN, OPCODE_STATE_DOMAIN
+    global PAYLOAD_FORMAT_DOMAIN, DECODE_PIPELINE_DOMAIN
     global FLOW_VERIFIER_MASK, BLOCK_FIELD_STRIDE, ENTROPY_KIND, DATA_KIND
     INTEGRITY_DOMAIN = domains.integrity
     BLOCK_INTEGRITY_DOMAIN = domains.block_integrity
@@ -70,6 +74,9 @@ def activate_domains(domains: BuildDomains) -> None:
     BLOCK_COLUMN_DOMAIN = domains.block_column
     CODE_DATA_PERMUTATION_DOMAIN = domains.code_data_permutation
     INSTRUCTION_STATE_DOMAIN = domains.instruction_state
+    OPCODE_STATE_DOMAIN = domains.opcode_state
+    PAYLOAD_FORMAT_DOMAIN = domains.payload_format
+    DECODE_PIPELINE_DOMAIN = domains.decode_pipeline
     FLOW_VERIFIER_MASK = domains.flow_verifier_mask
     BLOCK_FIELD_STRIDE = domains.block_field_stride
     ENTROPY_KIND = domains.entropy_record_kind
@@ -84,12 +91,25 @@ class Literal:
 
 
 @dataclass(frozen=True)
+class PayloadLayout:
+    outer_order: tuple[str, ...]
+    envelope_order: tuple[str, ...]
+    record_order: tuple[str, ...]
+    record_ordinal_width: int
+    record_length_width: int
+    page_length_width: int
+    page_length_suffix: bool
+    pipeline_variant: int
+
+
+@dataclass(frozen=True)
 class Record:
     start: int
     end: int
     kind: int
     ordinal: int
     data: bytes
+    data_offset: int
 
 
 @dataclass
@@ -155,6 +175,7 @@ class PayloadInfo:
     path: Path
     source: str
     domains: BuildDomains
+    layout: PayloadLayout
     literals: list[Literal]
     payload: bytes
     head: int
@@ -307,6 +328,44 @@ def extract_payload(source: str) -> tuple[list[Literal], bytes]:
     if len(payload) < 9:
         raise ValueError("decoded payload is shorter than the fixed v4 header")
     return candidates, payload
+
+
+def _permute_layout(values: list[str], seed: int, salt: int) -> tuple[str, ...]:
+    result = values[:]
+    state = (seed ^ salt) & MASK32
+    for size in range(len(result), 1, -1):
+        state = (state * LCG_MULTIPLIER + LCG_INCREMENT + size * salt) & MASK32
+        swap = state % size
+        result[size - 1], result[swap] = result[swap], result[size - 1]
+    return tuple(result)
+
+
+def derive_payload_layout(domains: BuildDomains) -> PayloadLayout:
+    domain = domains.payload_format
+    return PayloadLayout(
+        outer_order=_permute_layout(["head", "integrity", "flags"], domain, 0x13579BDF),
+        envelope_order=_permute_layout(
+            ["real_length", "entropy_length", "record_count", "data_count", "entropy_count", "nonce", "entropy_digest", "integrity"],
+            domain,
+            0x2468ACE1,
+        ),
+        record_order=_permute_layout(["kind", "ordinal", "length"], domain, 0x9E3779B9),
+        record_ordinal_width=2 if ((domain >> 3) & 1) == 0 else 4,
+        record_length_width=3 if ((domain >> 7) & 1) == 0 else 4,
+        page_length_width=2 if ((domain >> 11) & 1) == 0 else 4,
+        page_length_suffix=((domain >> 15) & 1) != 0,
+        pipeline_variant=domains.decode_pipeline % 3,
+    )
+
+
+def read_uint(data: bytes, offset: int, width: int) -> int:
+    if offset < 0 or offset + width > len(data):
+        raise ValueError("truncated polymorphic payload field")
+    return int.from_bytes(data[offset:offset + width], "little")
+
+
+def append_uint(output: bytearray, value: int, width: int) -> None:
+    output.extend((value & ((1 << (width * 8)) - 1)).to_bytes(width, "little"))
 
 
 def hash_word(initial: int, value: int) -> int:
@@ -899,21 +958,58 @@ def parse_prototype(
     return prototype
 
 
+def pipeline_inverse(data: bytes, layout: PayloadLayout, seed: int, nonce: int, digest: int, ordinal: int) -> bytes:
+    if layout.pipeline_variant == 0:
+        return data
+    if layout.pipeline_variant == 1:
+        return data[::-1]
+    state = (seed ^ nonce ^ digest ^ DECODE_PIPELINE_DOMAIN ^ ((ordinal * 0x9E3779B9) & MASK32)) & MASK32
+    output = bytearray(len(data))
+    for index, encoded in enumerate(data):
+        plain = encoded ^ ((state >> 24) & 0xFF)
+        output[index] = plain
+        state = (state * LCG_MULTIPLIER + LCG_INCREMENT + plain + index) & MASK32
+    return bytes(output)
+
+
+def pipeline_forward(data: bytes, layout: PayloadLayout, seed: int, nonce: int, digest: int, ordinal: int) -> bytes:
+    if layout.pipeline_variant == 0:
+        return data
+    if layout.pipeline_variant == 1:
+        return data[::-1]
+    state = (seed ^ nonce ^ digest ^ DECODE_PIPELINE_DOMAIN ^ ((ordinal * 0x9E3779B9) & MASK32)) & MASK32
+    output = bytearray(len(data))
+    for index, plain in enumerate(data):
+        output[index] = plain ^ ((state >> 24) & 0xFF)
+        state = (state * LCG_MULTIPLIER + LCG_INCREMENT + plain + index) & MASK32
+    return bytes(output)
+
+
 def parse_and_verify(path: Path) -> PayloadInfo:
     global PAYLOAD_ATTESTATION
     source = path.read_text("latin1")
     domains = extract_build_domains(source)
     activate_domains(domains)
     literals, payload = extract_payload(source)
-    head, stored_integrity = struct.unpack_from("<II", payload)
-    flags = payload[8]
+    layout = derive_payload_layout(domains)
+    outer_values: dict[str, int] = {}
+    outer_offset = 0
+    for field_name in layout.outer_order:
+        width = 1 if field_name == "flags" else 4
+        outer_values[field_name] = read_uint(payload, outer_offset, width)
+        outer_offset += width
+    if outer_offset != 9:
+        raise ValueError("invalid Build-local outer header width")
+    head = outer_values["head"]
+    stored_integrity = outer_values["integrity"]
+    flags = outer_values["flags"]
     version, features = flags >> 4, flags & 0x0F
     if version != 4:
         raise ValueError(f"expected payload version 4, found {version}")
     if features not in (14, 15):
         raise ValueError(f"unexpected v4 feature bits (block + dispatcher + entropy required): {features}")
 
-    encrypted = payload[9:]
+    encrypted = payload[outer_offset:]
     seed = recover_outer_seed(stored_integrity, flags, encrypted)
     integrity = hash_bytes(((seed ^ INTEGRITY_DOMAIN) * 31 + flags) & MASK32, encrypted)
     if integrity != stored_integrity or seed == 0:
@@ -926,17 +1022,20 @@ def parse_and_verify(path: Path) -> PayloadInfo:
     if len(envelope) < 32:
         raise ValueError("entropy envelope is shorter than its fixed header")
 
-    (
-        real_length,
-        entropy_length,
-        record_count,
-        data_count,
-        entropy_count,
-        nonce,
-        entropy_digest,
-        envelope_tag,
-    ) = struct.unpack_from("<8I", envelope)
-    expected = 32 + record_count * 7 + real_length + entropy_length
+    envelope_values = {
+        field_name: read_uint(envelope, slot * 4, 4)
+        for slot, field_name in enumerate(layout.envelope_order)
+    }
+    real_length = envelope_values["real_length"]
+    entropy_length = envelope_values["entropy_length"]
+    record_count = envelope_values["record_count"]
+    data_count = envelope_values["data_count"]
+    entropy_count = envelope_values["entropy_count"]
+    nonce = envelope_values["nonce"]
+    entropy_digest = envelope_values["entropy_digest"]
+    envelope_tag = envelope_values["integrity"]
+    record_header_width = 1 + layout.record_ordinal_width + layout.record_length_width
+    expected = 32 + record_count * record_header_width + real_length + entropy_length
     if not ENTROPY_MIN <= entropy_length <= ENTROPY_MAX:
         raise ValueError(f"entropy contribution outside 64–96 KiB: {entropy_length}")
     if not (1 <= data_count <= 65535 and 8 <= entropy_count <= 64):
@@ -944,7 +1043,8 @@ def parse_and_verify(path: Path) -> PayloadInfo:
     if record_count != data_count + entropy_count or nonce == 0 or expected != len(envelope):
         raise ValueError("invalid entropy envelope framing")
 
-    authenticated = envelope[:28] + envelope[32:]
+    integrity_offset = layout.envelope_order.index("integrity") * 4
+    authenticated = envelope[:integrity_offset] + envelope[integrity_offset + 4:]
     computed_tag = hash_bytes(((seed ^ ENVELOPE_INTEGRITY_DOMAIN) * 31) & MASK32, authenticated)
     if computed_tag != envelope_tag:
         raise ValueError("entropy envelope authentication mismatch")
@@ -955,11 +1055,17 @@ def parse_and_verify(path: Path) -> PayloadInfo:
     entropy_records: dict[int, bytes] = {}
     for _ in range(record_count):
         start = offset
-        if offset + 7 > len(envelope):
+        if offset + record_header_width > len(envelope):
             raise ValueError("truncated entropy record header")
-        kind = envelope[offset]
-        ordinal, length = struct.unpack_from("<HI", envelope, offset + 1)
-        offset += 7
+        record_values: dict[str, int] = {}
+        for field_name in layout.record_order:
+            width = 1 if field_name == "kind" else layout.record_ordinal_width if field_name == "ordinal" else layout.record_length_width
+            record_values[field_name] = read_uint(envelope, offset, width)
+            offset += width
+        kind = record_values["kind"]
+        ordinal = record_values["ordinal"]
+        length = record_values["length"]
+        data_offset = offset
         end = offset + length
         if length < 1 or end > len(envelope):
             raise ValueError("invalid entropy record length")
@@ -970,7 +1076,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         if destination is None or not 1 <= ordinal <= limit or ordinal in destination:
             raise ValueError("invalid or duplicate entropy record ordinal")
         destination[ordinal] = record_data
-        records.append(Record(start, end, kind, ordinal, record_data))
+        records.append(Record(start, end, kind, ordinal, record_data, data_offset))
     if offset != len(envelope):
         raise ValueError("trailing or missing bytes in entropy envelope")
     if set(data_records) != set(range(1, data_count + 1)) or set(entropy_records) != set(range(1, entropy_count + 1)):
@@ -992,7 +1098,9 @@ def parse_and_verify(path: Path) -> PayloadInfo:
     if digest != entropy_digest:
         raise ValueError("entropy digest mismatch")
 
-    mask_state = seed ^ nonce ^ entropy_digest ^ ENVELOPE_MASK_DOMAIN ^ real_length
+    mask_state = (
+        seed ^ nonce ^ entropy_digest ^ ENVELOPE_MASK_DOMAIN ^ PAYLOAD_FORMAT_DOMAIN ^ DECODE_PIPELINE_DOMAIN ^ real_length
+    ) & MASK32
     protected_pages: list[bytes] = []
     plain_pages: list[bytes] = []
     page_lengths: list[int] = []
@@ -1001,12 +1109,18 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         framed_page = stream_xor(masked_page, mask_state)
         for _ in masked_page:
             mask_state = (mask_state * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
-        if len(framed_page) < 5 or len(framed_page) > 16384:
+        if len(framed_page) < layout.page_length_width + 1 or len(framed_page) > 16384:
             raise ValueError("bounded payload page has invalid framed length")
-        raw_length = struct.unpack_from("<I", framed_page)[0]
+        length_offset = len(framed_page) - layout.page_length_width if layout.page_length_suffix else 0
+        raw_length = read_uint(framed_page, length_offset, layout.page_length_width)
         if not 1 <= raw_length <= 6144:
             raise ValueError("bounded payload page has invalid raw length")
-        encoded_page = framed_page[4:]
+        encoded_page = (
+            framed_page[:length_offset]
+            if layout.page_length_suffix
+            else framed_page[layout.page_length_width:]
+        )
+        encoded_page = pipeline_inverse(encoded_page, layout, seed, nonce, entropy_digest, ordinal)
         try:
             plain_page = zlib.decompress(encoded_page, -15) if features & 1 else encoded_page
         except zlib.error as error:
@@ -1028,7 +1142,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         raise ValueError(f"entropy records are not high entropy enough: {entropy_score:.4f} bits/byte")
 
     return PayloadInfo(
-        path, source, domains, literals, payload, head, seed, attestation_token, flags, envelope, records, entropy,
+        path, source, domains, layout, literals, payload, head, seed, attestation_token, flags, envelope, records, entropy,
         protected_body, body, root, entropy_length, entropy_digest, nonce,
         data_count, entropy_count, page_lengths, entropy_score
     )
@@ -1037,7 +1151,12 @@ def parse_and_verify(path: Path) -> PayloadInfo:
 def build_outer_payload(info: PayloadInfo, envelope: bytes) -> bytes:
     encrypted = stream_xor(envelope, info.seed)
     integrity = hash_bytes(((info.seed ^ INTEGRITY_DOMAIN) * 31 + info.flags) & MASK32, encrypted)
-    return struct.pack("<II", info.head, integrity) + bytes([info.flags]) + encrypted
+    values = {"head": info.head, "integrity": integrity, "flags": info.flags}
+    output = bytearray()
+    for field_name in info.layout.outer_order:
+        append_uint(output, values[field_name], 1 if field_name == "flags" else 4)
+    output.extend(encrypted)
+    return bytes(output)
 
 
 def replace_payload_literals(info: PayloadInfo, payload: bytes) -> str:
@@ -1088,15 +1207,24 @@ def envelope_for_body(info: PayloadInfo, body: bytes) -> bytes:
         raw_pages = list(split_evenly(body, info.data_count).values())
 
     framed_pages: list[bytes] = []
-    for raw_page in raw_pages:
+    for ordinal, raw_page in enumerate(raw_pages, 1):
         if info.flags & 1:
             compressor = zlib.compressobj(level=9, wbits=-15)
             encoded_page = compressor.compress(raw_page) + compressor.flush()
         else:
             encoded_page = raw_page
-        framed_pages.append(struct.pack("<I", len(raw_page)) + encoded_page)
+        transformed = pipeline_forward(encoded_page, info.layout, info.seed, info.nonce, info.entropy_digest, ordinal)
+        frame = bytearray()
+        if not info.layout.page_length_suffix:
+            append_uint(frame, len(raw_page), info.layout.page_length_width)
+        frame.extend(transformed)
+        if info.layout.page_length_suffix:
+            append_uint(frame, len(raw_page), info.layout.page_length_width)
+        framed_pages.append(bytes(frame))
     real_length = sum(map(len, framed_pages))
-    mask_state = info.seed ^ info.nonce ^ info.entropy_digest ^ ENVELOPE_MASK_DOMAIN ^ real_length
+    mask_state = (
+        info.seed ^ info.nonce ^ info.entropy_digest ^ ENVELOPE_MASK_DOMAIN ^ PAYLOAD_FORMAT_DOMAIN ^ DECODE_PIPELINE_DOMAIN ^ real_length
+    ) & MASK32
     masked_stream = stream_xor(b"".join(framed_pages), mask_state)
     data_records: dict[int, bytes] = {}
     position = 0
@@ -1104,16 +1232,32 @@ def envelope_for_body(info: PayloadInfo, body: bytes) -> bytes:
         data_records[ordinal] = masked_stream[position:position + len(framed_page)]
         position += len(framed_page)
     entropy_records = {record.ordinal: record.data for record in info.records if record.kind == ENTROPY_KIND}
-    envelope = bytearray(struct.pack(
-        "<8I", real_length, info.entropy_length, len(info.records), len(framed_pages),
-        info.entropy_count, info.nonce, info.entropy_digest, 0
-    ))
+    header_values = {
+        "real_length": real_length,
+        "entropy_length": info.entropy_length,
+        "record_count": len(info.records),
+        "data_count": len(framed_pages),
+        "entropy_count": info.entropy_count,
+        "nonce": info.nonce,
+        "entropy_digest": info.entropy_digest,
+        "integrity": 0,
+    }
+    envelope = bytearray()
+    for field_name in info.layout.envelope_order:
+        append_uint(envelope, header_values[field_name], 4)
     for record in info.records:
         record_data = data_records[record.ordinal] if record.kind == DATA_KIND else entropy_records[record.ordinal]
-        envelope.extend(struct.pack("<BHI", record.kind, record.ordinal, len(record_data)))
+        record_values = {"kind": record.kind, "ordinal": record.ordinal, "length": len(record_data)}
+        for field_name in info.layout.record_order:
+            width = 1 if field_name == "kind" else info.layout.record_ordinal_width if field_name == "ordinal" else info.layout.record_length_width
+            append_uint(envelope, record_values[field_name], width)
         envelope.extend(record_data)
-    tag = hash_bytes(((info.seed ^ ENVELOPE_INTEGRITY_DOMAIN) * 31) & MASK32, envelope[:28] + envelope[32:])
-    struct.pack_into("<I", envelope, 28, tag)
+    integrity_offset = info.layout.envelope_order.index("integrity") * 4
+    tag = hash_bytes(
+        ((info.seed ^ ENVELOPE_INTEGRITY_DOMAIN) * 31) & MASK32,
+        envelope[:integrity_offset] + envelope[integrity_offset + 4:],
+    )
+    envelope[integrity_offset:integrity_offset + 4] = struct.pack("<I", tag)
     return bytes(envelope)
 
 
@@ -1133,7 +1277,7 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
     if len(entropy_records) < 2:
         raise ValueError("not enough entropy records for tamper variants")
     changed = bytearray(info.envelope)
-    changed[entropy_records[0].start + 7] ^= 1
+    changed[entropy_records[0].data_offset] ^= 1
     removed = info.envelope[:entropy_records[0].start] + info.envelope[entropy_records[0].end:]
     first, second = info.records[0], info.records[1]
     reordered = (
@@ -1316,6 +1460,9 @@ def main() -> int:
             if info.domains == other.domains:
                 raise ValueError("independent generations reused the complete build-domain vector")
             print("PASS independent serializer/runtime domains across generations")
+            if info.layout == other.layout:
+                raise ValueError("independent generations reused the complete payload grammar and decode pipeline")
+            print("PASS independent payload grammar/decode pipeline across generations")
             if info.entropy == other.entropy or info.entropy_digest == other.entropy_digest or info.nonce == other.nonce:
                 raise ValueError("independent generations reused entropy state")
             print("PASS independent entropy across generations")

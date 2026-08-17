@@ -219,11 +219,13 @@ if envelope_leak:
     raise SystemExit("stable entropy-envelope identifier leaked: " + envelope_leak.group(0))
 stream_leak = re.search(
     r"\b(?:DeriveBlockPermutation|DeriveCodeDataPermutation|Column(?:Order|Positions|Read8|Read16|Read32|Data|Position)|"
-    r"Fragment(?:Order|Spans|Count|State)|Instruction(?:Digest|State|Seal)|BeginInstructionState|AdvanceInstructionState)\b",
+    r"Fragment(?:Order|Spans|Count|State)|Instruction(?:Digest|State|Seal)|BeginInstructionState|AdvanceInstructionState|"
+    r"OpcodeState(?:Key|Seal)?|BeginOpcodeState|AdvanceOpcodeState|PreviousOpcodeState|CurrentOpcode(?:State|Seal)|"
+    r"CipherByte|KeyByte|LengthOffset|EncodedIndex|Pipeline(?:State|Index)|TransformedByte|InstrPoint|Inst|GetInstruction)\b",
     source + "\n" + final_source,
 )
 if stream_leak:
-    raise SystemExit("stable streaming-record identifier leaked: " + stream_leak.group(0))
+    raise SystemExit("stable streaming/opcode/pipeline identifier leaked: " + stream_leak.group(0))
 PY
 echo "PASS guard, entropy-envelope and streaming-record runtime identifiers are randomized"
 
@@ -238,12 +240,12 @@ import sys
 source = Path(sys.argv[1]).read_text("latin1")
 ident = r"[A-Za-z_]\w*"
 calls = list(re.finditer(
-    rf"if\s+({ident})\(\s*({ident})\s*,\s*({ident})\s*,\s*({ident})\s*,\s*({ident})\s*\)\s+then\s+"
-    rf"return\s+({ident})\(\);\s*end;\s*return\s+({ident})\s*;",
+    rf"if\s+({ident})\(\s*({ident})\s*,\s*({ident})\s*,\s*({ident})\s*,\s*({ident})\s*,\s*"
+    rf"({ident})\s*,\s*({ident})\s*\)\s+then\s+return\s+({ident})\(\);\s*end;\s*return\s+({ident})\s*;",
     source,
 ))
 if len(calls) != 1:
-    raise SystemExit(f"expected one four-state Guard/payload bind call, found {len(calls)}")
+    raise SystemExit(f"expected one six-state Guard/payload bind call, found {len(calls)}")
 bind_name = calls[0].group(1)
 declaration = re.search(
     rf"local\s+function\s+{re.escape(bind_name)}\s*\([^)]*\)(.*?)\nend;",
@@ -365,6 +367,7 @@ echo "PASS unsupported dispatcher shape falls back without partial metadata"
 # executed, so template diversity never replaces semantic validation.
 for ((i = 1; i <= RANDOM_RUNS; i++)); do
     obfuscate "$WORK/random.lua"
+    cp "$WORK/obfuscator.log" "$WORK/obfuscator-$i.log"
     python3 tests/runtime_layout.py "$ROOT/temp/t2.lua" --include-shape > "$WORK/runtime-layout-$i.out"
     run_executor "$WORK/random.lua" > "$WORK/random.out"
     cmp -s "$WORK/baseline.out" "$WORK/random.out"
@@ -373,6 +376,7 @@ python3 - "$WORK" "$RANDOM_RUNS" <<'PY'
 from itertools import combinations
 from pathlib import Path
 import json
+import re
 import sys
 
 work = Path(sys.argv[1])
@@ -397,6 +401,46 @@ update_orders = [continuation["state_update_order"] for continuation in continua
 vm_layout_fingerprints = [layout["fingerprint"] for layout in vm_layouts]
 vm_layout_templates = [layout["template"] for layout in vm_layouts]
 domain_vectors = [json.dumps(layout["domains"], sort_keys=True) for layout in layouts]
+
+def permute(values, seed, salt):
+    result = list(values)
+    state = (seed ^ salt) & 0xFFFFFFFF
+    for size in range(len(result), 1, -1):
+        state = (state * 1664525 + 1013904223 + size * salt) & 0xFFFFFFFF
+        swap = state % size
+        result[size - 1], result[swap] = result[swap], result[size - 1]
+    return result
+
+def payload_layout(domains):
+    domain = domains["payload_format"]
+    return {
+        "outer": permute(["head", "integrity", "flags"], domain, 0x13579BDF),
+        "envelope": permute(
+            ["real_length", "entropy_length", "record_count", "data_count", "entropy_count", "nonce", "entropy_digest", "integrity"],
+            domain, 0x2468ACE1,
+        ),
+        "record": permute(["kind", "ordinal", "length"], domain, 0x9E3779B9),
+        "ordinal_width": 2 if ((domain >> 3) & 1) == 0 else 4,
+        "record_length_width": 3 if ((domain >> 7) & 1) == 0 else 4,
+        "page_length_width": 2 if ((domain >> 11) & 1) == 0 else 4,
+        "page_length_suffix": ((domain >> 15) & 1) != 0,
+        "pipeline": domains["decode_pipeline"] % 3,
+    }
+
+payload_layouts = [payload_layout(layout["domains"]) for layout in layouts]
+payload_layout_vectors = [json.dumps(layout, sort_keys=True) for layout in payload_layouts]
+super_records = []
+for index in range(1, runs + 1):
+    log = (work / f"obfuscator-{index}.log").read_text()
+    match = re.search(
+        r"Created (\d+) short super operators; folded (\d+) sequences; lengths ([0-9:,]+); structure ([0-9a-f]{8})\.",
+        log,
+    )
+    if not match:
+        raise SystemExit(f"missing structural short-super-operator record for build {index}")
+    lengths = {int(size): int(count) for size, count in
+               (entry.split(":") for entry in match.group(3).split(","))}
+    super_records.append((int(match.group(1)), int(match.group(2)), lengths, match.group(4)))
 slot_abis = [json.dumps({key: layout[key] for key in ("chunk", "block", "flow", "flow_cache")}, sort_keys=True)
              for layout in layouts]
 if min(counts) <= 44:
@@ -419,6 +463,31 @@ if len(set(update_orders)) < 2:
     raise SystemExit(f"dispatcher transition ordering did not vary: {update_orders}")
 if len(set(domain_vectors)) != runs:
     raise SystemExit("a serializer/runtime domain vector was reused across builds")
+if len(set(payload_layout_vectors)) != runs:
+    raise SystemExit("a complete payload grammar/pipeline layout was reused across builds")
+if {layout["pipeline"] for layout in payload_layouts} != {0, 1, 2}:
+    raise SystemExit("not all three decode pipelines were emitted")
+if len({tuple(layout["outer"]) for layout in payload_layouts}) < 4:
+    raise SystemExit("payload outer-field ordering did not vary sufficiently")
+if len({tuple(layout["envelope"]) for layout in payload_layouts}) < runs // 2:
+    raise SystemExit("payload envelope ordering did not vary sufficiently")
+if len({tuple(layout["record"]) for layout in payload_layouts}) < 4:
+    raise SystemExit("payload record-field ordering did not vary sufficiently")
+for field, expected in (
+    ("ordinal_width", {2, 4}),
+    ("record_length_width", {3, 4}),
+    ("page_length_width", {2, 4}),
+    ("page_length_suffix", {False, True}),
+):
+    observed = {layout[field] for layout in payload_layouts}
+    if observed != expected:
+        raise SystemExit(f"payload grammar dimension {field} did not emit both forms: {sorted(observed)}")
+if min(record[0] for record in super_records) < 12 or min(record[1] for record in super_records) < 8:
+    raise SystemExit(f"short super operators were not materially emitted/folded: {super_records}")
+if any(len(record[2]) < 2 or sum(record[2].values()) != record[0] for record in super_records):
+    raise SystemExit(f"short super-operator length structure is degenerate: {super_records}")
+if len({record[3] for record in super_records}) != runs:
+    raise SystemExit("a short super-operator semantic structure was reused across builds")
 if len(set(slot_abis)) != runs:
     raise SystemExit("a runtime slot ABI was reused across builds")
 
@@ -452,7 +521,9 @@ if max_layout_similarity > 0.45 or mean_layout_similarity > 0.10:
 print(
     f"PASS {runs}-build execution-model barrier: counts={sorted(set(counts))}, "
     f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, "
-    f"unique graphs/structures/layouts/domains/ABIs={runs}, "
+    f"unique graphs/structures/layouts/domains/ABIs/payload-grammars/super-structures={runs}, "
+    f"pipelines={sorted({layout['pipeline'] for layout in payload_layouts})}, "
+    f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, "
     f"dispatcher similarity max={max_similarity:.3f} mean={mean_similarity:.3f}, "
     f"VM-layout similarity max={max_layout_similarity:.3f} mean={mean_layout_similarity:.3f}"
 )

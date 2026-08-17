@@ -35,11 +35,12 @@ namespace IronBrew2.Obfuscator
 			BytecodeCompress = true;
 			DecryptTableLen = 500;
 			PreserveLineInfo = false;
-			// Mutation/SuperOperator remain experimental and are not part of the fixed profile.
+			// The fixed profile uses only bounded straight-line (2..6 instruction)
+			// fusions; mutation and legacy mega operators remain disabled.
 			Mutate = false;
-			SuperOperators = false;
-			MaxMegaSuperOperators = 120;
-			MaxMiniSuperOperators = 120;
+			SuperOperators = true;
+			MaxMegaSuperOperators = 0;
+			MaxMiniSuperOperators = 24;
 			MaxMutations = 200;
 			AntiDump = true;
 			AggressiveDefense = false;

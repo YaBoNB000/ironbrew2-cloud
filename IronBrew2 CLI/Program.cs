@@ -20,7 +20,7 @@ namespace IronBrew2_CLI
 			return new ObfuscationSettings
 			{
 				Mutate = false,
-				SuperOperators = false,
+				SuperOperators = true,
 				EncryptStrings = false,
 				EncryptImportantStrings = false,
 				AggressiveDefense = false,

@@ -81,9 +81,16 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			uint integrity = ComputeIntegrity(encrypted, _context.XorSeed, flags);
 
 			var output = new List<byte>(encrypted.Length + 9);
-			WriteUInt32(output, head);
-			WriteUInt32(output, integrity);
-			output.Add(flags);
+			foreach (OuterHeaderField field in _context.PayloadFormat.OuterHeaderOrder)
+			{
+				switch (field)
+				{
+					case OuterHeaderField.Head: WriteUInt32(output, head); break;
+					case OuterHeaderField.Integrity: WriteUInt32(output, integrity); break;
+					case OuterHeaderField.Flags: output.Add(flags); break;
+					default: throw new InvalidOperationException("Unknown outer payload header field.");
+				}
+			}
 			output.AddRange(encrypted);
 			return output.ToArray();
 		}
@@ -101,30 +108,34 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			if (body == null || body.Length == 0)
 				throw new InvalidOperationException("Cannot envelope an empty protected payload.");
 
+			PayloadFormatLayout format = _context.PayloadFormat;
 			int entropyLength = _random.Next(EntropyMinBytes, EntropyMaxBytes + 1);
 			byte[] entropy = _random.GetBytes(entropyLength);
 			uint nonce = NextState32();
-
 			List<byte[]> entropyParts = SplitRandom(entropy, _random.Next(12, 21));
+			uint entropyDigest = ComputeEntropyDigest(entropyParts, seed, nonce, entropyLength);
+
 			int pageSize = _random.Next(PayloadPageMinBytes, PayloadPageMaxBytes + 1);
 			var framedPages = new List<byte[]>((body.Length + pageSize - 1) / pageSize);
-			for (int offset = 0; offset < body.Length; offset += pageSize)
+			for (int offset = 0, ordinal = 1; offset < body.Length; offset += pageSize, ordinal++)
 			{
 				int rawLength = Math.Min(pageSize, body.Length - offset);
 				var rawPage = new byte[rawLength];
 				Buffer.BlockCopy(body, offset, rawPage, 0, rawLength);
 				byte[] encodedPage = compressPages ? Deflate(rawPage) : rawPage;
-				var framedPage = new byte[encodedPage.Length + 4];
-				WriteUInt32(framedPage, 0, (uint)rawLength);
-				Buffer.BlockCopy(encodedPage, 0, framedPage, 4, encodedPage.Length);
-				framedPages.Add(framedPage);
+				byte[] transformedPage = TransformEncodedPage(encodedPage, ordinal, seed, nonce, entropyDigest);
+				var frame = new List<byte>(transformedPage.Length + format.PageLengthWidth);
+				if (!format.PageLengthSuffix) WriteUIntWidth(frame, (uint)rawLength, format.PageLengthWidth);
+				frame.AddRange(transformedPage);
+				if (format.PageLengthSuffix) WriteUIntWidth(frame, (uint)rawLength, format.PageLengthWidth);
+				framedPages.Add(frame.ToArray());
 			}
 			if (framedPages.Count > ushort.MaxValue)
 				throw new InvalidOperationException("Protected payload requires too many bounded pages.");
 
 			uint framedLength = checked((uint)framedPages.Sum(page => (long)page.Length));
-			uint entropyDigest = ComputeEntropyDigest(entropyParts, seed, nonce, entropyLength);
-			uint maskState = seed ^ nonce ^ entropyDigest ^ _context.Domains.EnvelopeMaskDomain ^ framedLength;
+			uint maskState = seed ^ nonce ^ entropyDigest ^ _context.Domains.EnvelopeMaskDomain ^
+			                 _context.Domains.PayloadFormatDomain ^ _context.Domains.DecodePipelineDomain ^ framedLength;
 			var maskedPages = new List<byte[]>(framedPages.Count);
 			foreach (byte[] framedPage in framedPages)
 			{
@@ -144,28 +155,38 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				records.Add(new EntropyRecord {Kind = _context.Domains.DataRecordKind, Ordinal = (ushort)(index + 1), Data = maskedPages[index]});
 			ShuffleEntropyRecords(records);
 
-			// 8 x u32 fields. RealLength is the total framed-page length, not the
-			// plaintext body length; each page carries its own bounded raw length.
-			var envelope = new List<byte>(checked(32 + records.Count * 7 + entropyLength + (int)framedLength));
-			WriteUInt32(envelope, framedLength);
-			WriteUInt32(envelope, (uint)entropyLength);
-			WriteUInt32(envelope, (uint)records.Count);
-			WriteUInt32(envelope, (uint)maskedPages.Count);
-			WriteUInt32(envelope, (uint)entropyParts.Count);
-			WriteUInt32(envelope, nonce);
-			WriteUInt32(envelope, entropyDigest);
-			WriteUInt32(envelope, 0u);
+			var headerValues = new Dictionary<EnvelopeHeaderField, uint>
+			{
+				[EnvelopeHeaderField.FramedLength] = framedLength,
+				[EnvelopeHeaderField.EntropyLength] = (uint)entropyLength,
+				[EnvelopeHeaderField.RecordCount] = (uint)records.Count,
+				[EnvelopeHeaderField.DataCount] = (uint)maskedPages.Count,
+				[EnvelopeHeaderField.EntropyCount] = (uint)entropyParts.Count,
+				[EnvelopeHeaderField.Nonce] = nonce,
+				[EnvelopeHeaderField.EntropyDigest] = entropyDigest,
+				[EnvelopeHeaderField.Integrity] = 0u
+			};
+			var envelope = new List<byte>(checked(32 + records.Count * format.RecordHeaderWidth + entropyLength + (int)framedLength));
+			foreach (EnvelopeHeaderField field in format.EnvelopeHeaderOrder)
+				WriteUInt32(envelope, headerValues[field]);
 			foreach (EntropyRecord record in records)
 			{
-				envelope.Add(record.Kind);
-				WriteUInt16(envelope, record.Ordinal);
-				WriteUInt32(envelope, (uint)record.Data.Length);
+				foreach (EnvelopeRecordField field in format.EnvelopeRecordOrder)
+				{
+					switch (field)
+					{
+						case EnvelopeRecordField.Kind: envelope.Add(record.Kind); break;
+						case EnvelopeRecordField.Ordinal: WriteUIntWidth(envelope, record.Ordinal, format.RecordOrdinalWidth); break;
+						case EnvelopeRecordField.Length: WriteUIntWidth(envelope, (uint)record.Data.Length, format.RecordLengthWidth); break;
+						default: throw new InvalidOperationException("Unknown envelope record field.");
+					}
+				}
 				envelope.AddRange(record.Data);
 			}
 
 			byte[] result = envelope.ToArray();
 			uint tag = ComputeEnvelopeIntegrity(result, seed);
-			WriteUInt32(result, 28, tag);
+			WriteUInt32(result, format.EnvelopeIntegrityOffset, tag);
 			return result;
 		}
 
@@ -224,10 +245,11 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private uint ComputeEnvelopeIntegrity(byte[] envelope, uint seed)
 		{
 			uint hash = unchecked((seed ^ _context.Domains.EnvelopeIntegrityDomain) * 31u);
+			int integrityOffset = _context.PayloadFormat.EnvelopeIntegrityOffset;
 			for (int index = 0; index < envelope.Length; index++)
 			{
-				// Bytes 28..31 hold the tag itself and are intentionally omitted.
-				if (index >= 28 && index < 32) continue;
+				// The Build-local integrity slot holds the tag itself and is omitted.
+				if (index >= integrityOffset && index < integrityOffset + 4) continue;
 				hash = unchecked(hash * 31u + envelope[index]);
 			}
 			return hash;
@@ -315,6 +337,40 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			                       (uint)fromPc * 257u + (uint)toPc * 65537u + (uint)k1 * 251u +
 			                       (uint)k2 * 17u + k3 + _context.Domains.ChunkStateDomain + binding + attestation);
 			return unchecked(value * 1664525u + 1013904223u);
+		}
+
+		private uint BeginOpcodeState(uint chunkState, uint entryState, int blockStart,
+			ushort k1, ushort k2, ushort k3, uint attestation)
+		{
+			uint value = unchecked(chunkState * 22695477u + entryState * 1664525u +
+			                       (uint)blockStart * 65537u + (uint)k1 * 251u + (uint)k2 * 17u + k3 +
+			                       _context.Domains.OpcodeStateDomain + attestation);
+			return unchecked(value * 1664525u + 1013904223u);
+		}
+
+		private uint AdvanceOpcodeState(uint state, uint digest, int index, uint chunkState, uint entryState,
+			uint attestation)
+		{
+			uint value = unchecked(state * 1664525u + digest + (uint)index * 257u +
+			                       chunkState * 17u + entryState + _context.Domains.OpcodeStateDomain + attestation);
+			return unchecked(value * 22695477u + 1u);
+		}
+
+		private ushort OpcodeStateMask(uint state, int pc)
+		{
+			uint low = state & 0xffffu;
+			uint high = state >> 16;
+			return (ushort)((low * (uint)((pc % 251) + 1) + high * 17u +
+			                 (_context.Domains.OpcodeStateDomain & 0xffffu)) & 0xffffu);
+		}
+
+		private uint ComputeInstructionDigest(byte[] record, int index, ushort k1, ushort k2, ushort k3)
+		{
+			uint hash = unchecked((_context.Domains.InstructionStateDomain ^ (uint)index) * 31u + k1);
+			hash = HashWord(hash, k2);
+			hash = HashWord(hash, k3);
+			hash = HashWord(hash, (uint)record.Length);
+			return HashBytes(hash, record);
 		}
 
 		private ushort BlockFieldMask(uint entryState, int pc, int slot, ushort k1, ushort k2, ushort k3)
@@ -494,6 +550,14 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			output.Add((byte)(value >> 24));
 		}
 
+		private static void WriteUIntWidth(List<byte> output, uint value, int width)
+		{
+			if (width < 1 || width > 4 || (width < 4 && value >= (1u << (width * 8))))
+				throw new InvalidOperationException("Protected payload field exceeds its Build-local width.");
+			for (int index = 0; index < width; index++)
+				output.Add((byte)(value >> (index * 8)));
+		}
+
 		private static void WriteUInt32(byte[] output, int offset, uint value)
 		{
 			output[offset] = (byte)value;
@@ -509,6 +573,31 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			using (var deflate = new DeflateStream(stream, CompressionLevel.Optimal, true))
 				deflate.Write(data, 0, data.Length);
 			return stream.ToArray();
+		}
+
+		private byte[] TransformEncodedPage(byte[] page, int ordinal, uint seed, uint nonce, uint entropyDigest)
+		{
+			var output = page.ToArray();
+			switch (_context.PayloadFormat.PipelineVariant)
+			{
+				case 0:
+					return output;
+				case 1:
+					Array.Reverse(output);
+					return output;
+				case 2:
+					uint state = seed ^ nonce ^ entropyDigest ^ _context.Domains.DecodePipelineDomain ^
+					             unchecked((uint)ordinal * 0x9e3779b9u);
+					for (int index = 0; index < output.Length; index++)
+					{
+						byte plain = output[index];
+						output[index] = (byte)(plain ^ (byte)(state >> 24));
+						state = unchecked(state * 1664525u + 1013904223u + plain + (uint)index);
+					}
+					return output;
+				default:
+					throw new InvalidOperationException("Unknown protected payload decode pipeline.");
+			}
 		}
 
 		private byte[] SerializeBody(Chunk chunk)
@@ -534,7 +623,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			void WriteUInt32Local(uint value) => WriteUInt32(output, value);
 
 			void SerializeInstruction(Instruction instruction, int zeroBasedIndex, uint entryState,
-				IReadOnlyList<List<byte>> columns)
+				uint opcodeState, IReadOnlyList<List<byte>> columns)
 			{
 				// Logical columns are descriptor/opcode/A/B/C. They are accumulated
 				// independently, then emitted in a block-local physical permutation.
@@ -565,7 +654,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				descriptors.Add((byte)(((type << 1) | (constantMask << 3)) ^ descriptorMask));
 
 				ushort storedOpcode = (ushort)((ushort)opcode ^ OpcodeMask(pc, k1, k2, k3) ^
-				                               BlockFieldMask(entryState, pc, 0, k1, k2, k3));
+				                               BlockFieldMask(entryState, pc, 0, k1, k2, k3) ^
+				                               OpcodeStateMask(opcodeState, pc));
 				ushort storedA = (ushort)((ushort)instruction.A ^ OperandMask16(pc, k1, k2, k3, 1) ^
 				                          BlockFieldMask(entryState, pc, 1, k1, k2, k3));
 				WriteUInt16(opcodes, storedOpcode);
@@ -754,17 +844,24 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							var instructionRecords = new List<byte[]>(count);
 							int[] columnOrder = DeriveBlockPermutation(5, entryState, k1, k2, k3,
 								_context.Domains.BlockColumnDomain);
+							uint opcodeState = BeginOpcodeState(sourceChunkState, entryState, start + 1,
+								k1, k2, k3, payloadAttestation);
 							for (int offset = 0; offset < count; offset++)
 							{
+								int instructionIndex = start + offset + 1;
 								var columns = Enumerable.Range(0, 5).Select(_ => new List<byte>()).ToArray();
-								SerializeInstruction(chunk.Instructions[start + offset], start + offset, entryState, columns);
+								SerializeInstruction(chunk.Instructions[start + offset], start + offset, entryState, opcodeState, columns);
 								var instructionRecord = new List<byte>();
 								foreach (int logicalColumn in columnOrder)
 								{
 									WriteUInt32(instructionRecord, (uint)columns[logicalColumn].Count);
 									instructionRecord.AddRange(columns[logicalColumn]);
 								}
-								instructionRecords.Add(instructionRecord.ToArray());
+								byte[] record = instructionRecord.ToArray();
+								instructionRecords.Add(record);
+								opcodeState = AdvanceOpcodeState(opcodeState,
+									ComputeInstructionDigest(record, instructionIndex, k1, k2, k3), instructionIndex,
+									sourceChunkState, entryState, payloadAttestation);
 							}
 
 							var referenceSet = new HashSet<int>();
