@@ -108,8 +108,8 @@ echo "PASS entropy record modification, deletion and reordering rejection after 
 
 # Rebuild every outer/envelope layer around deliberately damaged v4 internals.
 # Each case leaves exactly the named prototype, complete block-manifest,
-# authenticated column parser/consumption, or capsule-integrity layer as the
-# first rejecting boundary.
+# authenticated instruction-record parser/consumption, or block-local
+# capsule-integrity layer as the first rejecting boundary.
 for payload_case in prototype-tag initial-chunk-state successor-chunk-state block-manifest column-framing column-consumption capsule-integrity; do
     payload_file="$WORK/payload-$payload_case.lua"
     "$LUAC" -p "$payload_file"
@@ -120,7 +120,7 @@ for payload_case in prototype-tag initial-chunk-state successor-chunk-state bloc
     assert_payload_rejected "$payload_code" "$WORK/payload-$payload_case.stdout" \
         "$WORK/payload-$payload_case.stderr" "v4 $payload_case tamper"
 done
-echo "PASS v4 prototype, attested chunk-chain, block-manifest, column framing/consumption and constant-capsule tamper rejection"
+echo "PASS v4 prototype, attested chunk-chain, block-manifest, record framing/consumption and block-local capsule tamper rejection"
 
 # The trusted test executor must pass every retained hard-AND behavior contract.
 # Compatibility paths model proxy-backed globals, empty C-upvalue results and
@@ -217,11 +217,78 @@ if leaked:
 envelope_leak = re.search(r"\b(?:Payload|Envelope)[A-Z][A-Za-z0-9_]*", source + "\n" + final_source)
 if envelope_leak:
     raise SystemExit("stable entropy-envelope identifier leaked: " + envelope_leak.group(0))
-column_leak = re.search(r"\b(?:DeriveBlockPermutation|Column(?:Order|Positions|Read8|Read16|Read32|Data|Position))\b", source + "\n" + final_source)
-if column_leak:
-    raise SystemExit("stable columnar-IR identifier leaked: " + column_leak.group(0))
+stream_leak = re.search(
+    r"\b(?:DeriveBlockPermutation|DeriveCodeDataPermutation|Column(?:Order|Positions|Read8|Read16|Read32|Data|Position)|"
+    r"Fragment(?:Order|Spans|Count|State)|Instruction(?:Digest|State|Seal)|BeginInstructionState|AdvanceInstructionState)\b",
+    source + "\n" + final_source,
+)
+if stream_leak:
+    raise SystemExit("stable streaming-record identifier leaked: " + stream_leak.group(0))
 PY
-echo "PASS guard, entropy-envelope and columnar-IR runtime identifiers are randomized"
+echo "PASS guard, entropy-envelope and streaming-record runtime identifiers are randomized"
+
+# Mutate the private payload-chain state immediately after its first successful
+# instruction bind. The next GuardProbe must notice the broken payload seal and
+# enter the configured non-yielding sticky sink before any protected output.
+python3 - "$WORK/fixed-vm.lua" "$WORK/guard-payload-state-tamper.lua" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1]).read_text("latin1")
+ident = r"[A-Za-z_]\w*"
+calls = list(re.finditer(
+    rf"if\s+({ident})\(\s*({ident})\s*,\s*({ident})\s*,\s*({ident})\s*,\s*({ident})\s*\)\s+then\s+"
+    rf"return\s+({ident})\(\);\s*end;\s*return\s+({ident})\s*;",
+    source,
+))
+if len(calls) != 1:
+    raise SystemExit(f"expected one four-state Guard/payload bind call, found {len(calls)}")
+bind_name = calls[0].group(1)
+declaration = re.search(
+    rf"local\s+function\s+{re.escape(bind_name)}\s*\([^)]*\)(.*?)\nend;",
+    source,
+    re.S,
+)
+if not declaration:
+    raise SystemExit("Guard/payload bind declaration not found")
+body = declaration.group(1)
+state = re.search(rf"\b({ident})\s*=\s*\(\s*\1\s*\*\s*4093\s*\+", body)
+if not state:
+    raise SystemExit("Guard/payload state absorption is missing")
+state_name = state.group(1)
+if not re.search(rf"\b{ident}\s*=\s*{ident}\(\s*\)\s*;\s*return\s+false;", body):
+    raise SystemExit("Guard/payload bind does not reseal before returning")
+return_offset = body.rfind("return false;")
+if return_offset < 0:
+    raise SystemExit("Guard/payload bind has no successful return")
+injection = (
+    "if not _G.__ib2_payload_state_tamper then "
+    f"_G.__ib2_payload_state_tamper=true;{state_name}=({state_name}+1)%2147483647;end;"
+)
+patched = body[:return_offset] + injection + body[return_offset:]
+source = source[:declaration.start(1)] + patched + source[declaration.end(1):]
+Path(sys.argv[2]).write_text(source, "latin1")
+PY
+"$LUAC" -p "$WORK/guard-payload-state-tamper.lua"
+set +e
+timeout 3s "$LUA" tests/executor_runner.lua trusted "$WORK/guard-payload-state-tamper.lua" \
+    > "$WORK/guard-payload-state-tamper.stdout" 2> "$WORK/guard-payload-state-tamper.stderr"
+guard_payload_code=$?
+set -e
+if [[ $guard_payload_code -ne 124 ]]; then
+    echo "Guard/payload state tamper did not enter the non-yielding sticky sink (exit $guard_payload_code)." >&2
+    exit 1
+fi
+if [[ -s "$WORK/guard-payload-state-tamper.stdout" ]]; then
+    echo "Guard/payload state tamper emitted protected output before the sticky sink." >&2
+    exit 1
+fi
+if LC_ALL=C grep -aFq 'invalid protected payload' "$WORK/guard-payload-state-tamper.stderr"; then
+    echo "Guard/payload state tamper leaked the stable protected-payload diagnostic." >&2
+    exit 1
+fi
+echo "PASS bidirectional Guard/payload seal rejects instruction-state mutation through sticky sink"
 
 # semantic.lua contains no IB_MAX_CFLOW markers. Assert that its root prototype
 # was nevertheless selected and received a complete random route-state map.
@@ -538,8 +605,8 @@ lifecycle_probe = (
 probe = (
     "_G.__ib2_lazy_opaque=function() "
     "assert(next(" + root + f"[{chunk_slots[1]}])==nil,'decoded instructions escaped invocation-local cache');"
-    "local capsules=" + root + f"[{chunk_slots[15]}];assert(type(capsules)=='table');"
-    "for _,capsule in pairs(capsules) do assert(type(capsule)=='string','plaintext constant escaped block-local cache');end;"
+    "local constant_count=" + root + f"[{chunk_slots[15]}];assert(type(constant_count)=='number');"
+    "assert(next(" + root + f"[{chunk_slots[1]}])==nil,'instruction material survived current fetch');"
     "local n=0;local blocks=" + root + f"[{chunk_slots[9]}];"
     "if blocks then for _,block in pairs(blocks) do "
     f"if type(block[{block_slots[3]}])=='string' then n=n+1;end;end;end;"
@@ -555,7 +622,7 @@ PY
 "$LUAC" -p "$WORK/lazy-instrumented.lua"
 run_executor "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
 grep -Eq '^lazy-blocks:[1-9][0-9]*:executed-constant:37$' "$WORK/lazy-instrumented.out"
-echo "PASS paged-source release, ephemeral instruction/constant cache and opaque block retention"
+echo "PASS paged-source release, current-record instruction lifetime, partitioned constants and opaque block retention"
 
 # Exercise Lua 5.1's SETLIST C == 0 data word without checking in a huge table
 # constructor. A test-only luac wrapper patches the one-element fixture after

@@ -17,6 +17,7 @@ class BuildDomains:
     block_integrity: int
     flow: int
     chunk_state: int
+    instruction_state: int
     envelope_integrity: int
     entropy_digest: int
     envelope_mask: int
@@ -27,6 +28,7 @@ class BuildDomains:
     schema_permutation: int
     constant_tag_permutation: int
     block_column: int
+    code_data_permutation: int
     flow_verifier_mask: int
     block_field_stride: int
     entropy_record_kind: int
@@ -107,14 +109,21 @@ def extract_build_domains(source: str) -> BuildDomains:
     )
     constant_mask = _one(
         source,
-        rf"local\s+{ident}\s*=\s*\(\s*{ident}\s*\*\s*65537\s*\+\s*{ident}\s*\*\s*257"
-        rf"\s*\+\s*{ident}\s*\*\s*17\s*\+\s*{ident}\s*\+\s*(\d+)\s*\)\s*%\s*4294967296",
+        rf"local\s+{ident}\s*=\s*\(\s*{ident}\s*\*\s*65537\s*\+\s*{ident}\(\s*{ident}\s*,\s*22695477\s*\)"
+        rf".+?\+\s*{ident}\s*\*\s*257\s*\+\s*{ident}\s*\*\s*17\s*\+\s*{ident}\s*\+\s*(\d+)\s*\)\s*%\s*4294967296",
         "constant mask domain",
+    )
+    instruction_state = _one(
+        source,
+        rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*(\d+)\s*,\s*{ident}\s*\)\s*\*\s*31\s*\+\s*{ident}\s*\)"
+        rf"\s*%\s*4294967296\s*;\s*{ident}\s*=\s*\(\s*{ident}\s*\*\s*31\s*\+\s*{ident}",
+        "instruction-state domain",
     )
     constant_integrity = _one(
         source,
-        rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)\s*\*\s*31"
-        rf"\s*\+\s*{ident}\s*\)\s*%\s*4294967296\s*;\s*{ident}\s*=\s*\(\s*{ident}\s*\*\s*31\s*\+\s*#{ident}",
+        rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)\s*,\s*{ident}\s*\)\s*,\s*{ident}\s*\)"
+        rf"\s*\*\s*31\s*\+\s*{ident}\s*\)\s*%\s*4294967296\s*;\s*{ident}\s*=\s*\(\s*{ident}\s*\*\s*31\s*\+\s*{ident}\s*\)"
+        rf"\s*%\s*4294967296\s*;\s*{ident}\s*=\s*\(\s*{ident}\s*\*\s*31\s*\+\s*#{ident}",
         "constant integrity domain",
     )
     prototype_integrity = _one(
@@ -153,6 +162,12 @@ def extract_build_domains(source: str) -> BuildDomains:
         rf"\s*;\s*local\s+{ident}\s*=\s*\{{\s*\}}",
         "block-column permutation domain",
     )
+    code_data_permutation = _one(
+        source,
+        rf"local\s+{ident}\s*=\s*{ident}\(\s*{ident}\[\d+\]\s*,\s*#{ident}\s*,\s*{ident}\(\s*{ident}\(\s*{ident}\s*,\s*{ident}\s*\)\s*\)\s*,"
+        rf"\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*(\d+)\s*\)",
+        "code/data permutation domain",
+    )
 
     record_candidates = {
         (int(match.group(1)), int(match.group(2)))
@@ -176,6 +191,7 @@ def extract_build_domains(source: str) -> BuildDomains:
         block_integrity=block_integrity,
         flow=flow,
         chunk_state=chunk_state,
+        instruction_state=instruction_state,
         envelope_integrity=envelope_integrity,
         entropy_digest=entropy_digest,
         envelope_mask=envelope_mask,
@@ -186,6 +202,7 @@ def extract_build_domains(source: str) -> BuildDomains:
         schema_permutation=schema_permutation,
         constant_tag_permutation=constant_tag_permutation,
         block_column=block_column,
+        code_data_permutation=code_data_permutation,
         flow_verifier_mask=flow_verifier_mask,
         block_field_stride=block_field_stride,
         entropy_record_kind=entropy_record_kind,
@@ -197,6 +214,7 @@ def extract_build_domains(source: str) -> BuildDomains:
         values.block_integrity,
         values.flow,
         values.chunk_state,
+        values.instruction_state,
         values.envelope_integrity,
         values.entropy_digest,
         values.envelope_mask,
@@ -207,6 +225,7 @@ def extract_build_domains(source: str) -> BuildDomains:
         values.schema_permutation,
         values.constant_tag_permutation,
         values.block_column,
+        values.code_data_permutation,
         values.block_field_stride,
     ]
     if any(value <= 0 or value > 0xFFFFFFFF for value in uint_domains):
@@ -221,6 +240,7 @@ def extract_build_domains(source: str) -> BuildDomains:
         values.schema_permutation & 0xFFFF,
         values.constant_tag_permutation & 0xFFFF,
         values.block_column & 0xFFFF,
+        values.code_data_permutation & 0xFFFF,
         values.block_field_stride & 0xFFFF,
         values.flow_verifier_mask,
     ]

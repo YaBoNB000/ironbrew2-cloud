@@ -483,17 +483,50 @@ local function BlockFieldKey32(EntryState, I, Slot, K1, K2, K3)
         + BlockFieldKey(EntryState, I, Slot + 4, K1, K2, K3) * 65536;
 end;
 
-local function ConstantMaskState(Index, K1, K2, K3)
-    local Value = (Index * 65537 + K1 * 257 + K2 * 17 + K3 + __IB2_DOMAIN_CONSTANT_MASK__) % 4294967296;
-    return (Value * 1664525 + 1013904223) % 4294967296;
+local function ConstantMaskState(Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3)
+    local Value = (Index * 65537 + U32Mul(EntryState, 22695477)
+        + U32Mul(CurrentChunkState, 1664525) + BlockStart * 257
+        + K1 * 257 + K2 * 17 + K3 + __IB2_DOMAIN_CONSTANT_MASK__) % 4294967296;
+    return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
 end;
 
-local function ComputeConstantIntegrity(EncodedBody, Index, K1, K2, K3)
+local function ComputeConstantIntegrity(EncodedBody, Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3)
     local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
-    local Hash = (BitXOR(Keyed, __IB2_DOMAIN_CONSTANT_INTEGRITY__) * 31 + Index) % 4294967296;
+    local Hash = (BitXOR(BitXOR(BitXOR(Keyed, __IB2_DOMAIN_CONSTANT_INTEGRITY__), EntryState), CurrentChunkState) * 31 + BlockStart) % 4294967296;
+    Hash = (Hash * 31 + Index) % 4294967296;
     Hash = (Hash * 31 + #EncodedBody) % 4294967296;
     for I = 1, #EncodedBody do Hash = (Hash * 31 + Byte(EncodedBody, I, I)) % 4294967296; end;
     return Hash;
+end;
+
+local function InstructionDigest(Record, Index, K1, K2, K3)
+    local Hash = (BitXOR(__IB2_DOMAIN_INSTRUCTION_STATE__, Index) * 31 + K1) % 4294967296;
+    Hash = (Hash * 31 + K2) % 4294967296;
+    Hash = (Hash * 31 + K3) % 4294967296;
+    Hash = (Hash * 31 + #Record) % 4294967296;
+    for I = 1, #Record do Hash = (Hash * 31 + Byte(Record, I, I)) % 4294967296; end;
+    return Hash;
+end;
+
+local function BeginInstructionState(CurrentChunkState, EntryState, BlockStart, BlockTag, K1, K2, K3)
+    local Value = (U32Mul(CurrentChunkState, 22695477) + U32Mul(EntryState, 1664525)
+        + BlockStart * 65537 + BlockTag + K1 * 251 + K2 * 17 + K3
+        + __IB2_DOMAIN_INSTRUCTION_STATE__ + PayloadAttestation) % 4294967296;
+    return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
+end;
+
+local function AdvanceInstructionState(State, Digest, Index, CurrentChunkState, EntryState)
+    local Value = (U32Mul(State, 1664525) + Digest + Index * 65537
+        + U32Mul(CurrentChunkState, 257) + EntryState
+        + __IB2_DOMAIN_INSTRUCTION_STATE__ + PayloadAttestation) % 4294967296;
+    return (U32Mul(Value, 22695477) + 1) % 4294967296;
+end;
+
+local function InstructionStateSeal(State, Index, CurrentChunkState, EntryState, BlockTag)
+    local Value = (U32Mul(State, 22695477) + Index * 257 + CurrentChunkState
+        + U32Mul(EntryState, 1664525) + BlockTag
+        + __IB2_DOMAIN_INSTRUCTION_STATE__ + PayloadAttestation) % 4294967296;
+    return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
 end;
 
 local function BeginPrototypeIntegrity(Length, K1, K2, K3)
@@ -508,7 +541,7 @@ local function BeginPrototypeIntegrity(Length, K1, K2, K3)
     ActivePrototypeHash = Hash;
 end;
 
-local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteToken, References, ConstCapsules, Verifier, SuccessorRecords, K1, K2, K3)
+local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteToken, References, Verifier, SuccessorRecords, K1, K2, K3)
     local Hash = (BitXOR(BitXOR(EntryState, __IB2_DOMAIN_BLOCK_INTEGRITY__), OuterSeed) * 31 + BlockStart) % 4294967296;
     Hash = (Hash * 31 + Count) % 4294967296;
     Hash = (Hash * 31 + K1) % 4294967296;
@@ -517,12 +550,7 @@ local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteT
     Hash = (Hash * 31 + RouteToken) % 4294967296;
     Hash = (Hash * 31 + #References) % 4294967296;
     for ReferenceIndex = 1, #References do
-        local Index = References[ReferenceIndex];
-        local Capsule = ConstCapsules[Index];
-        if type(Capsule) ~= 'string' then error('invalid protected payload', 0); end;
-        Hash = (Hash * 31 + Index) % 4294967296;
-        Hash = (Hash * 31 + #Capsule) % 4294967296;
-        for I = 1, #Capsule do Hash = (Hash * 31 + Byte(Capsule, I, I)) % 4294967296; end;
+        Hash = (Hash * 31 + References[ReferenceIndex]) % 4294967296;
     end;
     Hash = (Hash * 31 + Verifier) % 4294967296;
     Hash = (Hash * 31 + #SuccessorRecords) % 4294967296;
@@ -573,6 +601,26 @@ local function DeriveBlockPermutation(Count, EntryState, K1, K2, K3, Domain)
     return Values;
 end;
 
+local function DeriveCodeDataPermutation(InstructionCount, ConstantCount, StateValue, K1, K2, K3, Domain)
+    local Values = DeriveBlockPermutation(InstructionCount + ConstantCount, StateValue, K1, K2, K3, Domain);
+    if InstructionCount == 0 or ConstantCount == 0 or #Values <= 2 then return Values; end;
+    local SawData = Values[1] >= InstructionCount;
+    local Interleaved = 0;
+    local TargetSlot = 0;
+    for PhysicalSlot = 2, #Values do
+        local StateValue = Values[PhysicalSlot] >= InstructionCount;
+        if StateValue ~= SawData then
+            Interleaved = Interleaved + 1;
+            if TargetSlot == 0 then TargetSlot = PhysicalSlot; end;
+        end;
+        SawData = StateValue;
+    end;
+    if Interleaved < 2 then
+        Values[TargetSlot - 1], Values[TargetSlot] = Values[TargetSlot], Values[TargetSlot - 1];
+    end;
+    return Values;
+end;
+
 local function Deserialize()
     local PrototypeLength = ActiveSourceLength;
     ActivePrototypeHash = nil;
@@ -591,8 +639,8 @@ local function Deserialize()
     Chunk[5], Chunk[6], Chunk[7] = K1, K2, K3;
     local OpcodeBank = DerivePermutation(__IB2_OPCODE_COUNT__, K1, K2, K3, __IB2_DOMAIN_OPCODE_PERMUTATION__);
     Chunk[8] = OpcodeBank;
-    local ConstCapsules = {};
-    Chunk[15] = ConstCapsules;
+    local ConstCount = 0;
+    Chunk[15] = ConstCount;
     local InstrCount = 0;
     local Blocks = {};
     local BlockMap = {};

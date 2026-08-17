@@ -26,6 +26,7 @@ namespace IronBrew2.Obfuscator
 		public uint BlockIntegrityDomain { get; }
 		public uint FlowDomain { get; }
 		public uint ChunkStateDomain { get; }
+		public uint InstructionStateDomain { get; }
 		public uint EnvelopeIntegrityDomain { get; }
 		public uint EntropyDigestDomain { get; }
 		public uint EnvelopeMaskDomain { get; }
@@ -36,6 +37,7 @@ namespace IronBrew2.Obfuscator
 		public uint SchemaPermutationDomain { get; }
 		public uint ConstantTagPermutationDomain { get; }
 		public uint BlockColumnDomain { get; }
+		public uint CodeDataPermutationDomain { get; }
 		public uint BlockFieldStride { get; }
 		public ushort FlowVerifierMask { get; }
 		public byte EntropyRecordKind { get; }
@@ -49,6 +51,7 @@ namespace IronBrew2.Obfuscator
 			BlockIntegrityDomain = NextWord(random, used);
 			FlowDomain = NextWord(random, used);
 			ChunkStateDomain = NextWord(random, used);
+			InstructionStateDomain = NextWord(random, used);
 			EnvelopeIntegrityDomain = NextWord(random, used);
 			EntropyDigestDomain = NextWord(random, used);
 			EnvelopeMaskDomain = NextWord(random, used);
@@ -64,6 +67,7 @@ namespace IronBrew2.Obfuscator
 			SchemaPermutationDomain = NextEffectiveWord(random, used, effectiveWords);
 			ConstantTagPermutationDomain = NextEffectiveWord(random, used, effectiveWords);
 			BlockColumnDomain = NextEffectiveWord(random, used, effectiveWords);
+			CodeDataPermutationDomain = NextEffectiveWord(random, used, effectiveWords);
 			// An odd non-zero stride avoids short slot-mask cycles modulo 2^16.
 			BlockFieldStride = NextEffectiveWord(random, used, effectiveWords, true);
 

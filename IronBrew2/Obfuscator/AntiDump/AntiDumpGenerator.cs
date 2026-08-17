@@ -132,6 +132,8 @@ local function GuardDecoy(...)
             int probeJitter = Math.Max(5, probeInterval / 3);
             int heavyPeriod = 3 + (int)(decoySeed % 3);
             uint sealSalt = (decoySeed ^ 0x6E624EB7u) % 2147483647u;
+            uint payloadSealSalt = unchecked(decoySeed ^ (uint)random.NextInt64(1, 1L << 32));
+            uint payloadStateSalt = unchecked(attestationToken ^ (uint)random.NextInt64(1, 1L << 32));
             uint constantExpected = (uint)random.Next(1000000, 1000000000);
             uint upvalueExpected = (uint)random.Next(1000000, 1000000000);
             uint upvalueChanged = (uint)random.Next(1000000, 1000000000);
@@ -217,6 +219,9 @@ local GuardTripped = false;
 local GuardAttested = false;
 local GuardReportOnly = __IB2_REPORT_ONLY__;
 local GuardFaultWord = 0;
+local GuardPayloadState = 0;
+local GuardPayloadSeal = 0;
+local GuardPayloadActive = false;
 local GuardUpvalue = __IB2_UPVALUE_EXPECTED__;
 
 local function GuardReject()
@@ -230,6 +235,8 @@ local function GuardReject()
     -- environment contract corrupts its next authenticated state transition.
     GuardFaultWord = __IB2_FAULT_WORD__;
     GuardAttestation = 0;
+    GuardPayloadState = (GuardPayloadState + GuardFaultWord) % 2147483647;
+    GuardPayloadSeal = 0;
     return true;
 end;
 
@@ -451,9 +458,43 @@ end;
 
 __IB2_DECOY_GRAPH__
 
+local function GuardPayloadExpectedSeal()
+    local GuardPayloadLow = GuardPayloadState % 65536;
+    local GuardPayloadHigh = (GuardPayloadState - GuardPayloadLow) / 65536;
+    return (GuardPayloadLow * 65599 + GuardPayloadHigh * 257
+        + GuardState * 4099 + GuardSeal + GuardAttestation + __IB2_PAYLOAD_SEAL_SALT__) % 2147483647;
+end;
+
+local function GuardBindPayload(GuardVMState, GuardChunkState, GuardEntryState, GuardInstructionPoint)
+    if GuardTripped then return GuardReject(); end;
+    if GuardSeal ~= (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647 then
+        return GuardReject();
+    end;
+    if GuardPayloadActive and GuardPayloadSeal ~= GuardPayloadExpectedSeal() then return GuardReject(); end;
+    local GuardVMLow = GuardVMState % 65536;
+    local GuardVMHigh = (GuardVMState - GuardVMLow) / 65536;
+    local GuardChunkLow = GuardChunkState % 65536;
+    local GuardChunkHigh = (GuardChunkState - GuardChunkLow) / 65536;
+    local GuardEntryLow = GuardEntryState % 65536;
+    local GuardEntryHigh = (GuardEntryState - GuardEntryLow) / 65536;
+    GuardPayloadState = (GuardPayloadState * 4093 + GuardVMLow * 257 + GuardVMHigh * 17
+        + GuardChunkLow * 251 + GuardChunkHigh * 29 + GuardEntryLow * 13 + GuardEntryHigh * 7
+        + GuardInstructionPoint * 31 + GuardState + GuardAttestation + __IB2_PAYLOAD_STATE_SALT__) % 2147483647;
+    GuardPayloadState = GuardBXor(GuardPayloadState,
+        (GuardVMState % 2147483648 + GuardChunkState % 2147483648) % 2147483648) % 2147483647;
+    GuardPayloadActive = true;
+    -- Payload execution changes GuardState, and the new GuardState immediately
+    -- reseals payload state. Periodic probes perform the inverse update below.
+    GuardState = (GuardState + GuardPayloadState % 65521 + GuardInstructionPoint * 17 + GuardEpoch) % 2147483647;
+    GuardSeal = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
+    GuardPayloadSeal = GuardPayloadExpectedSeal();
+    return false;
+end;
+
 local function GuardProbe(Force)
     GuardCounter = GuardCounter + 1;
     if GuardTripped then return GuardReject(); end;
+    if GuardPayloadActive and GuardPayloadSeal ~= GuardPayloadExpectedSeal() then return GuardReject(); end;
     if not Force and GuardCounter < GuardNextProbe then return false; end;
     if GuardSeal ~= (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647 then
         return GuardReject();
@@ -477,6 +518,7 @@ local function GuardProbe(Force)
 
     GuardState = (GuardState * 48271 + GuardCounter + GuardEpoch * 17 + GuardAttestation % 65521) % 2147483647;
     GuardSeal = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
+    if GuardPayloadActive then GuardPayloadSeal = GuardPayloadExpectedSeal(); end;
     GuardNextProbe = GuardCounter + __IB2_GUARD_INTERVAL__ + (GuardState % __IB2_GUARD_JITTER__);
     return false;
 end;
@@ -491,6 +533,8 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__IB2_HEAVY_PERIOD__"] = heavyPeriod.ToString(),
                 ["__IB2_DECOY_SEED__"] = decoySeed.ToString(),
                 ["__IB2_SEAL_SALT__"] = sealSalt.ToString(),
+                ["__IB2_PAYLOAD_SEAL_SALT__"] = payloadSealSalt.ToString(),
+                ["__IB2_PAYLOAD_STATE_SALT__"] = payloadStateSalt.ToString(),
                 ["__IB2_CONSTANT_EXPECTED__"] = constantExpected.ToString(),
                 ["__IB2_UPVALUE_EXPECTED__"] = upvalueExpected.ToString(),
                 ["__IB2_UPVALUE_CHANGED__"] = upvalueChanged.ToString(),

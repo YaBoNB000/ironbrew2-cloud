@@ -757,12 +757,14 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"gBit","Instrs","Functions","Lines","Consts","ConstCapsules","Capsule","Instr","Proto","Params","Top","Vararg","Args",
 				"PCount","Lupvals","Stk","Inst","Enum","Chunk","decompress","Pos","Xs","Xd","_R","Env",
 				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2","K3","OpcodeKey","FieldKey","FieldKey32","U32","U32Mul",
-				"DerivePermutation","DeriveBlockPermutation","Count","Domain","Values","State","Identity","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank",
+				"DerivePermutation","DeriveBlockPermutation","DeriveCodeDataPermutation","Count","Domain","Values","State","Identity","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank","InstructionCount","ConstantCount","StateValue","SawData","Interleaved",
 				"Columns","ColumnOrder","ColumnPositions","ColumnRead8","ColumnRead16","ColumnRead32","ColumnData","ColumnPosition","PhysicalSlot","Role",
+				"Body","BodyPosition","FragmentCount","FragmentOrder","FragmentSpans","LogicalSlot","MinimumLength","ReadFragment","TargetSlot","Record","ReferenceSlots",
 				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","StoredTag","EncodedBody","RawParts","Raw","Cons","PreviousReference","Reference",
 				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root","Blocks","BlockMap",
 				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
-				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier",
+				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier","CurrentChunkState",
+				"InstructionDigest","BeginInstructionState","AdvanceInstructionState","InstructionStateSeal","PreviousInstructionState","CurrentInstructionState","CurrentInstructionSeal","Digest",
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
 				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
@@ -771,6 +773,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardEnvironmentRead","GuardGetGenV",
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
 				"GuardEpoch","GuardState","GuardSeal","GuardTripped","GuardFaultWord","GuardLuaProbe","GuardProbeValue","GuardFunction",
+				"GuardPayloadState","GuardPayloadSeal","GuardPayloadActive","GuardPayloadExpectedSeal","GuardBindPayload","GuardPayloadLow","GuardPayloadHigh",
+				"GuardVMState","GuardChunkState","GuardEntryState","GuardInstructionPoint","GuardVMLow","GuardVMHigh","GuardChunkLow","GuardChunkHigh","GuardEntryLow","GuardEntryHigh",
 				"GuardProbe","Force","GuardScore","GuardHeavy",
 				"GuardCurrentIsC","GuardCurrentIsL","GuardNativeMisses","GuardOK1","GuardOK2","GuardOK3","GuardOK4",
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
@@ -1080,6 +1084,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					["__IB2_DOMAIN_BLOCK_INTEGRITY__"] = domains.BlockIntegrityDomain.ToString(),
 					["__IB2_DOMAIN_FLOW__"] = domains.FlowDomain.ToString(),
 					["__IB2_DOMAIN_CHUNK_STATE__"] = domains.ChunkStateDomain.ToString(),
+					["__IB2_DOMAIN_INSTRUCTION_STATE__"] = domains.InstructionStateDomain.ToString(),
 					["__IB2_DOMAIN_ENVELOPE_INTEGRITY__"] = domains.EnvelopeIntegrityDomain.ToString(),
 					["__IB2_DOMAIN_ENTROPY_DIGEST__"] = domains.EntropyDigestDomain.ToString(),
 					["__IB2_DOMAIN_ENVELOPE_MASK__"] = domains.EnvelopeMaskDomain.ToString(),
@@ -1090,6 +1095,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					["__IB2_DOMAIN_SCHEMA_PERMUTATION__"] = domains.SchemaPermutationDomain.ToString(),
 					["__IB2_DOMAIN_CONSTANT_TAG_PERMUTATION__"] = domains.ConstantTagPermutationDomain.ToString(),
 					["__IB2_DOMAIN_BLOCK_COLUMN__"] = domains.BlockColumnDomain.ToString(),
+					["__IB2_DOMAIN_CODE_DATA_PERMUTATION__"] = domains.CodeDataPermutationDomain.ToString(),
 					["__IB2_BLOCK_FIELD_STRIDE__"] = domains.BlockFieldStride.ToString(),
 					["__IB2_FLOW_VERIFIER_MASK__"] = domains.FlowVerifierMask.ToString(),
 					["__IB2_ENTROPY_RECORD_KIND__"] = domains.EntropyRecordKind.ToString(),
@@ -1355,12 +1361,8 @@ local ToNumber = tonumber;");
 	    if (Step == 0) then
 	        Chunk[3] = gBits8();
 	    elseif (Step == 1) then
-	        local ConstCount = gBits32();
-	        for Idx = 1, ConstCount do
-	            local Length = gBits32();
-	            if Length < 5 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
-	            ConstCapsules[Idx] = SourceReadBytes(Length);
-	        end;
+	        ConstCount = gBits32();
+	        Chunk[15] = ConstCount;
 	    elseif (Step == 2) then
         InstrCount = gBits32();
         BlockCount = gBits32();
@@ -1399,7 +1401,7 @@ local ToNumber = tonumber;");
 	                PreviousSuccessor = SuccessorStart;
 	            end;
 	            local Length = gBits32();
-	            if Length < 21 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
+	            if Length < 25 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
 	            local Block = {};
 	            Block[1] = BlockStart;
 	            Block[2] = Count;
@@ -1450,7 +1452,7 @@ local ToNumber = tonumber;");
 	    local Block = Blocks[BlockIndex];
 	    local References = Block[4];
 	    for ReferenceIndex = 1, #References do
-	        if type(ConstCapsules[References[ReferenceIndex]]) ~= 'string' then error('invalid protected payload', 0); end;
+	        if References[ReferenceIndex] > ConstCount then error('invalid protected payload', 0); end;
 	    end;
 	    local SuccessorRecords = Block[9];
 	    for SuccessorIndex = 1, #SuccessorRecords do
@@ -1477,14 +1479,14 @@ local function GetProto(Proto, Index)
     return Encoded;
 end;
 
-local function DecodeConstantCapsule(Capsule, Index, K1, K2, K3, ConstTags)
+local function DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3, ConstTags)
     local SavedByteString, SavedPos = ByteString, Pos;
     local SavedSourceLength, SavedSourceMode = ActiveSourceLength, SourceIsPaged;
     ByteString, Pos, ActiveSourceLength, SourceIsPaged = Capsule, 1, #Capsule, false;
     local StoredTag = gBits32();
     local EncodedBody = Sub(Capsule, 5);
-    if ComputeConstantIntegrity(EncodedBody, Index, K1, K2, K3) ~= StoredTag then error('invalid protected payload', 0); end;
-    local State = ConstantMaskState(Index, K1, K2, K3);
+    if ComputeConstantIntegrity(EncodedBody, Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3) ~= StoredTag then error('invalid protected payload', 0); end;
+    local State = ConstantMaskState(Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3);
     local RawParts = {};
     for I = 1, #EncodedBody do
         local Mask = (State - State % 16777216) / 16777216;
@@ -1492,6 +1494,7 @@ local function DecodeConstantCapsule(Capsule, Index, K1, K2, K3, ConstTags)
         State = (State * 1664525 + 1013904223) % 4294967296;
     end;
     local Raw = Concat(RawParts);
+    RawParts, EncodedBody = nil, nil;
     ByteString, Pos, ActiveSourceLength, SourceIsPaged = Raw, 1, #Raw, false;
     local Type = gBits8();
     local Cons;
@@ -1512,42 +1515,71 @@ local function DecodeConstantCapsule(Capsule, Index, K1, K2, K3, ConstTags)
         error('invalid protected payload', 0);
     end;
     if Pos ~= #Raw + 1 then error('invalid protected payload', 0); end;
+    Raw = nil;
     ByteString, Pos, ActiveSourceLength, SourceIsPaged = SavedByteString, SavedPos, SavedSourceLength, SavedSourceMode;
     return Cons;
 end;
 
-local function DecodeInstructionBlock(Chunk, Block, EntryState, TargetIndex)
-    local SavedByteString, SavedPos = ByteString, Pos;
-    local SavedSourceLength, SavedSourceMode = ActiveSourceLength, SourceIsPaged;
+local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkState, TargetIndex)
     local K1, K2, K3 = Chunk[5], Chunk[6], Chunk[7];
     local References = Block[4];
-    local ConstCapsules = Chunk[15];
-    if ComputeBlockIntegrity(Block[3], EntryState, Block[1], Block[2], Block[8], References, ConstCapsules, Block[6], Block[9], K1, K2, K3) ~= Block[7] then
+    local Body = Block[3];
+    if ComputeBlockIntegrity(Body, EntryState, Block[1], Block[2], Block[8], References, Block[6], Block[9], K1, K2, K3) ~= Block[7] then
         error('invalid protected payload', 0);
     end;
-    local ConstTags = DerivePermutation(4, K1, K2, K3, __IB2_DOMAIN_CONSTANT_TAG_PERMUTATION__);
-    local ReferencedConstants = {};
-    for ReferenceIndex = 1, #References do ReferencedConstants[References[ReferenceIndex]] = true; end;
-    local function ResolveConstant(Index)
-        if not ReferencedConstants[Index] then error('invalid protected payload', 0); end;
-        return DecodeConstantCapsule(ConstCapsules[Index], Index, K1, K2, K3, ConstTags);
+
+    -- Scan only the authenticated top-level framing. Logical instruction windows
+    -- and block-local constant capsules share one state-permuted physical stream.
+    local FragmentCount = Block[2] + #References;
+    local FragmentOrder = DeriveCodeDataPermutation(Block[2], #References, U32(BitXOR(EntryState, CurrentChunkState)),
+        K1, K2, K3, __IB2_DOMAIN_CODE_DATA_PERMUTATION__);
+    local FragmentSpans = {};
+    local BodyPosition = 1;
+    for PhysicalSlot = 1, FragmentCount do
+        if BodyPosition + 3 > #Body then error('invalid protected payload', 0); end;
+        local Length = Byte(Body, BodyPosition, BodyPosition) + Byte(Body, BodyPosition + 1, BodyPosition + 1) * 256
+            + Byte(Body, BodyPosition + 2, BodyPosition + 2) * 65536 + Byte(Body, BodyPosition + 3, BodyPosition + 3) * 16777216;
+        BodyPosition = BodyPosition + 4;
+        local LogicalSlot = FragmentOrder[PhysicalSlot] + 1;
+        local MinimumLength = LogicalSlot <= Block[2] and 21 or 5;
+        if Length < MinimumLength or BodyPosition + Length - 1 > #Body or FragmentSpans[LogicalSlot] then
+            error('invalid protected payload', 0);
+        end;
+        FragmentSpans[LogicalSlot] = {BodyPosition, Length};
+        BodyPosition = BodyPosition + Length;
     end;
-    -- Authenticate first, then split all five length-framed physical pages and
-    -- recover their logical descriptor/opcode/A/B/C roles from this block's state.
-    ByteString, Pos, ActiveSourceLength, SourceIsPaged = Block[3], 1, #Block[3], false;
+    if BodyPosition ~= #Body + 1 then error('invalid protected payload', 0); end;
+
+    local function ReadFragment(LogicalSlot)
+        local Span = FragmentSpans[LogicalSlot];
+        if not Span then error('invalid protected payload', 0); end;
+        return Sub(Body, Span[1], Span[1] + Span[2] - 1);
+    end;
+
+    local TargetSlot = TargetIndex - Block[1] + 1;
+    if TargetSlot < 1 or TargetSlot > Block[2] then error('invalid protected payload', 0); end;
+    local Record = ReadFragment(TargetSlot);
+    local Digest = InstructionDigest(Record, TargetIndex, K1, K2, K3);
+
+    -- Parse just the requested instruction record. Five field roles remain
+    -- independently framed and state-permuted, but no block-wide columns or
+    -- instruction array are materialized.
+    local SavedByteString, SavedPos = ByteString, Pos;
+    local SavedSourceLength, SavedSourceMode = ActiveSourceLength, SourceIsPaged;
+    ByteString, Pos, ActiveSourceLength, SourceIsPaged = Record, 1, #Record, false;
     local ColumnOrder = DeriveBlockPermutation(5, EntryState, K1, K2, K3, __IB2_DOMAIN_BLOCK_COLUMN__);
     local Columns = {};
     for PhysicalSlot = 1, 5 do
-        if Pos + 3 > #ByteString then error('invalid protected payload', 0); end;
+        if Pos + 3 > #Record then error('invalid protected payload', 0); end;
         local Length = gBits32();
-        if Length > #ByteString - Pos + 1 then error('invalid protected payload', 0); end;
+        if Pos + Length - 1 > #Record then error('invalid protected payload', 0); end;
         local Role = ColumnOrder[PhysicalSlot] + 1;
         if Columns[Role] ~= nil then error('invalid protected payload', 0); end;
-        Columns[Role] = Sub(ByteString, Pos, Pos + Length - 1);
-        Pos = Pos + Length;
+        Columns[Role] = SourceReadBytes(Length);
     end;
-    if Pos ~= #ByteString + 1 then error('invalid protected payload', 0); end;
+    if Pos ~= #Record + 1 then error('invalid protected payload', 0); end;
     ByteString, Pos, ActiveSourceLength, SourceIsPaged = SavedByteString, SavedPos, SavedSourceLength, SavedSourceMode;
+    Record = nil;
 
     local ColumnPositions = {1, 1, 1, 1, 1};
     local function ColumnRead8(Role)
@@ -1573,48 +1605,57 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, TargetIndex)
                Byte(ColumnData, ColumnPosition + 2, ColumnPosition + 2) * 65536 + Byte(ColumnData, ColumnPosition + 3, ColumnPosition + 3) * 16777216;
     end;
 
-    __IB2_DECODE_TARGET__
-    for Offset = 0, Block[2] - 1 do
-        local Index = Block[1] + Offset;
-        local Descriptor = BitXOR(ColumnRead8(1), BlockFieldKey(EntryState, Index, 7, K1, K2, K3) % 256);
-        if Descriptor >= 64 then error('invalid protected payload', 0); end;
-        if (gBit(Descriptor, 1, 1) == 0) then
-            local Type = gBit(Descriptor, 2, 3);
-            local Mask = gBit(Descriptor, 4, 6);
-            local Inst =
-            {
-                ColumnRead16(2),
-                BitXOR(BitXOR(ColumnRead16(3), FieldKey(Index, 1, K1, K2, K3)), BlockFieldKey(EntryState, Index, 1, K1, K2, K3)),
-                nil,
-                nil
-            };
+    local ReferenceSlots = {};
+    for ReferenceIndex = 1, #References do ReferenceSlots[References[ReferenceIndex]] = Block[2] + ReferenceIndex; end;
+    local ConstTags = DerivePermutation(4, K1, K2, K3, __IB2_DOMAIN_CONSTANT_TAG_PERMUTATION__);
+    local function ResolveConstant(Index)
+        local LogicalSlot = ReferenceSlots[Index];
+        if not LogicalSlot then error('invalid protected payload', 0); end;
+        local Capsule = ReadFragment(LogicalSlot);
+        local Value = DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkState, Block[1], K1, K2, K3, ConstTags);
+        Capsule = nil;
+        return Value;
+    end;
 
-            if (Type == 0) then
-                Inst[OP_B] = BitXOR(BitXOR(ColumnRead16(4), FieldKey(Index, 2, K1, K2, K3)), BlockFieldKey(EntryState, Index, 2, K1, K2, K3));
-                Inst[OP_C] = BitXOR(BitXOR(ColumnRead16(5), FieldKey(Index, 3, K1, K2, K3)), BlockFieldKey(EntryState, Index, 3, K1, K2, K3));
-            elseif (Type == 1) then
-                Inst[OP_B] = U32(BitXOR(BitXOR(ColumnRead32(4), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3)));
-            elseif (Type == 2) then
-                Inst[OP_B] = U32(BitXOR(BitXOR(ColumnRead32(4), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3))) - (2 ^ 16);
-            elseif (Type == 3) then
-                Inst[OP_B] = U32(BitXOR(BitXOR(ColumnRead32(4), FieldKey32(Index, 2, K1, K2, K3)), BlockFieldKey32(EntryState, Index, 2, K1, K2, K3))) - (2 ^ 16);
-                Inst[OP_C] = BitXOR(BitXOR(ColumnRead16(5), FieldKey(Index, 3, K1, K2, K3)), BlockFieldKey(EntryState, Index, 3, K1, K2, K3));
-            end;
+    local Descriptor = BitXOR(ColumnRead8(1), BlockFieldKey(EntryState, TargetIndex, 7, K1, K2, K3) % 256);
+    if Descriptor >= 64 then error('invalid protected payload', 0); end;
+    local Inst;
+    if (gBit(Descriptor, 1, 1) == 0) then
+        local Type = gBit(Descriptor, 2, 3);
+        local Mask = gBit(Descriptor, 4, 6);
+        Inst =
+        {
+            ColumnRead16(2),
+            BitXOR(BitXOR(ColumnRead16(3), FieldKey(TargetIndex, 1, K1, K2, K3)), BlockFieldKey(EntryState, TargetIndex, 1, K1, K2, K3)),
+            nil,
+            nil
+        };
 
-            if __IB2_CAPTURE_CONDITION__ then
-                if gBit(Mask, 1, 1) == 1 then Inst[OP_A] = ResolveConstant(Inst[OP_A]); end;
-                if gBit(Mask, 2, 2) == 1 then Inst[OP_B] = ResolveConstant(Inst[OP_B]); end;
-                if gBit(Mask, 3, 3) == 1 then Inst[OP_C] = ResolveConstant(Inst[OP_C]); end;
-                __IB2_STORE_INSTRUCTION__
-            end;
-        elseif Descriptor ~= 1 then
-            error('invalid protected payload', 0);
+        if (Type == 0) then
+            Inst[OP_B] = BitXOR(BitXOR(ColumnRead16(4), FieldKey(TargetIndex, 2, K1, K2, K3)), BlockFieldKey(EntryState, TargetIndex, 2, K1, K2, K3));
+            Inst[OP_C] = BitXOR(BitXOR(ColumnRead16(5), FieldKey(TargetIndex, 3, K1, K2, K3)), BlockFieldKey(EntryState, TargetIndex, 3, K1, K2, K3));
+        elseif (Type == 1) then
+            Inst[OP_B] = U32(BitXOR(BitXOR(ColumnRead32(4), FieldKey32(TargetIndex, 2, K1, K2, K3)), BlockFieldKey32(EntryState, TargetIndex, 2, K1, K2, K3)));
+        elseif (Type == 2) then
+            Inst[OP_B] = U32(BitXOR(BitXOR(ColumnRead32(4), FieldKey32(TargetIndex, 2, K1, K2, K3)), BlockFieldKey32(EntryState, TargetIndex, 2, K1, K2, K3))) - (2 ^ 16);
+        elseif (Type == 3) then
+            Inst[OP_B] = U32(BitXOR(BitXOR(ColumnRead32(4), FieldKey32(TargetIndex, 2, K1, K2, K3)), BlockFieldKey32(EntryState, TargetIndex, 2, K1, K2, K3))) - (2 ^ 16);
+            Inst[OP_C] = BitXOR(BitXOR(ColumnRead16(5), FieldKey(TargetIndex, 3, K1, K2, K3)), BlockFieldKey(EntryState, TargetIndex, 3, K1, K2, K3));
         end;
+
+        if gBit(Mask, 1, 1) == 1 then Inst[OP_A] = ResolveConstant(Inst[OP_A]); end;
+        if gBit(Mask, 2, 2) == 1 then Inst[OP_B] = ResolveConstant(Inst[OP_B]); end;
+        if gBit(Mask, 3, 3) == 1 then Inst[OP_C] = ResolveConstant(Inst[OP_C]); end;
+    elseif Descriptor == 1 then
+        Inst = {nil, nil, nil, nil};
+    else
+        error('invalid protected payload', 0);
     end;
     for Role = 1, 5 do
         if type(Columns[Role]) ~= 'string' or ColumnPositions[Role] ~= #Columns[Role] + 1 then error('invalid protected payload', 0); end;
     end;
-    __IB2_DECODE_FINALIZE__
+    Columns, FragmentSpans, Body = nil, nil, nil;
+    return Inst, Digest;
 end;
 
 local function GetInstruction(Chunk, Index, Flow)
@@ -1627,36 +1668,54 @@ local function GetInstruction(Chunk, Index, Flow)
     local FlowCache = Flow[4];
     local EntryState;
     local CurrentChunkState;
+    local PreviousInstructionState;
     if not CurrentBlock then
         if Index ~= 1 then error('invalid protected payload', 0); end;
         __IB2_FIRST_BLOCK_CHECK__
         EntryState = U32(BitXOR(Chunk[12], InitialFlowKey(Chunk[5], Chunk[6], Chunk[7])));
         CurrentChunkState = U32(BitXOR(Chunk[16], InitialChunkKey(Chunk[5], Chunk[6], Chunk[7])));
+        PreviousInstructionState = BeginInstructionState(CurrentChunkState, EntryState, Block[1], Block[7], Chunk[5], Chunk[6], Chunk[7]);
     elseif CurrentBlock ~= Block or Index ~= LastIndex + 1 then
         if Index ~= Block[1] or not FlowCache or FlowCache[1] ~= CurrentBlock
-        or FlowCache[2] ~= Flow[3] then error('invalid protected payload', 0); end;
+        or FlowCache[2] ~= Flow[3]
+        or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5] then
+            error('invalid protected payload', 0);
+        end;
         local WrappedState = CurrentBlock[5][Block[1]];
         local WrappedChunkState = CurrentBlock[10][Block[1]];
         if not WrappedState or not WrappedChunkState then error('invalid protected payload', 0); end;
         EntryState = U32(BitXOR(WrappedState, FlowKey(Flow[3], LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
         CurrentChunkState = U32(BitXOR(WrappedChunkState, ChunkChainKey(
             FlowCache[3], Flow[3], LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
+        PreviousInstructionState = BeginInstructionState(CurrentChunkState, EntryState, Block[1], Block[7], Chunk[5], Chunk[6], Chunk[7]);
     else
-        if not FlowCache or FlowCache[1] ~= CurrentBlock or FlowCache[2] ~= Flow[3] then error('invalid protected payload', 0); end;
+        if not FlowCache or FlowCache[1] ~= CurrentBlock or FlowCache[2] ~= Flow[3]
+        or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5] then
+            error('invalid protected payload', 0);
+        end;
         EntryState = Flow[3];
         CurrentChunkState = FlowCache[3];
+        PreviousInstructionState = FlowCache[4];
     end;
 
     if FlowVerifier(EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]) ~= Block[6]
     or ChunkState(EntryState, Block[1], Block[2], Chunk[5], Chunk[6], Chunk[7]) ~= CurrentChunkState then
         error('invalid protected payload', 0);
     end;
-    FlowCache = {};
-    FlowCache[1], FlowCache[2], FlowCache[3] = Block, EntryState, CurrentChunkState;
-    Flow[1], Flow[2], Flow[3], Flow[4] = Index, Block, EntryState, FlowCache;
 
-    __IB2_INSTRUCTION_LOOKUP__
+    local Inst, Digest = DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkState, Index);
+    local CurrentInstructionState = AdvanceInstructionState(
+        PreviousInstructionState, Digest, Index, CurrentChunkState, EntryState);
+    local CurrentInstructionSeal = InstructionStateSeal(
+        CurrentInstructionState, Index, CurrentChunkState, EntryState, Block[7]);
+    FlowCache = {};
+    FlowCache[1], FlowCache[2], FlowCache[3], FlowCache[4], FlowCache[5] =
+        Block, EntryState, CurrentChunkState, CurrentInstructionState, CurrentInstructionSeal;
+    Flow[1], Flow[2], Flow[3], Flow[4] = Index, Block, EntryState, FlowCache;
+    __IB2_GUARD_BIND__
+    return Inst;
 end;
+
 
 -- For selected prototypes InstrPoint is a random route token at every basic-
 -- block boundary. Sequential execution remains linear only inside one block.
@@ -1685,25 +1744,18 @@ end;";
 
 			if (settings.AntiDump)
 			{
-				// Strict mode parses every authenticated column stream but retains only
-				// the requested instruction. Constants are opened only for that instruction.
+				// Fetch authenticates the opaque block, parses one instruction window,
+				// opens only its referenced constants, then binds the resulting state into
+				// the live GuardState/GuardSeal chain before opcode execution.
 				blockRuntime = blockRuntime
-					.Replace("__IB2_DECODE_TARGET__", "local TargetInstruction;")
-					.Replace("__IB2_CAPTURE_CONDITION__", "Index == TargetIndex")
-					.Replace("__IB2_STORE_INSTRUCTION__", "TargetInstruction = Inst;")
-					.Replace("__IB2_DECODE_FINALIZE__", "if not TargetInstruction then error('invalid protected payload', 0); end; return TargetInstruction;")
-					.Replace("__IB2_FIRST_BLOCK_CHECK__", "if GuardProbe(true) then Chunk[2], Chunk[15], Flow[4] = {}, {}, nil; return GuardDecoy(); end;")
-					.Replace("__IB2_INSTRUCTION_LOOKUP__", "return DecodeInstructionBlock(Chunk, Block, EntryState, Index);");
+					.Replace("__IB2_FIRST_BLOCK_CHECK__", "if GuardProbe(true) then Chunk[2], Chunk[15], Flow[4] = {}, 0, nil; return GuardDecoy(); end;")
+					.Replace("__IB2_GUARD_BIND__", "if GuardBindPayload(CurrentInstructionState, CurrentChunkState, EntryState, Index) then return GuardDecoy(); end;");
 			}
 			else
 			{
 				blockRuntime = blockRuntime
-					.Replace("__IB2_DECODE_TARGET__", "local Instrs = Chunk[1];")
-					.Replace("__IB2_CAPTURE_CONDITION__", "true")
-					.Replace("__IB2_STORE_INSTRUCTION__", "Instrs[Index] = Inst;")
-					.Replace("__IB2_DECODE_FINALIZE__", "Block[3], Block[4], Block[7], Block[9] = nil, nil, nil, nil; Chunk[11] = Chunk[11] - 1; if Chunk[11] == 0 then Chunk[9], Chunk[15] = nil, nil; end;")
 					.Replace("__IB2_FIRST_BLOCK_CHECK__", "")
-					.Replace("__IB2_INSTRUCTION_LOOKUP__", "local Inst = Chunk[1][Index]; if Inst then return Inst; end; DecodeInstructionBlock(Chunk, Block, EntryState, nil); Inst = Chunk[1][Index]; if not Inst then error('invalid protected payload', 0); end; return Inst;");
+					.Replace("__IB2_GUARD_BIND__", "");
 			}
 			vm += T(ApplyBuildDomains(blockRuntime));
 

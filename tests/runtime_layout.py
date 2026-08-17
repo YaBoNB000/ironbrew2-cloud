@@ -141,16 +141,17 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     opcode_count = int(opcode.group(2))
     chunk_map[8] = int(opcode.group(3))
 
-    # Constant capsules are initialized immediately before InstrCount/Blocks.
+    # The prototype-wide constant pool is gone: Chunk[15] stores only the
+    # declared constant count before InstrCount/Blocks are initialized.
     capsules = _expect(
-        rf"local\s+({IDENT})\s*=\s*\{{\}};\s*{re.escape(chunk)}\[(\d+)\]\s*=\s*\1;\s*"
+        rf"local\s+({IDENT})\s*=\s*0;\s*{re.escape(chunk)}\[(\d+)\]\s*=\s*\1;\s*"
         rf"local\s+{IDENT}\s*=\s*0;\s*local\s+({IDENT})\s*=\s*\{{\}};\s*"
         rf"local\s+({IDENT})\s*=\s*\{{\}};\s*local\s+({IDENT})\s*=\s*0;",
         source,
-        "could not recover Chunk capsule/block locals",
+        "could not recover Chunk constant-count/block locals",
     )
-    capsule_name, capsule_slot, blocks, block_map, block_count = capsules.group(1, 2, 3, 4, 5)
-    chunk_map[15] = int(capsule_slot)
+    constant_count_name, constant_count_slot, blocks, block_map, block_count = capsules.group(1, 2, 3, 4, 5)
+    chunk_map[15] = int(constant_count_slot)
     pair = _expect(
         rf"{re.escape(chunk)}\[(\d+)\]\s*,\s*{re.escape(chunk)}\[(\d+)\]\s*=\s*"
         rf"{re.escape(blocks)}\s*,\s*{re.escape(block_map)};",
@@ -220,25 +221,26 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         4: int(flow_match.group(5)),
     }
 
-    # FlowCache now authenticates the current block, entry state and chunk state;
-    # all three roles are assigned in one keyed tuple before it enters Flow.
+    # FlowCache authenticates source block, entry state, chunk state,
+    # instruction state and instruction seal as one randomized five-role tuple.
     cache_match = _expect(
         rf"(?:local\s+)?({IDENT})\s*=\s*\{{\}};\s*"
-        rf"\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*=\s*"
-        rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT};\s*"
+        rf"\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*"
+        rf"\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*=\s*"
+        rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT};\s*"
         rf"{re.escape(flow_name)}\[[^\]]+\]\s*,\s*{re.escape(flow_name)}\[[^\]]+\]\s*,\s*"
         rf"{re.escape(flow_name)}\[[^\]]+\]\s*,\s*{re.escape(flow_name)}\[{flow_map[4]}\]\s*=\s*"
         rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*\1;",
         source,
-        "could not recover keyed FlowCache chunk-state constructor",
+        "could not recover keyed five-role FlowCache constructor",
     )
     flow_cache_name = cache_match.group(1)
-    flow_cache_map = {1: int(cache_match.group(2)), 2: int(cache_match.group(3)), 3: int(cache_match.group(4))}
+    flow_cache_map = {index: int(cache_match.group(index + 1)) for index in range(1, 6)}
 
     _permutation(chunk_map, 16, "Chunk")
     _permutation(block_map_slots, 10, "Block")
     _permutation(flow_map, 4, "Flow")
-    _permutation(flow_cache_map, 3, "FlowCache")
+    _permutation(flow_cache_map, 5, "FlowCache")
 
     # Alias consistency checks cover parser and transition aliases. Opcode-handler
     # behavior is subsequently exercised by the differential suite.

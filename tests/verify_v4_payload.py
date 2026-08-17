@@ -33,6 +33,8 @@ OPCODE_PERMUTATION_DOMAIN = 0
 SCHEMA_DOMAIN = 0
 CONSTANT_TAG_DOMAIN = 0
 BLOCK_COLUMN_DOMAIN = 0
+CODE_DATA_PERMUTATION_DOMAIN = 0
+INSTRUCTION_STATE_DOMAIN = 0
 FLOW_VERIFIER_MASK = 0
 BLOCK_FIELD_STRIDE = 0
 ENTROPY_KIND = 0
@@ -50,6 +52,7 @@ def activate_domains(domains: BuildDomains) -> None:
     global ENVELOPE_INTEGRITY_DOMAIN, ENTROPY_DIGEST_DOMAIN, ENVELOPE_MASK_DOMAIN
     global CONSTANT_INTEGRITY_DOMAIN, CONSTANT_MASK_DOMAIN, PROTOTYPE_INTEGRITY_DOMAIN
     global OPCODE_PERMUTATION_DOMAIN, SCHEMA_DOMAIN, CONSTANT_TAG_DOMAIN, BLOCK_COLUMN_DOMAIN
+    global CODE_DATA_PERMUTATION_DOMAIN, INSTRUCTION_STATE_DOMAIN
     global FLOW_VERIFIER_MASK, BLOCK_FIELD_STRIDE, ENTROPY_KIND, DATA_KIND
     INTEGRITY_DOMAIN = domains.integrity
     BLOCK_INTEGRITY_DOMAIN = domains.block_integrity
@@ -65,6 +68,8 @@ def activate_domains(domains: BuildDomains) -> None:
     SCHEMA_DOMAIN = domains.schema_permutation
     CONSTANT_TAG_DOMAIN = domains.constant_tag_permutation
     BLOCK_COLUMN_DOMAIN = domains.block_column
+    CODE_DATA_PERMUTATION_DOMAIN = domains.code_data_permutation
+    INSTRUCTION_STATE_DOMAIN = domains.instruction_state
     FLOW_VERIFIER_MASK = domains.flow_verifier_mask
     BLOCK_FIELD_STRIDE = domains.block_field_stride
     ENTROPY_KIND = domains.entropy_record_kind
@@ -94,6 +99,10 @@ class Capsule:
     end: int
     tag_offset: int
     encoded_start: int
+    block_start: int
+    entry_state: int
+    chunk_state: int
+    logical_slot: int
 
 
 @dataclass
@@ -110,9 +119,14 @@ class Block:
     body_start: int
     body_end: int
     entry_state: int
-    column_order: list[int] = field(default_factory=list)
-    column_spans: dict[int, tuple[int, int]] = field(default_factory=dict)
+    fragment_order: list[int] = field(default_factory=list)
+    fragment_spans: dict[int, tuple[int, int, int]] = field(default_factory=dict)
+    record_column_orders: list[tuple[int, ...]] = field(default_factory=list)
+    record_column_spans: list[dict[int, tuple[int, int, int]]] = field(default_factory=list)
     descriptors: list[int] = field(default_factory=list)
+    capsules: dict[int, Capsule] = field(default_factory=dict)
+    final_instruction_state: int = 0
+    final_instruction_seal: int = 0
 
 
 @dataclass
@@ -126,6 +140,7 @@ class Prototype:
     binding: int
     parameter_offset: int | None = None
     instruction_count: int = 0
+    constant_count: int = 0
     initial_wrapped_state: int = 0
     initial_wrapped_chunk_state: int = 0
     initial_wrapped_chunk_offset: int = 0
@@ -388,6 +403,33 @@ def derive_block_permutation(
     return values
 
 
+def derive_code_data_permutation(
+    instruction_count: int, constant_count: int, state_value: int, prototype: Prototype
+) -> list[int]:
+    values = derive_block_permutation(
+        instruction_count + constant_count, state_value,
+        prototype.k1, prototype.k2, prototype.k3, CODE_DATA_PERMUTATION_DOMAIN
+    )
+    if not instruction_count or not constant_count or len(values) <= 2:
+        return values
+
+    previous_data = values[0] >= instruction_count
+    transitions = 0
+    first_boundary = 0
+    for position in range(1, len(values)):
+        current_data = values[position] >= instruction_count
+        if current_data != previous_data:
+            transitions += 1
+            if not first_boundary:
+                first_boundary = position
+        previous_data = current_data
+    if transitions < 2:
+        values[first_boundary - 1], values[first_boundary] = (
+            values[first_boundary], values[first_boundary - 1]
+        )
+    return values
+
+
 def block_field_mask(entry_state: int, pc: int, slot: int, prototype: Prototype) -> int:
     low = entry_state & 0xFFFF
     high = entry_state >> 16
@@ -401,71 +443,131 @@ def block_field_mask(entry_state: int, pc: int, slot: int, prototype: Prototype)
     ) & 0xFFFF
 
 
-def validate_columnar_block(data: bytes, prototype: Prototype, block: Block) -> None:
-    """Validate framing, role derivation and exact logical-column consumption."""
+def validate_instruction_record(
+    record: bytes, prototype: Prototype, block: Block, offset: int,
+    record_start: int, record_end: int,
+) -> tuple[int, tuple[int, ...], dict[int, tuple[int, int, int]]]:
     order = derive_block_permutation(
         5, block.entry_state, prototype.k1, prototype.k2, prototype.k3, BLOCK_COLUMN_DOMAIN
     )
     if sorted(order) != list(range(5)) or order == list(range(5)):
-        raise ValueError("invalid or identity block column-role permutation")
-
-    cursor = Cursor(data, block.body_start, block.body_end)
+        raise ValueError("invalid or identity instruction-column role permutation")
+    cursor = Cursor(record, 0, len(record))
     columns: dict[int, bytes] = {}
-    spans: dict[int, tuple[int, int]] = {}
+    spans: dict[int, tuple[int, int, int]] = {}
     for role in order:
         frame_start = cursor.position
         length = cursor.u32()
-        if role in columns:
-            raise ValueError("duplicate logical block column role")
+        data_start = cursor.position
         columns[role] = cursor.take(length)
-        spans[role] = (frame_start, cursor.position)
-    if cursor.position != block.body_end or set(columns) != set(range(5)):
-        raise ValueError("block column pages were not consumed exactly")
-
-    descriptor_column = columns[0]
-    if len(descriptor_column) != block.count:
-        raise ValueError("descriptor column length does not match block instruction count")
-    descriptors = [
-        encoded ^ (block_field_mask(block.entry_state, block.start_pc + offset, 7, prototype) & 0xFF)
-        for offset, encoded in enumerate(descriptor_column)
-    ]
-
-    non_data = 0
-    expected_b = 0
-    expected_c = 0
-    for descriptor in descriptors:
-        if descriptor & 1:
-            if descriptor != 1:
-                raise ValueError("invalid data-word descriptor in columnar block")
-            continue
+        spans[role] = (record_start + frame_start, record_start + data_start, record_start + cursor.position)
+    if cursor.position != len(record) or set(columns) != set(range(5)):
+        raise ValueError("instruction record columns were not consumed exactly")
+    pc = block.start_pc + offset
+    if len(columns[0]) != 1:
+        raise ValueError("instruction descriptor page is not scalar")
+    descriptor = columns[0][0] ^ (block_field_mask(block.entry_state, pc, 7, prototype) & 0xFF)
+    if descriptor & 1:
+        if descriptor != 1:
+            raise ValueError("invalid data-word instruction descriptor")
+        expected = {0: 1, 1: 0, 2: 0, 3: 4, 4: 0}
+    else:
         if descriptor >= 64:
             raise ValueError("invalid high bits in instruction descriptor")
         instruction_type = (descriptor >> 1) & 3
-        non_data += 1
-        expected_b += 2 if instruction_type == 0 else 4
-        if instruction_type in (0, 3):
-            expected_c += 2
+        expected = {
+            0: 1, 1: 2, 2: 2,
+            3: 2 if instruction_type == 0 else 4,
+            4: 2 if instruction_type in (0, 3) else 0,
+        }
+    actual = {role: len(value) for role, value in columns.items()}
+    if actual != expected:
+        raise ValueError(f"instruction record field lengths mismatch: {actual} != {expected}")
+    return descriptor, tuple(order), spans
 
-    expected_lengths = {
-        0: block.count,
-        1: non_data * 2,
-        2: non_data * 2,
-        3: expected_b,
-        4: expected_c,
-    }
-    actual_lengths = {role: len(column) for role, column in columns.items()}
-    if actual_lengths != expected_lengths:
-        raise ValueError(
-            f"logical block column lengths do not match descriptors: {actual_lengths} != {expected_lengths}"
+
+def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) -> None:
+    source_chunk_state = chunk_state(block.entry_state, block.start_pc, block.count, prototype)
+    order = derive_code_data_permutation(
+        block.count, len(block.references), block.entry_state ^ source_chunk_state, prototype
+    )
+    if sorted(order) != list(range(block.count + len(block.references))):
+        raise ValueError("invalid code/data fragment permutation")
+    if block.references and len(order) > 2:
+        type_runs = 1 + sum(
+            (order[position] >= block.count) != (order[position - 1] >= block.count)
+            for position in range(1, len(order))
         )
-    block.column_order = order
-    block.column_spans = spans
+        if type_runs < 3:
+            raise ValueError("code and constant fragments remain contiguous type partitions")
+
+    cursor = Cursor(data, block.body_start, block.body_end)
+    fragments: dict[int, bytes] = {}
+    spans: dict[int, tuple[int, int, int]] = {}
+    for logical_slot in order:
+        frame_start = cursor.position
+        length = cursor.u32()
+        data_start = cursor.position
+        fragments[logical_slot] = cursor.take(length)
+        spans[logical_slot] = (frame_start, data_start, cursor.position)
+    if cursor.position != block.body_end or len(fragments) != len(order):
+        raise ValueError("block fragments were not consumed exactly")
+
+    instruction_state = instruction_state_begin(
+        source_chunk_state, block.entry_state, block.start_pc, block.tag, prototype
+    )
+    descriptors: list[int] = []
+    orders: list[tuple[int, ...]] = []
+    column_spans: list[dict[int, tuple[int, int, int]]] = []
+    for offset in range(block.count):
+        record = fragments[offset]
+        _, record_start, record_end = spans[offset]
+        descriptor, column_order, record_spans = validate_instruction_record(
+            record, prototype, block, offset, record_start, record_end
+        )
+        descriptors.append(descriptor)
+        orders.append(column_order)
+        column_spans.append(record_spans)
+        digest = instruction_digest(record, block.start_pc + offset, prototype)
+        instruction_state = instruction_state_advance(
+            instruction_state, digest, block.start_pc + offset,
+            source_chunk_state, block.entry_state,
+        )
+
+    capsules: dict[int, Capsule] = {}
+    for reference_offset, constant_index in enumerate(block.references):
+        logical_slot = block.count + reference_offset
+        capsule_data = fragments[logical_slot]
+        _, capsule_start, capsule_end = spans[logical_slot]
+        if len(capsule_data) < 5:
+            raise ValueError("block-local constant capsule is too short")
+        capsule = Capsule(
+            constant_index, capsule_start, capsule_end, capsule_start, capsule_start + 4,
+            block.start_pc, block.entry_state, source_chunk_state, logical_slot,
+        )
+        validate_capsule(data, prototype, capsule)
+        capsules[constant_index] = capsule
+        prototype.capsules.append(capsule)
+
+    block.fragment_order = order
+    block.fragment_spans = spans
+    block.record_column_orders = orders
+    block.record_column_spans = column_spans
     block.descriptors = descriptors
+    block.capsules = capsules
+    block.final_instruction_state = instruction_state
+    block.final_instruction_seal = instruction_state_seal(
+        instruction_state, block.start_pc + block.count - 1,
+        source_chunk_state, block.entry_state, block.tag,
+    )
 
 
-def constant_mask_state(index: int, prototype: Prototype) -> int:
+def constant_mask_state(index: int, prototype: Prototype, capsule: Capsule) -> int:
     value = (
         index * 65537
+        + capsule.entry_state * 22695477
+        + capsule.chunk_state * LCG_MULTIPLIER
+        + capsule.block_start * 257
         + prototype.k1 * 257
         + prototype.k2 * 17
         + prototype.k3
@@ -474,11 +576,56 @@ def constant_mask_state(index: int, prototype: Prototype) -> int:
     return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
 
 
-def constant_integrity(encoded: bytes, index: int, prototype: Prototype) -> int:
+def constant_integrity(encoded: bytes, index: int, prototype: Prototype, capsule: Capsule) -> int:
     keyed = (prototype.k1 * 65537 + prototype.k2 * 257 + prototype.k3) & MASK32
-    value = hash_word(keyed ^ CONSTANT_INTEGRITY_DOMAIN, index)
+    value = hash_word(
+        keyed ^ CONSTANT_INTEGRITY_DOMAIN ^ capsule.entry_state ^ capsule.chunk_state,
+        capsule.block_start,
+    )
+    value = hash_word(value, index)
     value = hash_word(value, len(encoded))
     return hash_bytes(value, encoded)
+
+
+def instruction_digest(record: bytes, index: int, prototype: Prototype) -> int:
+    value = hash_word(INSTRUCTION_STATE_DOMAIN ^ index, prototype.k1)
+    value = hash_word(value, prototype.k2)
+    value = hash_word(value, prototype.k3)
+    value = hash_word(value, len(record))
+    return hash_bytes(value, record)
+
+
+def instruction_state_begin(
+    current_chunk_state: int, entry_state: int, block_start: int, block_tag: int, prototype: Prototype,
+) -> int:
+    value = (
+        current_chunk_state * 22695477 + entry_state * LCG_MULTIPLIER
+        + block_start * 65537 + block_tag + prototype.k1 * 251 + prototype.k2 * 17
+        + prototype.k3 + INSTRUCTION_STATE_DOMAIN + PAYLOAD_ATTESTATION
+    ) & MASK32
+    return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
+
+
+def instruction_state_advance(
+    state: int, digest: int, index: int, current_chunk_state: int, entry_state: int,
+) -> int:
+    value = (
+        state * LCG_MULTIPLIER + digest + index * 65537
+        + current_chunk_state * 257 + entry_state
+        + INSTRUCTION_STATE_DOMAIN + PAYLOAD_ATTESTATION
+    ) & MASK32
+    return (value * 22695477 + 1) & MASK32
+
+
+def instruction_state_seal(
+    state: int, index: int, current_chunk_state: int, entry_state: int, block_tag: int,
+) -> int:
+    value = (
+        state * 22695477 + index * 257 + current_chunk_state
+        + entry_state * LCG_MULTIPLIER + block_tag
+        + INSTRUCTION_STATE_DOMAIN + PAYLOAD_ATTESTATION
+    ) & MASK32
+    return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
 
 
 def prototype_integrity(data: bytes | bytearray, prototype: Prototype) -> int:
@@ -573,11 +720,7 @@ def block_integrity(data: bytes | bytearray, prototype: Prototype, block: Block)
     for word in (block.count, prototype.k1, prototype.k2, prototype.k3, block.route_token, len(block.references)):
         value = hash_word(value, word)
     for index in block.references:
-        capsule = prototype.capsules[index - 1]
-        capsule_data = bytes(data[capsule.start:capsule.end])
         value = hash_word(value, index)
-        value = hash_word(value, len(capsule_data))
-        value = hash_bytes(value, capsule_data)
     value = hash_word(value, block.verifier)
     value = hash_word(value, len(block.successors))
     for destination, wrapped_state, wrapped_chunk_state in block.successors:
@@ -592,9 +735,9 @@ def block_integrity(data: bytes | bytearray, prototype: Prototype, block: Block)
 def validate_capsule(data: bytes, prototype: Prototype, capsule: Capsule) -> None:
     stored = struct.unpack_from("<I", data, capsule.tag_offset)[0]
     encoded = data[capsule.encoded_start:capsule.end]
-    if constant_integrity(encoded, capsule.index, prototype) != stored:
+    if constant_integrity(encoded, capsule.index, prototype, capsule) != stored:
         raise ValueError(f"constant capsule {capsule.index} authentication mismatch")
-    raw = stream_xor(encoded, constant_mask_state(capsule.index, prototype))
+    raw = stream_xor(encoded, constant_mask_state(capsule.index, prototype, capsule))
     if not raw:
         raise ValueError("empty decoded constant capsule")
     tags = derive_permutation(4, prototype.k1, prototype.k2, prototype.k3, CONSTANT_TAG_DOMAIN)
@@ -631,18 +774,9 @@ def parse_prototype(
             prototype.parameter_offset = cursor.position
             cursor.u8()
         elif step == 1:
-            count = cursor.u32()
-            if count > 1_000_000:
-                raise ValueError("unreasonable constant capsule count")
-            for index in range(1, count + 1):
-                capsule_length = cursor.u32()
-                if capsule_length < 5:
-                    raise ValueError("constant capsule is shorter than tag plus value")
-                capsule_start = cursor.position
-                cursor.take(capsule_length)
-                capsule = Capsule(index, capsule_start, cursor.position, capsule_start, capsule_start + 4)
-                prototype.capsules.append(capsule)
-                validate_capsule(data, prototype, capsule)
+            prototype.constant_count = cursor.u32()
+            if prototype.constant_count > 1_000_000:
+                raise ValueError("unreasonable prototype constant count")
         elif step == 2:
             prototype.instruction_count = cursor.u32()
             block_count = cursor.u32()
@@ -704,8 +838,8 @@ def parse_prototype(
     occupied = [False] * (prototype.instruction_count + 1)
     starts = {block.start_pc for block in prototype.blocks}
     for block in prototype.blocks:
-        if any(not 1 <= item <= len(prototype.capsules) for item in block.references):
-            raise ValueError("block references a missing constant capsule")
+        if any(not 1 <= item <= prototype.constant_count for item in block.references):
+            raise ValueError("block references a missing prototype constant")
         for pc in range(block.start_pc, block.start_pc + block.count):
             if occupied[pc]:
                 raise ValueError("overlapping instruction blocks")
@@ -714,7 +848,7 @@ def parse_prototype(
             raise ValueError("successor does not name a block start")
         if block_integrity(data, prototype, block) != block.tag:
             raise ValueError("complete block manifest authentication mismatch")
-        validate_columnar_block(data, prototype, block)
+        validate_block_fragments(data, prototype, block)
         source_chunk_state = chunk_state(block.entry_state, block.start_pc, block.count, prototype)
         for destination, wrapped_state, wrapped_chunk_state in block.successors:
             destination_block = next(item for item in prototype.blocks if item.start_pc == destination)
@@ -1090,8 +1224,9 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
     )
     if normal_offset is None:
         raise ValueError("entry block has no normal instruction for column-consumption tamper")
-    descriptor_frame_start, _ = entry_block.column_spans[0]
-    descriptor_offset = descriptor_frame_start + 4 + normal_offset
+    _, descriptor_offset, descriptor_end = entry_block.record_column_spans[normal_offset][0]
+    if descriptor_end != descriptor_offset + 1:
+        raise ValueError("normal instruction descriptor span is not scalar")
     descriptor_mask = block_field_mask(
         entry_block.entry_state, entry_block.start_pc + normal_offset, 7, info.root
     )
@@ -1117,11 +1252,12 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
     if referenced is None:
         raise ValueError("root prototype has no referenced constant capsule")
     capsule_variant = bytearray(info.body)
-    target_capsule = info.root.capsules[referenced - 1]
+    target_capsule = next(
+        capsule for capsule in info.root.capsules if capsule.index == referenced
+    )
     capsule_variant[target_capsule.tag_offset] ^= 1
-    for block in info.root.blocks:
-        if referenced in block.references:
-            patch_u32(capsule_variant, block.tag_offset, block_integrity(capsule_variant, info.root, block))
+    owner = next(block for block in info.root.blocks if block.start_pc == target_capsule.block_start)
+    patch_u32(capsule_variant, owner.tag_offset, block_integrity(capsule_variant, info.root, owner))
     patch_u32(capsule_variant, info.root.tag_offset, prototype_integrity(capsule_variant, info.root))
     write_body_variant(info, output_dir, "capsule-integrity", capsule_variant)
 
@@ -1138,21 +1274,28 @@ def count_capsules(prototype: Prototype) -> int:
     return len(prototype.capsules) + sum(count_capsules(child) for child in prototype.children)
 
 
-def collect_column_orders(prototype: Prototype) -> list[tuple[int, ...]]:
-    return [tuple(block.column_order) for block in prototype.blocks] + [
-        order for child in prototype.children for order in collect_column_orders(child)
+def collect_fragment_orders(prototype: Prototype) -> list[tuple[int, ...]]:
+    return [tuple(block.fragment_order) for block in prototype.blocks] + [
+        order for child in prototype.children for order in collect_fragment_orders(child)
     ]
 
 
+def count_instruction_records(prototype: Prototype) -> int:
+    return sum(len(block.record_column_orders) for block in prototype.blocks) + sum(
+        count_instruction_records(child) for child in prototype.children
+    )
+
+
 def describe(info: PayloadInfo) -> str:
-    column_orders = collect_column_orders(info.root)
-    if len(column_orders) != count_blocks(info.root) or any(not order for order in column_orders):
-        raise ValueError("column-role validation did not cover every block")
+    fragment_orders = collect_fragment_orders(info.root)
+    if len(fragment_orders) != count_blocks(info.root) or any(not order for order in fragment_orders):
+        raise ValueError("code/data fragment validation did not cover every block")
     return (
         f"PASS authenticated v4 payload: features={info.flags & 15}, "
         f"prototypes={count_prototypes(info.root)}, blocks={count_blocks(info.root)}, "
-        f"column_layouts={len(set(column_orders))}, capsules={count_capsules(info.root)}, entropy={info.entropy_length} bytes, "
-        f"pages={info.data_count}, max_page={max(info.page_lengths)}, chunk_chain=attested, "
+        f"fragment_layouts={len(set(fragment_orders))}, capsules={count_capsules(info.root)}, entropy={info.entropy_length} bytes, "
+        f"instruction_records={count_instruction_records(info.root)}, pages={info.data_count}, max_page={max(info.page_lengths)}, "
+        f"chunk_chain=attested, instruction_chain=sealed, "
         f"records={len(info.records)}, H={info.shannon_entropy:.4f} bits/byte, "
         f"entropy_sha256={hashlib.sha256(info.entropy).hexdigest()}"
     )

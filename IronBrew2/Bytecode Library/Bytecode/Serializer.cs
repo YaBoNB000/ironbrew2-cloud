@@ -334,26 +334,30 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return hash;
 		}
 
-		private uint ConstantMaskState(int oneBasedIndex, ushort k1, ushort k2, ushort k3)
+		private uint ConstantMaskState(int oneBasedIndex, uint entryState, uint chunkState, int blockStart,
+			ushort k1, ushort k2, ushort k3)
 		{
-			uint value = unchecked((uint)oneBasedIndex * 65537u + (uint)k1 * 257u +
-			                       (uint)k2 * 17u + k3 + _context.Domains.ConstantMaskDomain);
+			uint value = unchecked((uint)oneBasedIndex * 65537u + entryState * 22695477u +
+			                       chunkState * 1664525u + (uint)blockStart * 257u +
+			                       (uint)k1 * 257u + (uint)k2 * 17u + k3 +
+			                       _context.Domains.ConstantMaskDomain);
 			return unchecked(value * 1664525u + 1013904223u);
 		}
 
 		private uint ComputeConstantIntegrity(byte[] encodedBody, int oneBasedIndex,
-			ushort k1, ushort k2, ushort k3)
+			uint entryState, uint chunkState, int blockStart, ushort k1, ushort k2, ushort k3)
 		{
 			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
-			uint hash = HashWord(keyed ^ _context.Domains.ConstantIntegrityDomain, (uint)oneBasedIndex);
+			uint hash = HashWord(keyed ^ _context.Domains.ConstantIntegrityDomain ^ entryState ^ chunkState,
+				(uint)blockStart);
+			hash = HashWord(hash, (uint)oneBasedIndex);
 			hash = HashWord(hash, (uint)encodedBody.Length);
 			return HashBytes(hash, encodedBody);
 		}
 
 		private uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
-			uint routeToken, IReadOnlyList<int> constantReferences, IReadOnlyList<byte[]> constantCapsules,
-			uint verifier, IReadOnlyList<ChunkSuccessor> successors, ushort k1, ushort k2, ushort k3,
-			uint binding)
+			uint routeToken, IReadOnlyList<int> constantReferences, uint verifier,
+			IReadOnlyList<ChunkSuccessor> successors, ushort k1, ushort k2, ushort k3, uint binding)
 		{
 			uint hash = HashWord(entryState ^ _context.Domains.BlockIntegrityDomain ^ binding, (uint)start);
 			hash = HashWord(hash, (uint)count);
@@ -363,14 +367,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			hash = HashWord(hash, routeToken);
 			hash = HashWord(hash, (uint)constantReferences.Count);
 			foreach (int constantIndex in constantReferences)
-			{
-				if (constantIndex < 1 || constantIndex > constantCapsules.Count)
-					throw new InvalidOperationException("Invalid block constant reference.");
-				byte[] capsule = constantCapsules[constantIndex - 1];
 				hash = HashWord(hash, (uint)constantIndex);
-				hash = HashWord(hash, (uint)capsule.Length);
-				hash = HashBytes(hash, capsule);
-			}
 			hash = HashWord(hash, verifier);
 			hash = HashWord(hash, (uint)successors.Count);
 			foreach (ChunkSuccessor successor in successors)
@@ -450,6 +447,36 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				identity &= values[index] == index;
 			if (identity && count > 1)
 				(values[0], values[1]) = (values[1], values[0]);
+			return values;
+		}
+
+		private static int[] DeriveCodeDataPermutation(int instructionCount, int constantCount,
+			uint stateValue, ushort k1, ushort k2, ushort k3, uint domain)
+		{
+			int[] values = DeriveBlockPermutation(instructionCount + constantCount, stateValue,
+				k1, k2, k3, domain);
+			if (instructionCount == 0 || constantCount == 0 || values.Length <= 2) return values;
+
+			bool previousData = values[0] >= instructionCount;
+			int transitions = 0;
+			int firstBoundary = 0;
+			for (int index = 1; index < values.Length; index++)
+			{
+				bool currentData = values[index] >= instructionCount;
+				if (currentData != previousData)
+				{
+					transitions++;
+					if (firstBoundary == 0) firstBoundary = index;
+				}
+				previousData = currentData;
+			}
+
+			// A single transition is still just two contiguous type partitions, even
+			// when data happens to precede code.  Move one item across that boundary
+			// so every non-trivial mixed block contains at least three type runs.
+			if (transitions < 2)
+				(values[firstBoundary - 1], values[firstBoundary]) =
+					(values[firstBoundary], values[firstBoundary - 1]);
 			return values;
 		}
 
@@ -645,7 +672,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			int[] schema = DerivePermutation((int)ChunkStep.StepCount, k1, k2, k3, _context.Domains.SchemaPermutationDomain);
 			int[] constantTags = DerivePermutation(4, k1, k2, k3, _context.Domains.ConstantTagPermutationDomain);
 
-			byte[] BuildConstantCapsule(Constant constant, int constantIndex)
+			byte[] BuildConstantCapsule(Constant constant, int constantIndex, uint entryState,
+				uint chunkState, int blockStart)
 			{
 				var raw = new List<byte>();
 				raw.Add((byte)constantTags[(int)constant.Type]);
@@ -671,7 +699,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				}
 
 				int oneBasedIndex = constantIndex + 1;
-				uint state = ConstantMaskState(oneBasedIndex, k1, k2, k3);
+				uint state = ConstantMaskState(oneBasedIndex, entryState, chunkState, blockStart, k1, k2, k3);
 				byte[] encodedBody = new byte[raw.Count];
 				for (int index = 0; index < raw.Count; index++)
 				{
@@ -680,23 +708,18 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				}
 
 				var capsule = new List<byte>(encodedBody.Length + 4);
-				WriteUInt32(capsule, ComputeConstantIntegrity(encodedBody, oneBasedIndex, k1, k2, k3));
+				WriteUInt32(capsule, ComputeConstantIntegrity(encodedBody, oneBasedIndex,
+					entryState, chunkState, blockStart, k1, k2, k3));
 				capsule.AddRange(encodedBody);
 				return capsule.ToArray();
 			}
 
-			List<byte[]> constantCapsules = chunk.Constants
-				.Select(BuildConstantCapsule)
-				.ToList();
-
 			void SerializeConstants()
 			{
-				WriteUInt32Local((uint)constantCapsules.Count);
-				foreach (byte[] capsule in constantCapsules)
-				{
-					WriteUInt32Local((uint)capsule.Length);
-					output.AddRange(capsule);
-				}
+				// Constant bodies are no longer emitted as a prototype-wide pool.  The
+				// count is retained for reference validation; authenticated capsules are
+				// rebuilt with block state and interleaved into each block's code records.
+				WriteUInt32Local((uint)chunk.Constants.Count);
 			}
 
 			foreach (int stepValue in schema)
@@ -723,23 +746,27 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							int start = block.Start;
 							int count = block.Count;
 							uint entryState = blockStates[block];
-							var columns = Enumerable.Range(0, 5).Select(_ => new List<byte>()).ToArray();
-							for (int offset = 0; offset < count; offset++)
-								SerializeInstruction(chunk.Instructions[start + offset], start + offset, entryState, columns);
+							uint sourceChunkState = blockChunkStates[block];
 
-							// Each logical field stream is independently length-framed. The physical
-							// page order is derived from this block's state plus prototype keys, so the
-							// decoder must recover a different descriptor/opcode/A/B/C role mapping per block.
-							var blockBody = new List<byte>();
-							int[] columnOrder = DeriveBlockPermutation(5, entryState, k1, k2, k3, _context.Domains.BlockColumnDomain);
-							foreach (int logicalColumn in columnOrder)
+							// Each instruction is an independently framed five-role record.  The
+							// decoder can therefore authenticate the block, locate one record and
+							// materialize only the instruction requested by the VM loop.
+							var instructionRecords = new List<byte[]>(count);
+							int[] columnOrder = DeriveBlockPermutation(5, entryState, k1, k2, k3,
+								_context.Domains.BlockColumnDomain);
+							for (int offset = 0; offset < count; offset++)
 							{
-								WriteUInt32(blockBody, (uint)columns[logicalColumn].Count);
-								blockBody.AddRange(columns[logicalColumn]);
+								var columns = Enumerable.Range(0, 5).Select(_ => new List<byte>()).ToArray();
+								SerializeInstruction(chunk.Instructions[start + offset], start + offset, entryState, columns);
+								var instructionRecord = new List<byte>();
+								foreach (int logicalColumn in columnOrder)
+								{
+									WriteUInt32(instructionRecord, (uint)columns[logicalColumn].Count);
+									instructionRecord.AddRange(columns[logicalColumn]);
+								}
+								instructionRecords.Add(instructionRecord.ToArray());
 							}
 
-							// Keep only capsule references in each block. The manifest authenticates
-							// every referenced capsule together with route and successor metadata.
 							var referenceSet = new HashSet<int>();
 							for (int offset = 0; offset < count; offset++)
 							{
@@ -750,12 +777,31 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							}
 							List<int> constantReferences = referenceSet.OrderBy(value => value).ToList();
 							foreach (int constantIndex in constantReferences)
-								if (constantIndex < 1 || constantIndex > constantCapsules.Count)
+								if (constantIndex < 1 || constantIndex > chunk.Constants.Count)
 									throw new InvalidOperationException("Invalid block constant reference.");
+
+							// Logical records are instruction windows followed by this block's
+							// state-bound constant partition.  Their physical order is shuffled from
+							// EntryState + ChunkState, producing real code/data record interleaving.
+							var logicalFragments = new List<byte[]>(count + constantReferences.Count);
+							logicalFragments.AddRange(instructionRecords);
+							foreach (int constantIndex in constantReferences)
+								logicalFragments.Add(BuildConstantCapsule(chunk.Constants[constantIndex - 1],
+									constantIndex - 1, entryState, sourceChunkState, start + 1));
+
+							var blockBody = new List<byte>();
+							uint fragmentState = entryState ^ sourceChunkState;
+							int[] fragmentOrder = DeriveCodeDataPermutation(count, constantReferences.Count, fragmentState,
+								k1, k2, k3, _context.Domains.CodeDataPermutationDomain);
+							foreach (int logicalFragment in fragmentOrder)
+							{
+								byte[] fragment = logicalFragments[logicalFragment];
+								WriteUInt32(blockBody, (uint)fragment.Length);
+								blockBody.AddRange(fragment);
+							}
 
 							uint routeToken = dispatcherFlattened ? blockRoutes[block] : 0u;
 							uint verifier = FlowVerifier(entryState, start + 1, k1, k2, k3, _context.XorSeed);
-							uint sourceChunkState = blockChunkStates[block];
 							var successorRecords = new List<ChunkSuccessor>();
 							foreach (ControlFlowBlock successor in block.Successors.OrderBy(value => value.Start))
 							{
@@ -774,7 +820,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							}
 							byte[] encodedBlockBody = blockBody.ToArray();
 							uint blockTag = ComputeBlockIntegrity(encodedBlockBody, entryState, start + 1, count,
-								routeToken, constantReferences, constantCapsules, verifier, successorRecords, k1, k2, k3,
+								routeToken, constantReferences, verifier, successorRecords, k1, k2, k3,
 								_context.XorSeed);
 
 							WriteUInt32Local((uint)(start + 1));
