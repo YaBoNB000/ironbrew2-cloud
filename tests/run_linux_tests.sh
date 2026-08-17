@@ -291,14 +291,17 @@ run_executor "$WORK/dispatcher-fallback-instrumented.lua" > "$WORK/dispatcher-fa
 cmp "$WORK/dispatcher-fallback-baseline.out" "$WORK/dispatcher-fallback.out"
 echo "PASS unsupported dispatcher shape falls back without partial metadata"
 
-# Repeat randomized prototype keys, opcode maps and schema orders.
+# Repeat randomized prototype keys, opcode maps, schema orders and dispatcher
+# control-flow templates. Each generated VM is parsed structurally before it is
+# executed, so template diversity never replaces semantic validation.
 for ((i = 1; i <= RANDOM_RUNS; i++)); do
     obfuscate "$WORK/random.lua"
-    python3 tests/runtime_layout.py "$ROOT/temp/t2.lua" > "$WORK/runtime-layout-$i.out"
+    python3 tests/runtime_layout.py "$ROOT/temp/t2.lua" --include-shape > "$WORK/runtime-layout-$i.out"
     run_executor "$WORK/random.lua" > "$WORK/random.out"
     cmp -s "$WORK/baseline.out" "$WORK/random.out"
 done
 python3 - "$WORK" "$RANDOM_RUNS" <<'PY'
+from itertools import combinations
 from pathlib import Path
 import json
 import sys
@@ -315,8 +318,12 @@ for index in range(1, runs + 1):
         raise SystemExit(f"missing runtime layout result for build {index}")
     layouts.append(json.loads(line[len(marker):]))
 
-counts = [layout["continuation"]["opcodes"] for layout in layouts]
-fingerprints = [layout["continuation"]["fingerprint"] for layout in layouts]
+continuations = [layout["continuation"] for layout in layouts]
+counts = [continuation["opcodes"] for continuation in continuations]
+fingerprints = [continuation["fingerprint"] for continuation in continuations]
+structure_fingerprints = [continuation["structure_fingerprint"] for continuation in continuations]
+templates = [continuation["template"] for continuation in continuations]
+update_orders = [continuation["state_update_order"] for continuation in continuations]
 domain_vectors = [json.dumps(layout["domains"], sort_keys=True) for layout in layouts]
 slot_abis = [json.dumps({key: layout[key] for key in ("chunk", "block", "flow", "flow_cache")}, sort_keys=True)
              for layout in layouts]
@@ -326,11 +333,41 @@ if len(set(counts)) < 2:
     raise SystemExit(f"opcode cardinality did not vary across builds: {counts}")
 if len(set(fingerprints)) != runs:
     raise SystemExit("a continuation/opcode execution graph was reused across builds")
+if len(set(structure_fingerprints)) != runs:
+    raise SystemExit("a normalized dispatcher structure was reused across builds")
+expected_templates = {"lane-partitioned", "token-threaded", "depth-layered"}
+if set(templates) != expected_templates:
+    raise SystemExit(f"not all dispatcher templates were emitted: {sorted(set(templates))}")
+if len(set(update_orders)) < 2:
+    raise SystemExit(f"dispatcher transition ordering did not vary: {update_orders}")
 if len(set(domain_vectors)) != runs:
     raise SystemExit("a serializer/runtime domain vector was reused across builds")
 if len(set(slot_abis)) != runs:
     raise SystemExit("a runtime slot ABI was reused across builds")
-print(f"PASS {runs}-build opcode reuse barrier: counts={sorted(set(counts))}, unique graphs/domains/ABIs={runs}")
+
+# Compare normalized structural token bigrams, not randomized names, arithmetic
+# spellings or token values. A high score therefore indicates actual CFG/layout
+# reuse instead of superficial lexical similarity.
+def bigrams(sequence):
+    return set(zip(sequence, sequence[1:]))
+
+def jaccard(left, right):
+    union = left | right
+    return len(left & right) / len(union) if union else 1.0
+
+shape_bigrams = [bigrams(continuation["shape_sequence"]) for continuation in continuations]
+similarities = [jaccard(left, right) for left, right in combinations(shape_bigrams, 2)]
+max_similarity = max(similarities)
+mean_similarity = sum(similarities) / len(similarities)
+if max_similarity > 0.35 or mean_similarity > 0.08:
+    raise SystemExit(
+        f"normalized dispatcher structures remain too similar: max={max_similarity:.3f}, mean={mean_similarity:.3f}"
+    )
+print(
+    f"PASS {runs}-build execution-model barrier: counts={sorted(set(counts))}, "
+    f"templates={sorted(set(templates))}, unique graphs/structures/domains/ABIs={runs}, "
+    f"normalized bigram similarity max={max_similarity:.3f} mean={mean_similarity:.3f}"
+)
 PY
 echo "PASS randomized opcode handlers and non-identity runtime layouts: $RANDOM_RUNS/$RANDOM_RUNS"
 

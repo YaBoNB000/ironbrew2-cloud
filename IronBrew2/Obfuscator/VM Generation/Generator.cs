@@ -686,6 +686,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				throw new InvalidOperationException("EnvironmentLock requires the VM-integrated AntiDump attestation guard.");
 
 			Random r = _context.Seed.GetStream("vm.generator");
+			BuildRandom dispatcherRandom = _context.Seed.GetStream("dispatcher.template");
 			Random guardRandom = _context.Seed.GetStream("runtime.guard");
 
 			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
@@ -1705,12 +1706,20 @@ end;";
 			string bitXorName = T("BitXOR");
 			string u32Name = T("U32");
 			string enumName = T("Enum");
+			DispatcherTemplate dispatcherTemplate = DispatcherTemplateSelector.Select(dispatcherRandom);
+			// State updates have three dependency-safe orders. This varies the def-use
+			// shape even when two builds select the same outer dispatcher template.
+			int transitionLayout = r.Next(3);
+
+			string EncodedState(uint token, string mask) =>
+				u32Name + "(" + bitXorName + "(" + ScrambleUInt(token) + "," + mask + "))";
 
 			string EntryAssignment(int opcodeIndex)
 			{
 				ContinuationNode entry = continuationChains[opcodeIndex][0];
-				return dispatchStateName + "=" + u32Name + "(" + bitXorName + "(" + ScrambleUInt(entry.Token) + "," + dispatchMaskName + "));" +
-				       dispatchLaneName + "=" + ScrambleNumber(entry.Lane) + ";";
+				string state = dispatchStateName + "=" + EncodedState(entry.Token, dispatchMaskName) + ";";
+				string lane = dispatchLaneName + "=" + ScrambleNumber(entry.Lane) + ";";
+				return transitionLayout == 1 ? lane + state : state + lane;
 			}
 
 			string BuildOpcodeSelector(List<int> opcodes)
@@ -1733,12 +1742,72 @@ end;";
 					}
 				}
 
-				List<int> ordered = opcodes.OrderBy(opcode => opcode).ToList();
+				// Every threshold and leaf comparison is expressed in virtual-opcode
+				// space. Sorting by the source list index would silently misroute a
+				// randomized VIndex permutation.
+				List<int> ordered = opcodes.OrderBy(opcode => virtuals[opcode].VIndex).ToList();
 				int middle = ordered.Count / 2;
 				List<int> left = ordered.Take(middle).ToList();
 				List<int> right = ordered.Skip(middle).ToList();
-				return "if " + enumName + "<=" + ScrambleNumber(left.Last()) + " then " +
+				int threshold = virtuals[left.Last()].VIndex;
+				return "if " + enumName + "<=" + ScrambleNumber(threshold) + " then " +
 				       BuildOpcodeSelector(left) + "else " + BuildOpcodeSelector(right) + "end;";
+			}
+
+			string DecodedState() => settings.AntiDump
+				? u32Name + "(" + bitXorName + "(" + bitXorName + "(" + dispatchStateName + "," + dispatchStepMaskName + ")," + T("GuardFaultWord") + "))"
+				: u32Name + "(" + bitXorName + "(" + dispatchStateName + "," + dispatchStepMaskName + "))";
+
+			string TokenCondition(ContinuationNode node)
+			{
+				string decoded = DecodedState();
+				string token = ScrambleUInt(node.Token);
+				switch (r.Next(3))
+				{
+					case 0: return decoded + "==" + token;
+					case 1: return "not(" + decoded + "~=" + token + ")";
+					default: return decoded + "<=" + token + " and " + decoded + ">=" + token;
+				}
+			}
+
+			string Transition(ContinuationNode node)
+			{
+				string step = dispatchStepsName + "=" + dispatchStepsName + "+1;";
+				string mask = dispatchStepMaskName + "=" + u32Name + "(" + bitXorName + "(" + dispatchMaskName + ",(" +
+				              dispatchStepsName + "*" + dispatchSaltName + ")%4294967296));";
+				string state = dispatchStateName + "=" + EncodedState(node.NextToken, dispatchStepMaskName) + ";";
+				string lane = dispatchLaneName + "=" + ScrambleNumber(node.NextLane) + ";";
+				return transitionLayout switch
+				{
+					0 => step + mask + state + lane,
+					1 => lane + step + mask + state,
+					_ => step + mask + lane + state
+				};
+			}
+
+			string NodeBody(ContinuationNode node)
+			{
+				string body = dispatchMatchedName + "=true;";
+				if (node.Terminal)
+					return body + node.Handler + dispatchActiveName + "=false;";
+				return body + Transition(node);
+			}
+
+			string NodeChain(IEnumerable<ContinuationNode> nodes, bool inlineLane)
+			{
+				var ordered = nodes.ToList();
+				var result = new StringBuilder();
+				for (int index = 0; index < ordered.Count; index++)
+				{
+					ContinuationNode node = ordered[index];
+					string condition = TokenCondition(node);
+					if (inlineLane)
+						condition = dispatchLaneName + "==" + ScrambleNumber(node.Lane) + " and (" + condition + ")";
+					result.Append(index == 0 ? "if " : "elseif ")
+					      .Append(condition).Append(" then ").Append(NodeBody(node));
+				}
+				result.Append("end;");
+				return result.ToString();
 			}
 
 			uint dispatchSaltFactor = (uint)(1 + r.Next(1, 32768) * 2);
@@ -1754,49 +1823,64 @@ end;";
 			vm += BuildOpcodeSelector(Enumerable.Range(0, virtuals.Count).ToList());
 
 			int maximumDepth = continuationChains.Values.Max(chain => chain.Count - 1);
-			vm += "while " + dispatchActiveName + " do " +
-			      "if " + dispatchStepsName + ">" + ScrambleNumber(maximumDepth) + " then error('invalid protected payload',0);end;" +
-			      dispatchStepMaskName + "=" + u32Name + "(" + bitXorName + "(" + dispatchMaskName + ",(" + dispatchStepsName + "*" + dispatchSaltName + ")%4294967296));" +
-			      dispatchMatchedName + "=false;";
-
-			int[] laneOrder = Enumerable.Range(0, laneCount).ToArray();
-			laneOrder.Shuffle(r);
-			for (int laneOrderIndex = 0; laneOrderIndex < laneOrder.Length; laneOrderIndex++)
+			string depthGuard = "if " + dispatchStepsName + ">" + ScrambleNumber(maximumDepth) + " then error('invalid protected payload',0);end;";
+			string stepMask = dispatchStepMaskName + "=" + u32Name + "(" + bitXorName + "(" + dispatchMaskName + ",(" +
+			                  dispatchStepsName + "*" + dispatchSaltName + ")%4294967296));";
+			string loopPrefix;
+			switch (transitionLayout)
 			{
-				int lane = laneOrder[laneOrderIndex];
-				vm += (laneOrderIndex == 0 ? "if " : "elseif ") + dispatchLaneName + "==" + ScrambleNumber(lane) + " then ";
-				List<ContinuationNode> laneNodes = allContinuationNodes.Where(node => node.Lane == lane).OrderBy(node => r.Next()).ToList();
-				for (int nodeIndex = 0; nodeIndex < laneNodes.Count; nodeIndex++)
-				{
-					ContinuationNode node = laneNodes[nodeIndex];
-					string decoded = settings.AntiDump
-						? u32Name + "(" + bitXorName + "(" + bitXorName + "(" + dispatchStateName + "," + dispatchStepMaskName + ")," + T("GuardFaultWord") + "))"
-						: u32Name + "(" + bitXorName + "(" + dispatchStateName + "," + dispatchStepMaskName + "))";
-					string token = ScrambleUInt(node.Token);
-					string condition;
-					switch (r.Next(3))
-					{
-						case 0: condition = decoded + "==" + token; break;
-						case 1: condition = "not(" + decoded + "~=" + token + ")"; break;
-						default: condition = decoded + "<=" + token + " and " + decoded + ">=" + token; break;
-					}
-					vm += (nodeIndex == 0 ? "if " : "elseif ") + condition + " then " + dispatchMatchedName + "=true;";
-					if (node.Terminal)
-					{
-						vm += node.Handler;
-						vm += dispatchActiveName + "=false;";
-					}
-					else
-					{
-						vm += dispatchStepsName + "=" + dispatchStepsName + "+1;" +
-						      dispatchStepMaskName + "=" + u32Name + "(" + bitXorName + "(" + dispatchMaskName + ",(" + dispatchStepsName + "*" + dispatchSaltName + ")%4294967296));" +
-						      dispatchStateName + "=" + u32Name + "(" + bitXorName + "(" + ScrambleUInt(node.NextToken) + "," + dispatchStepMaskName + "));" +
-						      dispatchLaneName + "=" + ScrambleNumber(node.NextLane) + ";";
-					}
-				}
-				vm += "end;";
+				case 0: loopPrefix = depthGuard + stepMask + dispatchMatchedName + "=false;"; break;
+				case 1: loopPrefix = dispatchMatchedName + "=false;" + depthGuard + stepMask; break;
+				default: loopPrefix = stepMask + depthGuard + dispatchMatchedName + "=false;"; break;
 			}
-			vm += "end;if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;end;";
+
+			if (dispatcherTemplate == DispatcherTemplate.LanePartitioned)
+			{
+				// Template A: an outer continuation loop selects a lane first, then a
+				// lane-local token chain. Lane and node orders are independently shuffled.
+				vm += "while " + dispatchActiveName + " do " + loopPrefix;
+				int[] laneOrder = Enumerable.Range(0, laneCount).ToArray();
+				laneOrder.Shuffle(r);
+				for (int laneOrderIndex = 0; laneOrderIndex < laneOrder.Length; laneOrderIndex++)
+				{
+					int lane = laneOrder[laneOrderIndex];
+					vm += (laneOrderIndex == 0 ? "if " : "elseif ") + dispatchLaneName + "==" + ScrambleNumber(lane) + " then ";
+					vm += NodeChain(allContinuationNodes.Where(node => node.Lane == lane).OrderBy(_ => r.Next()), false);
+				}
+				vm += "end;if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;end;";
+			}
+			else if (dispatcherTemplate == DispatcherTemplate.TokenThreaded)
+			{
+				// Template B: token and lane checks share one flat threaded state chain.
+				// A repeat terminator replaces the active-condition loop header.
+				vm += "repeat " + loopPrefix;
+				vm += NodeChain(allContinuationNodes.OrderBy(_ => r.Next()), true);
+				vm += "if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;until not " + dispatchActiveName + ";";
+			}
+			else
+			{
+				// Template C: continuation depth is the first state-machine layer; each
+				// layer then selects a lane and finally a token. This is intentionally
+				// distinct from both the lane-first and flat token-threaded CFGs.
+				vm += "while " + dispatchActiveName + " do " + loopPrefix;
+				int[] depthOrder = Enumerable.Range(0, maximumDepth + 1).ToArray();
+				depthOrder.Shuffle(r);
+				for (int depthOrderIndex = 0; depthOrderIndex < depthOrder.Length; depthOrderIndex++)
+				{
+					int depth = depthOrder[depthOrderIndex];
+					vm += (depthOrderIndex == 0 ? "if " : "elseif ") + dispatchStepsName + "==" + ScrambleNumber(depth) + " then ";
+					int[] depthLanes = allContinuationNodes.Where(node => node.Depth == depth).Select(node => node.Lane).Distinct().ToArray();
+					depthLanes.Shuffle(r);
+					for (int laneIndex = 0; laneIndex < depthLanes.Length; laneIndex++)
+					{
+						int lane = depthLanes[laneIndex];
+						vm += (laneIndex == 0 ? "if " : "elseif ") + dispatchLaneName + "==" + ScrambleNumber(lane) + " then ";
+						vm += NodeChain(allContinuationNodes.Where(node => node.Depth == depth && node.Lane == lane).OrderBy(_ => r.Next()), false);
+					}
+					vm += "end;";
+				}
+				vm += "end;if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;end;";
+			}
 			string finalRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP3_LI_R : VMStrings.VMP3_LI) : (useRepeat ? VMStrings.VMP3_R : VMStrings.VMP3);
 			if (settings.AntiDump)
 			{

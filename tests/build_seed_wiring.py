@@ -14,6 +14,7 @@ CORE = [
     ROOT / "IronBrew2" / "Obfuscator" / "AntiDump" / "AntiDumpGenerator.cs",
     ROOT / "IronBrew2" / "Obfuscator" / "Encryption" / "ConstantEncryption.cs",
     ROOT / "IronBrew2" / "Obfuscator" / "Opcodes" / "OpMutated.cs",
+    ROOT / "IronBrew2" / "Obfuscator" / "VM Generation" / "DispatcherTemplate.cs",
     ROOT / "IronBrew2" / "Obfuscator" / "VM Generation" / "Generator.cs",
     ROOT / "IronBrew2" / "Bytecode Library" / "Bytecode" / "Serializer.cs",
     *sorted((ROOT / "IronBrew2" / "Obfuscator" / "Control Flow").rglob("*.cs")),
@@ -30,6 +31,7 @@ all_source = "\n".join(path.read_text(encoding="utf-8-sig") for path in CORE)
 purposes = set(re.findall(r'GetStream\("([a-z0-9.-]+)"\)', all_source))
 expected = {
     "bytecode.schema",
+    "dispatcher.template",
     "environment.binding",
     "opcode.mutations",
     "payload.domains",

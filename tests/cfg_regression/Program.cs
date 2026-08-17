@@ -2,6 +2,7 @@ using IronBrew2.Bytecode_Library.Bytecode;
 using IronBrew2.Bytecode_Library.IR;
 using IronBrew2.Obfuscator;
 using IronBrew2.Obfuscator.Control_Flow;
+using IronBrew2.Obfuscator.VM_Generation;
 
 static Chunk NewChunk(params Opcode[] opcodes)
 {
@@ -155,6 +156,29 @@ foreach (Opcode opcode in new[] { Opcode.Eq, Opcode.Lt, Opcode.Le, Opcode.Test, 
     chunk.Instructions[1].OpCode = Opcode.Add;
     decision = DispatcherFlatteningPlanner.Apply(chunk);
     Expect(!decision.IsEligible && decision.Reason == "invalid-closure-binding", "invalid closure binding fallback failed");
+}
+
+// All three dispatcher structures must be reachable from the dedicated purpose
+// stream, and equal roots must select the same template without consulting any
+// process-global random source.
+{
+    var templates = new HashSet<DispatcherTemplate>();
+    for (int discriminator = 0; discriminator < 256; discriminator++)
+    {
+        byte[] root = Enumerable.Range(0, 32)
+            .Select(value => (byte)(value ^ discriminator))
+            .ToArray();
+        using var first = new BuildSeed(root);
+        using var second = new BuildSeed(root);
+        DispatcherTemplate selected = DispatcherTemplateSelector.Select(first.GetStream("dispatcher.template"));
+        DispatcherTemplate repeated = DispatcherTemplateSelector.Select(second.GetStream("dispatcher.template"));
+        Expect(selected == repeated, "equal build roots selected different dispatcher templates");
+        Expect((int)selected >= 0 && (int)selected < DispatcherTemplateSelector.TemplateCount,
+            "dispatcher template selector escaped its declared range");
+        templates.Add(selected);
+    }
+    Expect(templates.SetEquals(Enum.GetValues<DispatcherTemplate>()),
+        $"dispatcher selector did not cover all templates: {string.Join(',', templates)}");
 }
 
 // One master BuildSeed must deterministically derive independent named streams.

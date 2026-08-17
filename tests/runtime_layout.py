@@ -276,10 +276,10 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         if not re.search(rf"\b{re.escape(reject_name)}\s*\(\s*{arithmetic_raw}\s*\)", source):
             raise ValueError("a generated protected-payload rejection path is unused")
 
-    # The opcode comparison tree must only choose a masked entry token. A
-    # continuation graph then crosses 3-5 shuffled lanes and 3-5 nodes before a
-    # terminal handler runs in the VM closure. Recover the randomized names from
-    # the declaration shape rather than relying on implementation identifiers.
+    # The opcode comparison tree only chooses a masked entry token. A build-local
+    # continuation graph then reaches the handler through one of three genuinely
+    # different dispatcher CFG templates. Recover names and structure rather than
+    # relying on stable implementation identifiers.
     continuation_init = _expect(
         rf"local\s+({IDENT})\s*=\s*({IDENT})\(\s*({IDENT})\([^;]+\)\s*\);\s*"
         rf"local\s+({IDENT})\s*=\s*[^;]+;\s*"
@@ -321,19 +321,35 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     ):
         raise ValueError("periodic guard probe is not fused into the VM execution loop")
 
-    continuation_loop = _expect(
+    arithmetic_raw = r"\(\s*\d+\s*[+\-*]\s*\d+\s*\)"
+    arithmetic = f"({arithmetic_raw})"
+    continuation_tail = source[continuation_init.end():]
+    loop_candidates: list[tuple[int, str, re.Match[str]]] = []
+    while_loop = re.search(
         rf"while\s+{re.escape(dispatch_active)}\s+do\s+(.*?)"
         rf"if\s+not\s+{re.escape(dispatch_matched)}\s+then\s+"
         rf"({IDENT})\(\s*{arithmetic_raw}\s*\);\s*end;\s*end;",
-        source[continuation_init.end():],
-        "could not recover complete continuation dispatcher loop",
+        continuation_tail,
         re.S,
     )
+    if while_loop:
+        loop_candidates.append((while_loop.start(), "while", while_loop))
+    repeat_loop = re.search(
+        rf"repeat\s+(.*?)if\s+not\s+{re.escape(dispatch_matched)}\s+then\s+"
+        rf"({IDENT})\(\s*{arithmetic_raw}\s*\);\s*end;\s*"
+        rf"until\s+not\s+{re.escape(dispatch_active)}\s*;",
+        continuation_tail,
+        re.S,
+    )
+    if repeat_loop:
+        loop_candidates.append((repeat_loop.start(), "repeat", repeat_loop))
+    if not loop_candidates:
+        raise ValueError("could not recover a complete continuation dispatcher loop")
+    loop_start, loop_kind, continuation_loop = min(loop_candidates, key=lambda item: item[0])
     if continuation_loop.group(2) not in reject_paths:
         raise ValueError("continuation dispatcher does not terminate through a hidden rejection path")
-    selector = source[continuation_init.end():continuation_init.end() + continuation_loop.start()]
+    selector = continuation_tail[:loop_start]
     loop_body = continuation_loop.group(1)
-    arithmetic = f"({arithmetic_raw})"
 
     salt_init = _expect(
         rf"local\s+{re.escape(dispatch_salt)}\s*=\s*\([^;]*\*\s*{arithmetic}\s*\+\s*{arithmetic}"
@@ -345,25 +361,21 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     if salt_factor == 0 or salt_factor % 2 == 0:
         raise ValueError("continuation step salt factor must be odd and non-zero")
 
-    entry_matches = re.findall(
+    state_entry = (
         rf"{re.escape(dispatch_state)}\s*=\s*{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
-        rf"{arithmetic}\s*,\s*{re.escape(dispatch_mask)}\s*\)\s*\);\s*"
-        rf"{re.escape(dispatch_lane)}\s*=\s*{arithmetic}\s*;",
-        selector,
+        rf"{arithmetic}\s*,\s*{re.escape(dispatch_mask)}\s*\)\s*\);"
     )
-    entry_tokens = [_arithmetic_value(token) for token, _lane in entry_matches]
-    entry_lanes = [_arithmetic_value(lane) for _token, lane in entry_matches]
+    lane_entry = rf"{re.escape(dispatch_lane)}\s*=\s*{arithmetic}\s*;"
+    entries: list[tuple[int, int, int]] = []
+    for match in re.finditer(state_entry + rf"\s*" + lane_entry, selector):
+        entries.append((match.start(), _arithmetic_value(match.group(1)), _arithmetic_value(match.group(2))))
+    for match in re.finditer(lane_entry + rf"\s*" + state_entry, selector):
+        entries.append((match.start(), _arithmetic_value(match.group(2)), _arithmetic_value(match.group(1))))
+    entries.sort()
+    entry_tokens = [token for _position, token, _lane in entries]
+    entry_lanes = [lane for _position, _token, lane in entries]
     if len(entry_tokens) != opcode_count or len(set(entry_tokens)) != opcode_count:
         raise ValueError(f"opcode selector exposed {len(entry_tokens)} non-unique entries for {opcode_count} opcodes")
-
-    lane_pattern = re.compile(
-        rf"(?:if|elseif)\s+{re.escape(dispatch_lane)}\s*==\s*{arithmetic}\s+then"
-    )
-    lane_matches = list(lane_pattern.finditer(loop_body))
-    lane_values = [_arithmetic_value(match.group(1)) for match in lane_matches]
-    lanes = set(lane_values)
-    if len(lanes) < 3 or len(lanes) > 5 or lanes != set(range(len(lanes))) or len(lane_values) != len(lanes):
-        raise ValueError(f"continuation dispatcher does not use one complete 3-5 lane set: {lane_values}")
 
     fault_use = _expect(
         rf"{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
@@ -394,56 +406,68 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         rf"{re.escape(dispatch_xor)}\(\s*{re.escape(dispatch_state)}\s*,\s*"
         rf"{re.escape(dispatch_step_mask)}\s*\)\s*,\s*{re.escape(guard_fault)}\s*\)\s*\)"
     )
-    node_header = (
-        rf"(?:if|elseif)\s+(?:not\s*\(\s*)?{decoded_state}\s*(?:==|~=|<=)\s*{arithmetic}"
-        rf"[^;]*?then\s+{re.escape(dispatch_matched)}\s*=\s*true;"
+    # A tempered prefix prevents an outer depth/lane branch from being mistaken
+    # for the nested token condition: a real node header cannot cross another
+    # Lua 'then' before it reaches the decoded continuation state.
+    node_header = re.compile(
+        rf"(?:if|elseif)\s+(?P<prefix>(?:(?!\bthen\b).)*?){decoded_state}\s*"
+        rf"(?:==|~=|<=)\s*(?P<token>{arithmetic_raw})(?P<suffix>[^;]*?)"
+        rf"then\s+{re.escape(dispatch_matched)}\s*=\s*true;",
+        re.S,
     )
-    node_matches = list(re.finditer(node_header, loop_body))
-    node_tokens = [_arithmetic_value(match.group(1)) for match in node_matches]
-    if len(node_tokens) != len(set(node_tokens)):
-        raise ValueError("continuation state tokens are not unique")
+    node_matches = list(node_header.finditer(loop_body))
+    node_tokens = [_arithmetic_value(match.group("token")) for match in node_matches]
+    if not node_tokens or len(node_tokens) != len(set(node_tokens)):
+        raise ValueError("continuation state tokens are missing or non-unique")
     fault_decode_uses = len(re.findall(decoded_state, loop_body))
     fault_identifier_uses = len(re.findall(rf"\b{re.escape(guard_fault)}\b", loop_body))
     if fault_identifier_uses != fault_decode_uses or not len(node_tokens) <= fault_decode_uses <= 2 * len(node_tokens):
         raise ValueError("sticky guard fault word is used outside continuation decode comparisons")
-
-    node_lanes: dict[int, int] = {}
-    for lane_index, lane_match in enumerate(lane_matches):
-        lane = _arithmetic_value(lane_match.group(1))
-        lane_end = lane_matches[lane_index + 1].start() if lane_index + 1 < len(lane_matches) else len(loop_body)
-        for node_match in re.finditer(node_header, loop_body[lane_match.end():lane_end]):
-            token = _arithmetic_value(node_match.group(1))
-            if token in node_lanes:
-                raise ValueError("continuation state appears in multiple lanes")
-            node_lanes[token] = lane
-    if set(node_lanes) != set(node_tokens):
-        raise ValueError("could not bind every continuation state to exactly one lane")
 
     step_mask_assignment = (
         rf"{re.escape(dispatch_step_mask)}\s*=\s*{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
         rf"{re.escape(dispatch_mask)}\s*,\s*\(\s*{re.escape(dispatch_steps)}\s*\*\s*"
         rf"{re.escape(dispatch_salt)}\s*\)\s*%\s*4294967296\s*\)\s*\);"
     )
-    transition_pattern = re.compile(
-        node_header +
-        rf"\s*{re.escape(dispatch_steps)}\s*=\s*{re.escape(dispatch_steps)}\s*\+\s*1;\s*"
-        + step_mask_assignment +
-        rf"\s*{re.escape(dispatch_state)}\s*=\s*{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
-        rf"{arithmetic}\s*,\s*{re.escape(dispatch_step_mask)}\s*\)\s*\);\s*"
-        rf"{re.escape(dispatch_lane)}\s*=\s*{arithmetic}\s*;"
+    step_increment = rf"{re.escape(dispatch_steps)}\s*=\s*{re.escape(dispatch_steps)}\s*\+\s*1;"
+    successor_state = re.compile(
+        rf"{re.escape(dispatch_state)}\s*=\s*{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
+        rf"({arithmetic_raw})\s*,\s*{re.escape(dispatch_step_mask)}\s*\)\s*\);"
     )
+    successor_lane = re.compile(rf"{re.escape(dispatch_lane)}\s*=\s*({arithmetic_raw})\s*;")
+    active_false = re.compile(rf"\b{re.escape(dispatch_active)}\s*=\s*false;")
+
     transitions: dict[int, int] = {}
     transition_lanes: dict[int, int] = {}
-    for match in transition_pattern.finditer(loop_body):
-        current = _arithmetic_value(match.group(1))
-        successor = _arithmetic_value(match.group(2))
-        successor_lane = _arithmetic_value(match.group(3))
-        if current in transitions:
-            raise ValueError("continuation state has multiple successor assignments")
-        transitions[current] = successor
-        transition_lanes[current] = successor_lane
+    update_orders: set[str] = set()
+    terminals: set[int] = set()
+    for index, match in enumerate(node_matches):
+        token = node_tokens[index]
+        end = node_matches[index + 1].start() if index + 1 < len(node_matches) else len(loop_body)
+        segment = loop_body[match.end():end]
+        state_match = successor_state.search(segment)
+        terminal_match = active_false.search(segment)
+        if state_match:
+            step_match = re.search(step_increment, segment)
+            mask_match = re.search(step_mask_assignment, segment)
+            lane_match = successor_lane.search(segment)
+            if not step_match or not mask_match or not lane_match:
+                raise ValueError("continuation transition is missing a state component")
+            if terminal_match and terminal_match.start() < state_match.end():
+                raise ValueError("continuation node is both terminal and transitional")
+            transitions[token] = _arithmetic_value(state_match.group(1))
+            transition_lanes[token] = _arithmetic_value(lane_match.group(1))
+            components = sorted(
+                ((step_match.start(), "S"), (mask_match.start(), "M"),
+                 (state_match.start(), "T"), (lane_match.start(), "L"))
+            )
+            update_orders.add("".join(label for _position, label in components))
+        elif terminal_match:
+            terminals.add(token)
+        else:
+            raise ValueError("continuation node has neither a transition nor a terminal handler")
 
-    terminal_count = len(re.findall(rf"\b{re.escape(dispatch_active)}\s*=\s*false;", loop_body))
+    terminal_count = len(terminals)
     if terminal_count != opcode_count:
         raise ValueError(f"expected {opcode_count} terminal handlers, found {terminal_count}")
     if re.search(rf"\b{re.escape(dispatch_active)}\s*=\s*false;", selector):
@@ -454,32 +478,86 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         raise ValueError("continuation transition targets an unknown state token")
     if len(re.findall(step_mask_assignment, loop_body)) != len(transitions) + 1:
         raise ValueError("continuation step mask is not recomputed at loop entry and after every transition")
+    if len(update_orders) != 1 or next(iter(update_orders)) not in {"SMTL", "LSMT", "SMLT"}:
+        raise ValueError(f"dispatcher state update ordering is inconsistent: {update_orders}")
+    update_order = next(iter(update_orders))
 
-    for entry, entry_lane in zip(entry_tokens, entry_lanes):
-        if node_lanes.get(entry) != entry_lane:
-            raise ValueError("opcode selector chose the wrong lane for its continuation entry")
+    # Reconstruct every node's expected lane from selector entries and transition
+    # destinations. This remains independent of the chosen outer CFG template.
+    node_lanes: dict[int, int] = {}
+    for token, lane in zip(entry_tokens, entry_lanes):
+        if token in node_lanes and node_lanes[token] != lane:
+            raise ValueError("opcode selector assigned conflicting entry lanes")
+        node_lanes[token] = lane
+    for successor, lane in zip(transitions.values(), transition_lanes.values()):
+        if successor in node_lanes and node_lanes[successor] != lane:
+            raise ValueError("continuation transition assigned a conflicting target lane")
+        node_lanes[successor] = lane
+    if set(node_lanes) != set(node_tokens):
+        raise ValueError("could not recover a lane for every continuation node")
+    lanes = set(node_lanes.values())
+    if len(lanes) < 3 or len(lanes) > 5 or lanes != set(range(len(lanes))):
+        raise ValueError(f"continuation dispatcher does not use one complete 3-5 lane set: {sorted(lanes)}")
     for current, successor in transitions.items():
-        successor_lane = transition_lanes[current]
-        if node_lanes[successor] != successor_lane:
+        successor_lane_value = transition_lanes[current]
+        if node_lanes[successor] != successor_lane_value:
             raise ValueError("continuation transition chose the wrong target lane")
-        if node_lanes[current] == successor_lane:
+        if node_lanes[current] == successor_lane_value:
             raise ValueError("continuation path retained the same lane across adjacent nodes")
 
+    lane_branch_pattern = re.compile(
+        rf"(?:if|elseif)\s+{re.escape(dispatch_lane)}\s*==\s*({arithmetic_raw})\s+then"
+    )
+    inline_lane_pattern = re.compile(
+        rf"(?:if|elseif)\s+{re.escape(dispatch_lane)}\s*==\s*({arithmetic_raw})\s+and\s*\("
+    )
+    depth_branch_pattern = re.compile(
+        rf"(?:if|elseif)\s+{re.escape(dispatch_steps)}\s*==\s*({arithmetic_raw})\s+then"
+    )
+    lane_branches = [_arithmetic_value(match.group(1)) for match in lane_branch_pattern.finditer(loop_body)]
+    inline_lanes = [_arithmetic_value(match.group(1)) for match in inline_lane_pattern.finditer(loop_body)]
+    depth_branches = [_arithmetic_value(match.group(1)) for match in depth_branch_pattern.finditer(loop_body)]
+    if depth_branches:
+        dispatcher_template = "depth-layered"
+        if loop_kind != "while" or inline_lanes:
+            raise ValueError("depth-layered dispatcher has the wrong loop/lane organization")
+        if set(depth_branches) != set(range(max(depth_branches) + 1)) or len(depth_branches) != len(set(depth_branches)):
+            raise ValueError(f"depth-layered dispatcher has an incomplete depth partition: {depth_branches}")
+        if set(lane_branches) != lanes:
+            raise ValueError("depth-layered dispatcher does not cover every lane")
+    elif inline_lanes:
+        dispatcher_template = "token-threaded"
+        if loop_kind != "repeat" or lane_branches or len(inline_lanes) != len(node_tokens):
+            raise ValueError("token-threaded dispatcher is not one flat lane/token chain")
+        for match, expected_lane in zip(node_matches, (node_lanes[token] for token in node_tokens)):
+            inline = re.search(rf"{re.escape(dispatch_lane)}\s*==\s*({arithmetic_raw})", match.group("prefix"))
+            if not inline or _arithmetic_value(inline.group(1)) != expected_lane:
+                raise ValueError("token-threaded node checks the wrong lane")
+    else:
+        dispatcher_template = "lane-partitioned"
+        if loop_kind != "while" or set(lane_branches) != lanes or len(lane_branches) != len(lanes):
+            raise ValueError("lane-partitioned dispatcher does not contain one complete lane partition")
+
     visited: set[int] = set()
+    node_labels: dict[int, str] = {}
     has_full_lane_path = False
-    for entry in entry_tokens:
+    for entry_index, entry in enumerate(entry_tokens):
         path: set[int] = set()
         path_lanes: set[int] = set()
         current = entry
+        depth = 0
         while current in transitions:
             if current in path:
                 raise ValueError("continuation path contains a cycle")
             path.add(current)
             path_lanes.add(node_lanes[current])
+            node_labels[current] = f"{entry_index}:{depth}"
             current = transitions[current]
+            depth += 1
         path.add(current)
         path_lanes.add(node_lanes[current])
-        if current not in node_tokens:
+        node_labels[current] = f"{entry_index}:{depth}"
+        if current not in terminals:
             raise ValueError("continuation entry does not reach a terminal handler")
         if len(path) < 3 or len(path) > 5:
             raise ValueError(f"continuation path length is outside 3-5 nodes: {len(path)}")
@@ -492,12 +570,32 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     if not has_full_lane_path:
         raise ValueError("no continuation path covers every generated lane")
 
+    # Capture enough normalized structure for cross-build n-gram similarity tests.
+    # Random token values and randomized identifiers are deliberately excluded.
+    first_node = node_matches[0].start()
+    prefix = loop_body[:first_node]
+    prefix_positions = {
+        "G": prefix.find("then"),
+        "M": (re.search(step_mask_assignment, prefix).start()
+              if re.search(step_mask_assignment, prefix) else -1),
+        "R": (re.search(rf"{re.escape(dispatch_matched)}\s*=\s*false;", prefix).start()
+              if re.search(rf"{re.escape(dispatch_matched)}\s*=\s*false;", prefix) else -1),
+    }
+    prefix_order = "".join(label for label, position in sorted(prefix_positions.items(), key=lambda item: item[1]) if position >= 0)
+    shape_sequence = [f"T:{dispatcher_template}", f"P:{prefix_order}", f"U:{update_order}"]
+    shape_sequence.extend(f"D:{value}" for value in depth_branches)
+    shape_sequence.extend(f"B:{value}" for value in lane_branches)
+    shape_sequence.extend(
+        f"N:{node_labels[token]}:L{node_lanes[token]}" for token in node_tokens
+    )
+
     graph_material = ",".join(
         f"{index}:{entry}@{entry_lanes[index]}" for index, entry in enumerate(entry_tokens)
     ) + ";" + ",".join(
         f"{current}@{node_lanes[current]}>{successor}@{transition_lanes[current]}"
         for current, successor in sorted(transitions.items())
     )
+    structure_material = "|".join(shape_sequence)
     continuation = {
         "opcodes": opcode_count,
         "reject_paths": len(reject_paths),
@@ -506,11 +604,15 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         "nodes": len(node_tokens),
         "transitions": len(transitions),
         "terminals": terminal_count,
+        "template": dispatcher_template,
+        "loop": loop_kind,
+        "state_update_order": update_order,
         "periodic_guard_probe": guard_probe,
         "sticky_fault_word": guard_fault,
         "fingerprint": hashlib.sha256(graph_material.encode("ascii")).hexdigest()[:16],
+        "structure_fingerprint": hashlib.sha256(structure_material.encode("ascii")).hexdigest()[:16],
+        "shape_sequence": shape_sequence,
     }
-
     return {
         "domains": domains.as_dict(),
         "chunk": chunk_map,
@@ -542,10 +644,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("generated_vm", type=Path)
     parser.add_argument("--compare", type=Path, help="require a second generation to use different layouts")
+    parser.add_argument(
+        "--include-shape",
+        action="store_true",
+        help="include the normalized dispatcher token sequence for multi-build similarity analysis",
+    )
     args = parser.parse_args()
     try:
         first = derive_runtime_layout(args.generated_vm.read_text("latin1"))
-        print("PASS runtime slot ABI " + json.dumps(json_ready(first), sort_keys=True))
+        display = json_ready(first)
+        if not args.include_shape:
+            display["continuation"].pop("shape_sequence", None)
+        print("PASS runtime slot ABI " + json.dumps(display, sort_keys=True))
         if args.compare:
             second = derive_runtime_layout(args.compare.read_text("latin1"))
             changed = [name for name in ("chunk", "block", "flow", "flow_cache") if first[name] != second[name]]
