@@ -369,6 +369,10 @@ for ((i = 1; i <= RANDOM_RUNS; i++)); do
     obfuscate "$WORK/random.lua"
     cp "$WORK/obfuscator.log" "$WORK/obfuscator-$i.log"
     python3 tests/runtime_layout.py "$ROOT/temp/t2.lua" --include-shape > "$WORK/runtime-layout-$i.out"
+    if (( i <= 5 )); then
+        cp "$WORK/random.lua" "$WORK/extractor-build-$i.lua"
+        cp "$ROOT/temp/t2.lua" "$WORK/extractor-build-$i-vm.lua"
+    fi
     run_executor "$WORK/random.lua" > "$WORK/random.out"
     cmp -s "$WORK/baseline.out" "$WORK/random.out"
 done
@@ -518,16 +522,84 @@ if max_layout_similarity > 0.45 or mean_layout_similarity > 0.10:
         f"normalized VM layouts remain too similar: max={max_layout_similarity:.3f}, "
         f"mean={mean_layout_similarity:.3f}"
     )
+
+# Phase 4 quantifies all five public structural surfaces, including role-slot
+# overlap and payload grammar similarity rather than checking uniqueness alone.
+def slot_similarity(left, right):
+    roles = [(family, semantic) for family in ("chunk", "block", "flow", "flow_cache") for semantic in left[family]]
+    return sum(left[family][semantic] == right[family][semantic] for family, semantic in roles) / len(roles)
+
+slot_similarities = [slot_similarity(left, right) for left, right in combinations(layouts, 2)]
+max_slot_similarity = max(slot_similarities)
+mean_slot_similarity = sum(slot_similarities) / len(slot_similarities)
+if max_slot_similarity > 0.45 or mean_slot_similarity > 0.16:
+    raise SystemExit(
+        f"runtime slot ABIs remain too similar: max={max_slot_similarity:.3f}, mean={mean_slot_similarity:.3f}"
+    )
+
+def grammar_features(layout):
+    features = set()
+    for family in ("outer", "envelope", "record"):
+        features.update(f"{family}:{position}:{field}" for position, field in enumerate(layout[family]))
+    for field in ("ordinal_width", "record_length_width", "page_length_width", "page_length_suffix", "pipeline"):
+        features.add(f"{field}:{layout[field]}")
+    return features
+
+grammar_sets = [grammar_features(layout) for layout in payload_layouts]
+grammar_similarities = [jaccard(left, right) for left, right in combinations(grammar_sets, 2)]
+max_grammar_similarity = max(grammar_similarities)
+mean_grammar_similarity = sum(grammar_similarities) / len(grammar_similarities)
+if max_grammar_similarity > 0.75 or mean_grammar_similarity > 0.38:
+    raise SystemExit(
+        f"payload grammars remain too similar: max={max_grammar_similarity:.3f}, mean={mean_grammar_similarity:.3f}"
+    )
+
+def handler_features(sequence):
+    paths = {}
+    for item in sequence:
+        match = re.fullmatch(r"N:(\d+):(\d+):L(\d+)", item)
+        if match:
+            entry, depth, lane = map(int, match.groups())
+            paths.setdefault(entry, []).append((depth, lane))
+    features = set()
+    for entry, path in paths.items():
+        lanes = [lane for _depth, lane in sorted(path)]
+        # Keep the frozen opcode selector index: a Build-A handler extractor has
+        # no target-B semantic remapping available before it recognizes a path.
+        features.add(f"path:{entry}:" + ">".join(map(str, lanes)))
+        features.update(
+            f"entry-step:{entry}:{index}:{left}>{right}"
+            for index, (left, right) in enumerate(zip(lanes, lanes[1:]))
+        )
+    return features
+
+handler_sets = [handler_features(continuation["shape_sequence"]) for continuation in continuations]
+handler_similarities = [jaccard(left, right) for left, right in combinations(handler_sets, 2)]
+max_handler_similarity = max(handler_similarities)
+mean_handler_similarity = sum(handler_similarities) / len(handler_similarities)
+if max_handler_similarity > 0.35 or mean_handler_similarity > 0.08:
+    raise SystemExit(
+        f"handler path structures remain too similar: max={max_handler_similarity:.3f}, mean={mean_handler_similarity:.3f}"
+    )
 print(
     f"PASS {runs}-build execution-model barrier: counts={sorted(set(counts))}, "
     f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, "
     f"unique graphs/structures/layouts/domains/ABIs/payload-grammars/super-structures={runs}, "
     f"pipelines={sorted({layout['pipeline'] for layout in payload_layouts})}, "
     f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, "
-    f"dispatcher similarity max={max_similarity:.3f} mean={mean_similarity:.3f}, "
-    f"VM-layout similarity max={max_layout_similarity:.3f} mean={mean_layout_similarity:.3f}"
+    f"similarity dispatcher={max_similarity:.3f}/{mean_similarity:.3f}, "
+    f"slot-ABI={max_slot_similarity:.3f}/{mean_slot_similarity:.3f}, "
+    f"payload-grammar={max_grammar_similarity:.3f}/{mean_grammar_similarity:.3f}, "
+    f"VM-layout={max_layout_similarity:.3f}/{mean_layout_similarity:.3f}, "
+    f"handler-path={max_handler_similarity:.3f}/{mean_handler_similarity:.3f} (max/mean)"
 )
 PY
+python3 tests/phase4_cross_build_extractor.py \
+    "$WORK/extractor-build-1.lua" "$WORK/extractor-build-1-vm.lua" \
+    "$WORK/extractor-build-2.lua:$WORK/extractor-build-2-vm.lua" \
+    "$WORK/extractor-build-3.lua:$WORK/extractor-build-3-vm.lua" \
+    "$WORK/extractor-build-4.lua:$WORK/extractor-build-4-vm.lua" \
+    "$WORK/extractor-build-5.lua:$WORK/extractor-build-5-vm.lua"
 echo "PASS randomized opcode handlers and non-identity runtime layouts: $RANDOM_RUNS/$RANDOM_RUNS"
 
 # Tamper with v4's invocation-local flow metadata only after the outer payload
@@ -694,6 +766,27 @@ PY
 run_executor "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
 grep -Eq '^lazy-blocks:[1-9][0-9]*:executed-constant:37$' "$WORK/lazy-instrumented.out"
 echo "PASS paged-source release, current-record instruction lifetime, partitioned constants and opaque block retention"
+
+# Phase 4 uses a larger, branch-rich fixture for median performance gates and a
+# test-only observer over the unminified VM. The observer records only counts,
+# weak references and heap sizes; production output receives no hook or decoder.
+python3 tests/phase4_performance.py \
+    --root "$ROOT" --work "$WORK" --dotnet "$DOTNET" --cli "$CLI" --lua "$LUA" \
+    --fixture "$ROOT/tests/phase4_runtime.lua" \
+    --payload-output "$WORK/phase4-runtime.lua" --vm-output "$WORK/phase4-runtime-vm.lua"
+"$LUAC" -p "$WORK/phase4-runtime.lua"
+"$LUA" tests/phase4_runtime.lua > "$WORK/phase4-runtime-baseline.out"
+run_executor "$WORK/phase4-runtime.lua" > "$WORK/phase4-runtime.out"
+cmp "$WORK/phase4-runtime-baseline.out" "$WORK/phase4-runtime.out"
+python3 tests/phase4_dynamic_dump.py \
+    "$WORK/phase4-runtime-vm.lua" "$WORK/phase4-runtime.lua" "$WORK/phase4-runtime-instrumented.lua"
+"$LUAC" -p "$WORK/phase4-runtime-instrumented.lua"
+run_executor "$WORK/phase4-runtime-instrumented.lua" > "$WORK/phase4-runtime-instrumented.out"
+head -n 1 "$WORK/phase4-runtime-instrumented.out" > "$WORK/phase4-runtime-instrumented-baseline.out"
+cmp "$WORK/phase4-runtime-baseline.out" "$WORK/phase4-runtime-instrumented-baseline.out"
+grep -Eq '^PHASE4_DYNAMIC payload=page:[1-9][0-9]*/[1-9][0-9]* vm=opaque:[1-9][0-9]* chunks=decoded:[2-9][0-9]*,opaque:[1-9][0-9]* constants=max-live:[0-3]/[1-9][0-9]* instructions=weak-live:0/[1-9][0-9]* memory-kb=[0-9]+\.[0-9]>[0-9]+\.[0-9]>[0-9]+\.[0-9]$' \
+    "$WORK/phase4-runtime-instrumented.out"
+echo "PASS Phase 4 dynamic dump, single-Chunk isolation and GC/peak-memory lifecycle barriers"
 
 # Exercise Lua 5.1's SETLIST C == 0 data word without checking in a huge table
 # constructor. A test-only luac wrapper patches the one-element fixture after

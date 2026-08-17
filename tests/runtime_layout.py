@@ -775,6 +775,9 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         "sticky_fault_word": guard_fault,
         "fingerprint": hashlib.sha256(graph_material.encode("ascii")).hexdigest()[:16],
         "structure_fingerprint": hashlib.sha256(structure_material.encode("ascii")).hexdigest()[:16],
+        # Kept in the in-process result for the Phase 4 frozen-extractor test.
+        # The CLI removes raw build-local selector tokens from normal reports.
+        "entry_tokens": entry_tokens,
         "shape_sequence": shape_sequence,
     }
     return {
@@ -820,6 +823,7 @@ def main() -> int:
     try:
         first = derive_runtime_layout(args.generated_vm.read_text("latin1"))
         display = json_ready(first)
+        display["continuation"].pop("entry_tokens", None)
         if not args.include_shape:
             display["continuation"].pop("shape_sequence", None)
             display["vm_layout"].pop("shape_sequence", None)
