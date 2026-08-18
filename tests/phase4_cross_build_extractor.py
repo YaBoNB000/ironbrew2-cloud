@@ -42,7 +42,7 @@ def frozen_payload_recognized(source: str, domains, layout) -> tuple[bool, str]:
         integrity = payload.hash_bytes(((seed ^ payload.INTEGRITY_DOMAIN) * 31 + flags) & MASK32, encrypted)
         if seed == 0 or integrity != values["integrity"]:
             raise ValueError("outer-authentication")
-        envelope = payload.stream_xor(encrypted, seed)
+        envelope = payload.payload_stream_xor(encrypted, seed)
         if len(envelope) < 32:
             raise ValueError("envelope-width")
         envelope_values = {

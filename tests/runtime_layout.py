@@ -194,7 +194,8 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     # Block is built by ten explicit keyed assignments in semantic order.
     block_match = _expect(
         rf"local\s+({IDENT})\s*=\s*\{{\}};\s*"
-        + "".join(rf"\1\[(\d+)\]\s*=\s*[^;]+;\s*" for _ in range(10)),
+        + "".join(rf"\1\[(\d+)\]\s*=\s*[^;]+;\s*" for _ in range(10))
+        + rf"{re.escape(blocks)}\s*\[[^\]]+\]\s*=\s*\1;",
         source,
         "could not recover keyed Block constructor",
     )
@@ -253,8 +254,10 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     )
     guard_bind_name = bind_call.group(1)
     guard_bind = _expect(
-        rf"local\s+function\s+{re.escape(guard_bind_name)}\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*,\s*"
-        rf"({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)",
+        rf"(?:local\s+function\s+{re.escape(guard_bind_name)}\s*\(|"
+        rf"{re.escape(guard_bind_name)}\s*=\s*function\s*\()\s*"
+        rf"({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*,\s*"
+        rf"({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)",
         source,
         "runtime Guard binding does not expose six dispersed state inputs",
     )
@@ -470,7 +473,11 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     guard_probe = periodic_calls[0].group(1)
     if periodic_calls[0].start() >= continuation_init.start():
         raise ValueError("periodic guard probe is not executed before continuation decoding")
-    if not re.search(rf"local\s+function\s+{re.escape(guard_probe)}\s*\(\s*{IDENT}\s*\)", source):
+    if not re.search(
+        rf"(?:local\s+function\s+{re.escape(guard_probe)}\s*\(|"
+        rf"{re.escape(guard_probe)}\s*=\s*function\s*\()\s*{IDENT}\s*\)",
+        source,
+    ):
         raise ValueError("periodic guard call does not resolve to the generated guard probe")
     if not re.search(
         rf"(?:\brepeat|\bwhile\s+true\s+do)\s+{re.escape(guard_probe)}\s*\(\s*false\s*\)\s*;",
@@ -542,22 +549,24 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         "continuation decoder does not consume a sticky guard fault word",
     )
     guard_fault = fault_use.group(1)
-    fault_init = _expect(
-        rf"local\s+{re.escape(guard_fault)}\s*=\s*0\s*;",
-        source,
-        "sticky guard fault word is not initialized to zero",
-    )
+    fault_zero_assignments = list(re.finditer(
+        rf"\b{re.escape(guard_fault)}\s*=\s*0\s*;", source
+    ))
+    if len(fault_zero_assignments) != 1:
+        raise ValueError("sticky guard fault word does not have one initialization")
+    fault_init = fault_zero_assignments[0]
+    if not re.search(rf"local\s+[^;]*\b{re.escape(guard_fault)}\b[^;]*;", source[:fault_init.start()]):
+        raise ValueError("sticky guard fault word is not held in a private local")
     fault_assignments = [
         int(match.group(1))
         for match in re.finditer(rf"\b{re.escape(guard_fault)}\s*=\s*(\d+)\s*;", source)
         if int(match.group(1)) != 0
     ]
-    bare_fault_reset = re.search(
-        rf"(?<!local\s)\b{re.escape(guard_fault)}\s*=\s*0\s*;",
-        source,
-    )
-    if len(fault_assignments) != 1 or bare_fault_reset:
-        raise ValueError(f"sticky guard fault word assignments are invalid: {fault_assignments}")
+    # Rejection is intentionally decentralized across several build-local tight
+    # sinks. Each sink may seed the same continuation fault word before entering
+    # its non-yielding state mixer; no live path may reset it.
+    if not 1 <= len(fault_assignments) <= 4 or len(set(fault_assignments)) != 1:
+        raise ValueError(f"distributed guard fault word assignments are invalid: {fault_assignments}")
     if fault_init.start() >= periodic_calls[0].start():
         raise ValueError("sticky guard fault word is declared after periodic probing")
     if re.search(rf"\b{re.escape(guard_fault)}\b", selector):

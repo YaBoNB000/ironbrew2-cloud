@@ -38,6 +38,7 @@ expected = {
     "payload.domains",
     "payload.outer-seed",
     "payload.serializer",
+    "payload.carrier",
     "runtime.guard",
     "vm.generator",
     "vm.layout",

@@ -101,36 +101,200 @@ namespace IronBrew2.Obfuscator.VM_Generation
             return sb.ToString();
         }
 
-		internal static string[] SplitDataSegs(string data, Random r)
+		private sealed class PayloadCarrierPlan
 		{
-			int n = Math.Max(2, Math.Min(6, data.Length / 200 + (r.Next(2) == 0 ? 1 : 0)));
-			var segs = new List<string>();
-			int baseLen = Math.Max(1, data.Length / n);
-			int pos = 0;
-			for (int i = 0; i < n; i++)
-			{
-				int len = (i == n - 1) ? data.Length - pos : baseLen;
-				if (len <= 0) break;
-				segs.Add(data.Substring(pos, len));
-				pos += len;
-			}
-			if (segs.Count == 0)
-				segs.Add(data);
-			return segs.ToArray();
+			public string Prelude { get; init; }
+			public string[] StageAssignments { get; init; }
+			public string Assembly { get; init; }
+			public int SegmentCount { get; init; }
+			public int CarrierTopology { get; init; }
+			public int AssemblyTopology { get; init; }
+			public int[] StageCounts { get; init; }
 		}
 
-		internal static string[] RandSegNames(int n, Random r)
+		internal static string[] SplitDataSegs(string data, Random r)
 		{
-			var names = new string[n];
-			var used = new HashSet<string>();
-			for (int i = 0; i < n; i++)
+			if (data == null) throw new ArgumentNullException(nameof(data));
+			if (r == null) throw new ArgumentNullException(nameof(r));
+			if (data.Length == 0) return new[] {string.Empty};
+
+			// Production payloads use 7-14 deliberately uneven pieces. The small-input
+			// fallback only lowers that range when there are not enough characters to
+			// keep every segment non-empty.
+			int maximum = Math.Min(14, data.Length);
+			int minimum = Math.Min(7, maximum);
+			int count = minimum == maximum ? minimum : r.Next(minimum, maximum + 1);
+			var weights = Enumerable.Range(0, count).Select(_ => r.Next(37, 181)).ToArray();
+			if (count > 1)
 			{
-				string name;
-				do { name = "s" + r.Next(100000, 999999); } while (used.Contains(name));
-				used.Add(name);
-				names[i] = name;
+				weights[0] = r.Next(37, 55);
+				weights[1] = r.Next(165, 181);
+				weights.Shuffle(r);
 			}
-			return names;
+			var segments = new List<string>(count);
+			int position = 0;
+			int weightLeft = weights.Sum();
+			for (int index = 0; index < count; index++)
+			{
+				int slotsLeft = count - index - 1;
+				int remaining = data.Length - position;
+				int length = slotsLeft == 0
+					? remaining
+					: Math.Max(1, Math.Min(remaining - slotsLeft,
+						(int)Math.Round((double)remaining * weights[index] / weightLeft)));
+				segments.Add(data.Substring(position, length));
+				position += length;
+				weightLeft -= weights[index];
+			}
+			return segments.ToArray();
+		}
+
+		private static string PayloadName(Random random, HashSet<string> used)
+		{
+			string name;
+			do name = "p" + random.Next(100000, 999999); while (!used.Add(name));
+			return name;
+		}
+
+		private static int[] RandomSlots(int count, Random random, int scale = 4)
+		{
+			var slots = new HashSet<int>();
+			while (slots.Count < count) slots.Add(random.Next(2, Math.Max(4, count * scale + 3)));
+			int[] result = slots.ToArray();
+			result.Shuffle(random);
+			return result;
+		}
+
+		private static PayloadCarrierPlan BuildPayloadCarrierPlan(string data, Random random)
+		{
+			string[] segments = SplitDataSegs(data, random);
+			int count = segments.Length;
+			int carrierTopology = random.Next(4);
+			int assemblyTopology = random.Next(4);
+			var usedNames = new HashSet<string>();
+			var prelude = new StringBuilder();
+			var references = new string[count];
+			var assignments = new string[count];
+
+			if (carrierTopology == 0)
+			{
+				string carrier = PayloadName(random, usedNames);
+				int[] slots = RandomSlots(count, random);
+				prelude.Append("local ").Append(carrier).Append("={};\n");
+				for (int index = 0; index < count; index++)
+				{
+					references[index] = carrier + "[" + slots[index] + "]";
+					assignments[index] = references[index] + "='" + segments[index] + "';\n";
+				}
+			}
+			else if (carrierTopology == 1)
+			{
+				string[] carriers = {PayloadName(random, usedNames), PayloadName(random, usedNames)};
+				prelude.Append("local ").Append(carriers[0]).Append(",").Append(carriers[1]).Append("={},{};\n");
+				int[] lanes = Enumerable.Range(0, count).Select(index => index % 2).ToArray();
+				lanes.Shuffle(random);
+				int[][] slots = {RandomSlots(lanes.Count(lane => lane == 0), random), RandomSlots(lanes.Count(lane => lane == 1), random)};
+				int[] lanePositions = {0, 0};
+				for (int index = 0; index < count; index++)
+				{
+					int lane = lanes[index];
+					int slot = slots[lane][lanePositions[lane]++];
+					references[index] = carriers[lane] + "[" + slot + "]";
+					assignments[index] = references[index] + "='" + segments[index] + "';\n";
+				}
+			}
+			else if (carrierTopology == 2)
+			{
+				string carrier = PayloadName(random, usedNames);
+				int laneCount = 2 + random.Next(3);
+				int[] laneKeys = RandomSlots(laneCount, random, 3);
+				prelude.Append("local ").Append(carrier).Append("={");
+				for (int lane = 0; lane < laneCount; lane++)
+					prelude.Append("[").Append(laneKeys[lane]).Append("]={},");
+				prelude.Append("};\n");
+				int[] lanes = Enumerable.Range(0, count).Select(index => index % laneCount).ToArray();
+				lanes.Shuffle(random);
+				var laneSlots = Enumerable.Range(0, laneCount)
+					.Select(lane => RandomSlots(lanes.Count(value => value == lane), random)).ToArray();
+				var lanePositions = new int[laneCount];
+				for (int index = 0; index < count; index++)
+				{
+					int lane = lanes[index];
+					int slot = laneSlots[lane][lanePositions[lane]++];
+					references[index] = carrier + "[" + laneKeys[lane] + "][" + slot + "]";
+					assignments[index] = references[index] + "='" + segments[index] + "';\n";
+				}
+			}
+			else
+			{
+				string carrier = PayloadName(random, usedNames);
+				string writer = PayloadName(random, usedNames);
+				int[] slots = RandomSlots(count, random);
+				prelude.Append("local ").Append(carrier).Append("={};local ").Append(writer)
+					.Append("=function(k,v)").Append(carrier).Append("[k]=v;end;\n");
+				for (int index = 0; index < count; index++)
+				{
+					references[index] = carrier + "[" + slots[index] + "]";
+					assignments[index] = writer + "(" + slots[index] + ",'" + segments[index] + "');\n";
+				}
+			}
+
+			// Every guard stage receives a contiguous logical run, preserving a simple
+			// source-order fallback for authenticated test rewriting while the physical
+			// slots and runtime reads remain independently randomized.
+			int[] stageCounts = Enumerable.Repeat(1, 5).ToArray();
+			for (int remaining = count - stageCounts.Length; remaining > 0; remaining--)
+				stageCounts[random.Next(stageCounts.Length)]++;
+			var stageAssignments = Enumerable.Range(0, 5).Select(_ => new StringBuilder()).ToArray();
+			int segmentIndex = 0;
+			for (int stage = 0; stage < stageAssignments.Length; stage++)
+				for (int item = 0; item < stageCounts[stage]; item++)
+					stageAssignments[stage].Append(assignments[segmentIndex++]);
+
+			string assembly;
+			if (assemblyTopology == 0)
+			{
+				assembly = "local ByteString=decompress(" + string.Join("..", references) + ");\n";
+			}
+			else if (assemblyTopology == 2)
+			{
+				string Balanced(int start, int length)
+				{
+					if (length == 1) return references[start];
+					int left = length / 2;
+					return "(" + Balanced(start, left) + ".." + Balanced(start + left, length - left) + ")";
+				}
+				assembly = "local ByteString=decompress(" + Balanced(0, count) + ");\n";
+			}
+			else
+			{
+				int[] slots = Enumerable.Range(1, count).ToArray();
+				slots.Shuffle(random);
+				int[] sourceOrder = Enumerable.Range(0, count).ToArray();
+				sourceOrder.Shuffle(random);
+				var staged = new StringBuilder("local ByteString;do local EncodedParts={};");
+				foreach (int index in sourceOrder)
+					staged.Append("EncodedParts[").Append(slots[index]).Append("]=").Append(references[index]).Append(";");
+				string orderedReads = string.Join(",", Enumerable.Range(0, count).Select(index => "EncodedParts[" + slots[index] + "]"));
+				if (assemblyTopology == 1)
+					staged.Append("ByteString=decompress(Concat({").Append(orderedReads).Append("}));end;\n");
+				else
+					staged.Append("local EncodedPage={").Append(orderedReads).Append("};local EncodedPartIndex=1;local Encoded=EncodedPage[1];")
+						.Append("while EncodedPartIndex<#EncodedPage do EncodedPartIndex=EncodedPartIndex+1;Encoded=Encoded..EncodedPage[EncodedPartIndex];end;")
+						.Append("ByteString=decompress(Encoded);end;\n");
+				assembly = staged.ToString();
+			}
+
+			return new PayloadCarrierPlan
+			{
+				Prelude = prelude.ToString(),
+				StageAssignments = stageAssignments.Select(value => value.ToString()).ToArray(),
+				Assembly = assembly,
+				SegmentCount = count,
+				CarrierTopology = carrierTopology,
+				AssemblyTopology = assemblyTopology,
+				StageCounts = stageCounts
+			};
 		}
 
 		public static string CompressedToString(List<int> compressed)
@@ -678,6 +842,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			BuildRandom dispatcherRandom = _context.Seed.GetStream("dispatcher.template");
 			BuildRandom layoutRandom = _context.Seed.GetStream("vm.layout");
 			Random guardRandom = _context.Seed.GetStream("runtime.guard");
+			Random payloadCarrierRandom = _context.Seed.GetStream("payload.carrier");
 			VMLayout vmLayout = VMLayoutSelector.Select(layoutRandom);
 
 			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
@@ -765,7 +930,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetInfo","GuardInfo","GuardInspector",
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardEnvironmentRead","GuardGetGenV",
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
-				"GuardEpoch","GuardState","GuardSeal","GuardTripped","GuardFaultWord","GuardLuaProbe","GuardProbeValue","GuardFunction",
+				"GuardEpoch","GuardState","GuardSeal","GuardSealA","GuardSealB","GuardSealC","GuardTripped","GuardFaultWord","GuardLuaProbe","GuardProbeValue","GuardFunction",
+				"GuardKeyBytes","GuardKeyMeta","GuardKeyCache","GuardKey","GuardKeyRecord","GuardKeyParts","GuardKeyIndex",
 				"GuardPayloadState","GuardPayloadSeal","GuardPayloadActive","GuardPayloadExpectedSeal","GuardBindPayload","GuardPayloadLow","GuardPayloadHigh",
 				"GuardVMState","GuardChunkState","GuardEntryState","GuardInstructionPoint","GuardVMLow","GuardVMHigh","GuardChunkLow","GuardChunkHigh","GuardEntryLow","GuardEntryHigh","GuardOpcodeState","GuardOpcodeSeal","GuardOpcodeLow","GuardOpcodeHigh",
 				"GuardProbe","Force","GuardScore","GuardHeavy",
@@ -788,7 +954,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardActivated","GuardActivatedOK","GuardActivatedValid","GuardActiveCallOK","GuardActiveCallResult","GuardActiveProto","GuardCConstantsOK","GuardCOK","GuardCProtoOK",
 				"GuardCProtosOK","GuardCResult","GuardCSetupOK","GuardCUpvalues","GuardCUpvaluesOK","GuardCapabilityMarker","GuardCapabilityOld","GuardClassifies","GuardExpectedC",
 				"GuardInactiveCallOK","GuardInactiveCallResult","GuardInactiveProto","GuardInactiveProtoOK","GuardInactiveType","GuardInvalidError","GuardInvalidFunction","GuardInvalidOK","GuardInvalidSource","GuardLOK","GuardLResult",
-				"GuardPersistent","GuardProtoConstants","GuardProtoConstantsOK","GuardProtosValid","GuardReject","GuardRepeatEnvironment","GuardRepeatOK","GuardReportOnly","GuardSawInactiveProto","GuardSeparated",
+				"GuardPersistent","GuardProtoConstants","GuardProtoConstantsOK","GuardProtosValid","GuardReject","GuardRejectA","GuardRejectB","GuardRejectC","GuardRejectD","GuardRepeatEnvironment","GuardRepeatOK","GuardReportOnly","GuardSawInactiveProto","GuardSeparated",
 				"GuardThreadMarker","GuardThreadOld","GuardCanaryOK","GuardCapabilityRestoreOK","GuardThreadRestoreOK","GuardWrappedUpvalues","GuardWrappedUpvaluesOK",
 				"GuardPrimitiveIndex","GuardPrimitives",
 				"PayloadRejectA","PayloadRejectB","PayloadRejectC","PayloadRejectD",
@@ -1072,6 +1238,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			string ApplyBuildDomains(string code)
 			{
 				BuildDomains domains = _context.Domains;
+				PayloadDerivationProfile derivation = _context.PayloadDerivation;
 				PayloadFormatLayout format = _context.PayloadFormat;
 				string EnvelopeTarget(EnvelopeHeaderField field) => field switch
 				{
@@ -1128,11 +1295,15 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					["__IB2_PAGE_MIN_FRAME__"] = (format.PageLengthWidth + 1).ToString(),
 					["__IB2_PAGE_LENGTH_WIDTH__"] = format.PageLengthWidth.ToString(),
 					["__IB2_PAGE_LENGTH_OFFSET__"] = format.PageLengthSuffix ? $"Descriptor[2] - {format.PageLengthWidth}" : "0",
-					["__IB2_PAGE_PIPELINE__"] = format.PipelineVariant.ToString()
+					["__IB2_PAGE_PIPELINE__"] = format.PipelineVariant.ToString(),
+					["__IB2_PAGE_BYTE_TRANSFORM__"] = format.ByteTransformVariant.ToString(),
+					["__IB2_PAGE_BYTE_PARAMETER__"] = format.ByteTransformParameter.ToString(),
+					["__IB2_STREAM_MULTIPLIER__"] = derivation.StreamMultiplier.ToString(),
+					["__IB2_STREAM_INCREMENT__"] = derivation.StreamIncrement.ToString()
 				};
 				foreach (KeyValuePair<string, string> replacement in replacements)
 					code = code.Replace(replacement.Key, replacement.Value);
-				if (Regex.IsMatch(code, @"__IB2_(?:DOMAIN|BLOCK_FIELD|FLOW_VERIFIER|ENTROPY_RECORD|DATA_RECORD|OUTER_|ENVELOPE_|RECORD_|PAGE_)"))
+				if (Regex.IsMatch(code, @"__IB2_(?:DOMAIN|BLOCK_FIELD|FLOW_VERIFIER|ENTROPY_RECORD|DATA_RECORD|OUTER_|ENVELOPE_|RECORD_|PAGE_|STREAM_)"))
 					throw new InvalidOperationException("A per-build runtime layout or domain placeholder was not replaced.");
 				return code;
 			}
@@ -1310,8 +1481,13 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			}
 
 			byte[] bs = new Serializer(_context, settings).SerializeLChunk(_context.HeadChunk);
+			string data = Base91Encode(bs);
+			PayloadCarrierPlan payloadCarrier = BuildPayloadCarrierPlan(data, payloadCarrierRandom);
+			Console.WriteLine("Payload carrier: segments=" + payloadCarrier.SegmentCount
+				+ "; carrier=" + payloadCarrier.CarrierTopology
+				+ "; assembly=" + payloadCarrier.AssemblyTopology
+				+ "; stages=" + string.Join(",", payloadCarrier.StageCounts) + ".");
 
-			
 			vm += T(@"return(function()
 local Byte         = string.byte;
 local Char         = string.char;
@@ -1334,32 +1510,36 @@ local ToString     = tostring;
 local Unpack = unpack or table.unpack;
 local ToNumber = tonumber;");
 
+			// Carrier declarations remain in the outer loader scope, while each literal
+			// assignment is injected only after identifier rewriting. This avoids
+			// mutating identifier-looking byte sequences inside Base91 data.
+			vm += payloadCarrier.Prelude;
 			if (settings.AntiDump)
-				vm += T(AntiDumpGenerator.GenerateRuntimeGuard(
+			{
+				string guard = T(AntiDumpGenerator.GenerateRuntimeGuard(
 					37 + r.Next(36),
 					(uint) r.Next(1, int.MaxValue),
 					_context.Binder.AttestationToken,
 					guardRandom));
+				for (int stage = 0; stage < payloadCarrier.StageAssignments.Length; stage++)
+				{
+					string marker = "--__IB2_GUARD_STAGE_" + (stage + 1) + "__";
+					if (!guard.Contains(marker, StringComparison.Ordinal))
+						throw new InvalidOperationException("Payload carrier guard stage is missing: " + (stage + 1));
+					guard = guard.Replace(marker, payloadCarrier.StageAssignments[stage], StringComparison.Ordinal);
+				}
+				vm += guard;
+			}
+			else
+			{
+				vm += string.Concat(payloadCarrier.StageAssignments);
+			}
 
-			// 数据切片:base92 字符串拆成 2-6 小段,以 local <随机名>='段' 形式散布在产物各处,
-			// 最后统一拼接 —— 视觉上与代码交织,不再是一整块孤立的"数据区"
-			// 注意:段声明必须全部位于最外层作用域(decompress 前/后 与 Deserialize 结束后的外层),
-			// 若放进 Deserialize 等函数体内,luasrcdiet --opt-locals 重命名会造成声明/引用不一致
-			// 数据总是 base91 编码;LZ77 压缩与否已由 Serializer 写入 header 的 flag,VM 端按 flag 决定是否解压
-			string data = Base91Encode(bs);
-
-			string[] segs = SplitDataSegs(data, r);
-			string[] segNames = RandSegNames(segs.Length, r);
-			vm += "local " + segNames[0] + "='" + segs[0] + "';\n";
-
+			// Data is always Base91 encoded; Serializer records whether the restored
+			// body itself is compressed. Runtime carrier topology is independent from
+			// the decoder and from logical segment order.
 			vm += T("local function decompress(b)local out={}local v=-1;local acc=0;local bits=0;for i=1,#b do local z=Byte(Sub(b,i,i));local d=z-33;if z>39 then d=d-1 end;if z>92 then d=d-1 end;if d>=0 and d<=90 then if v<0 then v=d else v=v+d*91;acc=acc+v*(2^bits);if(v%8192)>88 then bits=bits+13 else bits=bits+14 end;while bits>=8 do out[#out+1]=Char(acc%256);acc=(acc-acc%256)/256;bits=bits-8 end;v=-1 end end end;if v>=0 then acc=acc+v*(2^bits);bits=bits+7;while bits>=8 do out[#out+1]=Char(acc%256);acc=(acc-acc%256)/256;bits=bits-8 end end;return Concat(out)end;");
-
-			vm += "local " + segNames[1] + "='" + segs[1] + "';\n";
-
-			for (int i = 2; i < segs.Length; i++)
-				vm += "local " + segNames[i] + "='" + segs[i] + "';\n";
-
-			vm += T("local ByteString=decompress(") + string.Join("..", segNames) + T(");\n");
+			vm += T(payloadCarrier.Assembly);
 
 			int maxConstants = 0;
 

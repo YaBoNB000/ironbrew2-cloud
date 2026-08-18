@@ -205,7 +205,11 @@ root = re.search(
 if not root:
     raise SystemExit("post-deserialize forced guard/sink call not found")
 probe = root.group(2)
-if not re.search(r"local\s+function\s+" + re.escape(probe) + r"\s*\(", source):
+if not re.search(
+    r"(?:local\s+function\s+" + re.escape(probe) +
+    r"\s*\(|\b" + re.escape(probe) + r"\s*=\s*function\s*\()",
+    source,
+):
     raise SystemExit("guard definition not found")
 if len(re.findall(r"\b" + re.escape(probe) + r"\s*\(true\)", source)) < 3:
     raise SystemExit("startup, post-deserialize and first-block forced guards are not all present")
@@ -248,7 +252,8 @@ if len(calls) != 1:
     raise SystemExit(f"expected one six-state Guard/payload bind call, found {len(calls)}")
 bind_name = calls[0].group(1)
 declaration = re.search(
-    rf"local\s+function\s+{re.escape(bind_name)}\s*\([^)]*\)(.*?)\nend;",
+    rf"(?:local\s+function\s+{re.escape(bind_name)}\s*\([^)]*\)|"
+    rf"\b{re.escape(bind_name)}\s*=\s*function\s*\([^)]*\))(.*?)\nend;",
     source,
     re.S,
 )
@@ -369,6 +374,7 @@ for ((i = 1; i <= RANDOM_RUNS; i++)); do
     obfuscate "$WORK/random.lua"
     cp "$WORK/obfuscator.log" "$WORK/obfuscator-$i.log"
     python3 tests/runtime_layout.py "$ROOT/temp/t2.lua" --include-shape > "$WORK/runtime-layout-$i.out"
+    python3 tests/payload_carrier_layout.py "$WORK/random.lua" "$WORK/obfuscator-$i.log" > "$WORK/payload-carrier-$i.out"
     if (( i <= 5 )); then
         cp "$WORK/random.lua" "$WORK/extractor-build-$i.lua"
         cp "$ROOT/temp/t2.lua" "$WORK/extractor-build-$i-vm.lua"
@@ -388,12 +394,14 @@ runs = int(sys.argv[2])
 if runs < 5:
     raise SystemExit("opcode polymorphism comparison requires at least five builds")
 layouts = []
+payload_carriers = []
 for index in range(1, runs + 1):
     line = (work / f"runtime-layout-{index}.out").read_text().strip().splitlines()[-1]
     marker = "PASS runtime slot ABI "
     if not line.startswith(marker):
         raise SystemExit(f"missing runtime layout result for build {index}")
     layouts.append(json.loads(line[len(marker):]))
+    payload_carriers.append(json.loads((work / f"payload-carrier-{index}.out").read_text()))
 
 continuations = [layout["continuation"] for layout in layouts]
 vm_layouts = [layout["vm_layout"] for layout in layouts]
@@ -429,9 +437,30 @@ def payload_layout(domains):
         "page_length_width": 2 if ((domain >> 11) & 1) == 0 else 4,
         "page_length_suffix": ((domain >> 15) & 1) != 0,
         "pipeline": domains["decode_pipeline"] % 3,
+        "byte_transform": (domains["decode_pipeline"] >> 8) % 4,
+        "byte_parameter": (
+            ((domains["decode_pipeline"] >> 18) % 7) + 1
+            if ((domains["decode_pipeline"] >> 8) % 4) == 3
+            else ((domains["decode_pipeline"] >> 16) ^ domain) & 0xFF
+        ),
+    }
+
+def derivation_profile(domains):
+    binder_multiplier = ((domains["flow"] ^ domains["payload_format"]) & 0xFFFF) | 1
+    if binder_multiplier == 1:
+        binder_multiplier = 3
+    stream_seed = (domains["envelope_mask"] ^ domains["decode_pipeline"]) % 1048572
+    return {
+        "binder_multiplier": binder_multiplier,
+        "binder_increment": ((domains["chunk_state"] ^ domains["decode_pipeline"]) & 0xFFFF) | 1,
+        "binder_initial": domains["envelope_mask"] ^ domains["prototype_integrity"],
+        "binder_final_xor": domains["integrity"] ^ domains["block_integrity"],
+        "stream_multiplier": (stream_seed & 0xFFFFFC) + 5,
+        "stream_increment": ((domains["entropy_digest"] ^ domains["payload_format"]) & 0x3FFFFFFF) | 1,
     }
 
 payload_layouts = [payload_layout(layout["domains"]) for layout in layouts]
+derivation_profiles = [derivation_profile(layout["domains"]) for layout in layouts]
 payload_layout_vectors = [json.dumps(layout, sort_keys=True) for layout in payload_layouts]
 super_records = []
 for index in range(1, runs + 1):
@@ -463,6 +492,24 @@ if set(vm_layout_templates) != expected_vm_layouts:
     raise SystemExit(f"not all VM layout templates were emitted: {sorted(set(vm_layout_templates))}")
 if len(set(vm_layout_fingerprints)) != runs:
     raise SystemExit("a VM state carrier layout was reused across builds")
+carrier_topologies = {layout["carrier"] for layout in payload_carriers}
+assembly_topologies = {layout["assembly"] for layout in payload_carriers}
+segment_counts = {layout["segments"] for layout in payload_carriers}
+carrier_vectors = {
+    (layout["segments"], layout["carrier"], layout["assembly"], tuple(layout["stages"]))
+    for layout in payload_carriers
+}
+if len(carrier_topologies) < 3 or len(assembly_topologies) < 3:
+    raise SystemExit(
+        f"payload carrier/assembly topology coverage is insufficient: "
+        f"carrier={sorted(carrier_topologies)}, assembly={sorted(assembly_topologies)}"
+    )
+if len(segment_counts) < 4:
+    raise SystemExit(f"payload segment cardinality did not vary sufficiently: {sorted(segment_counts)}")
+if len(carrier_vectors) != runs:
+    raise SystemExit("a complete payload carrier/stage layout was reused across builds")
+if min(layout["interleaved_gaps"] for layout in payload_carriers) < 4:
+    raise SystemExit("a payload carrier was not distributed across all five guard stages")
 if len(set(update_orders)) < 2:
     raise SystemExit(f"dispatcher transition ordering did not vary: {update_orders}")
 if len(set(domain_vectors)) != runs:
@@ -471,6 +518,15 @@ if len(set(payload_layout_vectors)) != runs:
     raise SystemExit("a complete payload grammar/pipeline layout was reused across builds")
 if {layout["pipeline"] for layout in payload_layouts} != {0, 1, 2}:
     raise SystemExit("not all three decode pipelines were emitted")
+if len({layout["byte_transform"] for layout in payload_layouts}) < 3:
+    raise SystemExit("payload byte-transform topology did not vary sufficiently")
+if len({(layout["pipeline"], layout["byte_transform"]) for layout in payload_layouts}) < 7:
+    raise SystemExit("combined payload decode topology did not vary sufficiently")
+if len({json.dumps(profile, sort_keys=True) for profile in derivation_profiles}) != runs:
+    raise SystemExit("a complete payload seed/stream derivation recipe was reused across builds")
+if any(profile["stream_multiplier"] % 4 != 1 or profile["stream_increment"] % 2 != 1
+       for profile in derivation_profiles):
+    raise SystemExit("a payload stream recipe does not provide a full-period 32-bit LCG")
 if len({tuple(layout["outer"]) for layout in payload_layouts}) < 4:
     raise SystemExit("payload outer-field ordering did not vary sufficiently")
 if len({tuple(layout["envelope"]) for layout in payload_layouts}) < runs // 2:
@@ -586,6 +642,11 @@ print(
     f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, "
     f"unique graphs/structures/layouts/domains/ABIs/payload-grammars/super-structures={runs}, "
     f"pipelines={sorted({layout['pipeline'] for layout in payload_layouts})}, "
+    f"byte transforms={sorted({layout['byte_transform'] for layout in payload_layouts})}, "
+    f"decode combinations={len({(layout['pipeline'], layout['byte_transform']) for layout in payload_layouts})}, "
+    f"derivation recipes={len({json.dumps(profile, sort_keys=True) for profile in derivation_profiles})}, "
+    f"payload carriers={sorted(carrier_topologies)}, assemblies={sorted(assembly_topologies)}, "
+    f"segments={sorted(segment_counts)}, "
     f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, "
     f"similarity dispatcher={max_similarity:.3f}/{mean_similarity:.3f}, "
     f"slot-ABI={max_slot_similarity:.3f}/{mean_slot_similarity:.3f}, "

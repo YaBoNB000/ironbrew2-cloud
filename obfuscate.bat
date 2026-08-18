@@ -1,3 +1,4 @@
+:; exec bash tools/obfuscate-bat-linux.sh "$@"
 @echo off
 setlocal enabledelayedexpansion
 title IronBrew2 Obfuscator
@@ -25,14 +26,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem ---- check the obfuscator DLL ----
-if not exist "%CLI%" (
-    echo [ERROR] Obfuscator not found:
-    echo   %CLI%
-    echo Build it once with:
-    echo   dotnet build "IronBrew2 CLI\IronBrew2 CLI.csproj" -c Release
+rem ---- keep the shipped Release DLL synchronized with current source ----
+echo [BUILD] Synchronizing Release binaries with the current source...
+dotnet build "IronBrew2 CLI\IronBrew2 CLI.csproj" -c Release --nologo
+if errorlevel 1 (
+    echo [ERROR] Release build failed.
     echo.
-    pause
+    if not defined IB2_NO_PAUSE pause
+    exit /b 1
+)
+if not exist "%CLI%" (
+    echo [ERROR] Obfuscator not found after build:
+    echo   %CLI%
+    echo.
+    if not defined IB2_NO_PAUSE pause
     exit /b 1
 )
 
@@ -53,6 +60,7 @@ if "%~1"=="" (
 )
 
 set /a N=0
+set /a FAIL=0
 
 :next
 if "%~1"=="" goto finish
@@ -86,12 +94,14 @@ dotnet "%CLI%" "!INP!"
 
 if errorlevel 1 (
     echo [FAILED] !INP! - obfuscator returned an error
+    set /a FAIL=1
     shift
     goto next
 )
 
 if not exist "out.lua" (
-    echo [FAILED] out.lua was not created for: !INP!
+    echo [FAILED] a fresh out.lua was not created for: !INP!
+    set /a FAIL=1
     shift
     goto next
 )
@@ -101,6 +111,7 @@ if exist "!OUT!" (
     echo [OK] output: !OUT!
 ) else (
     echo [FAILED] cannot write: !OUT!
+    set /a FAIL=1
 )
 
 shift
@@ -114,5 +125,5 @@ if !N! GTR 0 (
     echo No file was obfuscated.
 )
 echo.
-pause
-exit /b 0
+if not defined IB2_NO_PAUSE pause
+exit /b !FAIL!

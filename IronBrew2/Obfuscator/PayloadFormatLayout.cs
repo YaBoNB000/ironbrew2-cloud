@@ -45,6 +45,8 @@ namespace IronBrew2.Obfuscator
 		public int PageLengthWidth { get; }
 		public bool PageLengthSuffix { get; }
 		public int PipelineVariant { get; }
+		public int ByteTransformVariant { get; }
+		public int ByteTransformParameter { get; }
 
 		public int OuterHeadOffset => FieldOffset(OuterHeaderOrder, OuterHeaderField.Head, OuterWidth);
 		public int OuterIntegrityOffset => FieldOffset(OuterHeaderOrder, OuterHeaderField.Integrity, OuterWidth);
@@ -69,6 +71,10 @@ namespace IronBrew2.Obfuscator
 			PageLengthWidth = ((domains.PayloadFormatDomain >> 11) & 1u) == 0 ? 2 : 4;
 			PageLengthSuffix = ((domains.PayloadFormatDomain >> 15) & 1u) != 0;
 			PipelineVariant = (int)(domains.DecodePipelineDomain % 3u);
+			ByteTransformVariant = (int)((domains.DecodePipelineDomain >> 8) % 4u);
+			ByteTransformParameter = ByteTransformVariant == 3
+				? (int)(((domains.DecodePipelineDomain >> 18) % 7u) + 1u)
+				: (int)(((domains.DecodePipelineDomain >> 16) ^ domains.PayloadFormatDomain) & 0xFFu);
 		}
 
 		public int EnvelopeSlot(EnvelopeHeaderField field) =>

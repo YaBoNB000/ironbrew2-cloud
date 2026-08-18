@@ -194,7 +194,7 @@ local function EnvelopeRead8()
     local CipherByte = Byte(PayloadCiphertext, EnvelopeCipherPos, EnvelopeCipherPos);
     local KeyByte = (EnvelopeCipherState - EnvelopeCipherState % 16777216) / 16777216;
     local PlainByte = BitXOR(CipherByte, KeyByte);
-    EnvelopeCipherState = (EnvelopeCipherState * 1664525 + 1013904223) % 4294967296;
+    EnvelopeCipherState = (EnvelopeCipherState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
     EnvelopeCipherPos = EnvelopeCipherPos + 1;
     EnvelopePlainPos = EnvelopePlainPos + 1;
     if EnvelopePlainPos < __IB2_ENVELOPE_INTEGRITY_START__ or EnvelopePlainPos > __IB2_ENVELOPE_INTEGRITY_END__ then
@@ -264,7 +264,7 @@ for EnvelopeIndex = 1, EnvelopeEntropyCount do
         local KeyByte = (DescriptorState - DescriptorState % 16777216) / 16777216;
         local PlainByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + DescriptorOffset, Descriptor[1] + DescriptorOffset), KeyByte);
         EntropyHash = (EntropyHash * 31 + PlainByte) % 4294967296;
-        DescriptorState = (DescriptorState * 1664525 + 1013904223) % 4294967296;
+        DescriptorState = (DescriptorState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
     end;
 end;
 EntropyDescriptors = nil;
@@ -290,8 +290,8 @@ for PageOrdinal = 1, EnvelopeDataCount do
             RawLength = RawLength + BitXOR(NestedByte, InnerKey) * Multiplier;
             Multiplier = Multiplier * 256;
         end;
-        DescriptorState = (DescriptorState * 1664525 + 1013904223) % 4294967296;
-        EnvelopeMaskState = (EnvelopeMaskState * 1664525 + 1013904223) % 4294967296;
+        DescriptorState = (DescriptorState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
+        EnvelopeMaskState = (EnvelopeMaskState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
     end;
     if RawLength < 1 or RawLength > 6144 then error('invalid protected payload', 0); end;
     Descriptor[5] = RawLength;
@@ -326,8 +326,8 @@ local function LoadPayloadPage()
             EncodedParts[EncodedIndex] = PlainByte;
             EncodedIndex = EncodedIndex + 1;
         end;
-        DescriptorState = (DescriptorState * 1664525 + 1013904223) % 4294967296;
-        MaskState = (MaskState * 1664525 + 1013904223) % 4294967296;
+        DescriptorState = (DescriptorState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
+        MaskState = (MaskState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
     end;
     if FramedLength ~= Descriptor[5] then error('invalid protected payload', 0); end;
     if __IB2_PAGE_PIPELINE__ == 1 then
@@ -337,12 +337,28 @@ local function LoadPayloadPage()
             Left, Right = Left + 1, Right - 1;
         end;
     elseif __IB2_PAGE_PIPELINE__ == 2 then
-        local PipelineState = BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), __IB2_DOMAIN_DECODE_PIPELINE__), (PayloadPageOrdinal * 2654435769) % 4294967296);
+        local PipelineState = BitXOR(BitXOR(BitXOR(BitXOR(OuterSeed, EnvelopeNonce), EnvelopeDigest), __IB2_DOMAIN_DECODE_PIPELINE__), (PayloadPageOrdinal * 2654435769) % 4294967296) % 4294967296;
         for PipelineIndex = 1, #EncodedParts do
             local TransformedByte = EncodedParts[PipelineIndex];
             local PlainByte = BitXOR(TransformedByte, (PipelineState - PipelineState % 16777216) / 16777216);
             EncodedParts[PipelineIndex] = PlainByte;
-            PipelineState = (PipelineState * 1664525 + 1013904223 + PlainByte + PipelineIndex - 1) % 4294967296;
+            PipelineState = (PipelineState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__ + PlainByte + PipelineIndex - 1) % 4294967296;
+        end;
+    end;
+    if __IB2_PAGE_BYTE_TRANSFORM__ == 1 then
+        for EncodedPartIndex = 1, #EncodedParts do
+            local PlainByte = EncodedParts[EncodedPartIndex];
+            EncodedParts[EncodedPartIndex] = (PlainByte % 16) * 16 + (PlainByte - PlainByte % 16) / 16;
+        end;
+    elseif __IB2_PAGE_BYTE_TRANSFORM__ == 2 then
+        local PageByteMask = (__IB2_PAGE_BYTE_PARAMETER__ + PayloadPageOrdinal * 29) % 256;
+        for EncodedPartIndex = 1, #EncodedParts do EncodedParts[EncodedPartIndex] = BitXOR(EncodedParts[EncodedPartIndex], PageByteMask); end;
+    elseif __IB2_PAGE_BYTE_TRANSFORM__ == 3 then
+        local RotateDivisor = 2 ^ __IB2_PAGE_BYTE_PARAMETER__;
+        local RotateFactor = 2 ^ (8 - __IB2_PAGE_BYTE_PARAMETER__);
+        for EncodedPartIndex = 1, #EncodedParts do
+            local PlainByte = EncodedParts[EncodedPartIndex];
+            EncodedParts[EncodedPartIndex] = (PlainByte - PlainByte % RotateDivisor) / RotateDivisor + (PlainByte % RotateDivisor) * RotateFactor;
         end;
     end;
     for EncodedPartIndex = 1, #EncodedParts do EncodedParts[EncodedPartIndex] = Char(EncodedParts[EncodedPartIndex]); end;

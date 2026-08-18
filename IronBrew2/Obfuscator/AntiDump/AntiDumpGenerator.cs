@@ -32,8 +32,62 @@ namespace IronBrew2.Obfuscator.AntiDump
 
         private static uint MixWord(uint hash, uint value) => unchecked(hash * 31u + value);
 
-        private static string LuaChars(string value) =>
-            "Char(" + string.Join(",", Encoding.ASCII.GetBytes(value).Select(item => item.ToString())) + ")";
+        private sealed class KeyVault
+        {
+            public string Prelude { get; init; }
+            public Dictionary<string, string> References { get; init; }
+        }
+
+        /// <summary>
+        /// Packs executor and host lookup keys into one build-local additive stream.
+        /// Tokens, byte positions, per-key states, padding and descriptor order all
+        /// vary per build, so the runtime has no stable plaintext API sequence.
+        /// </summary>
+        private static KeyVault BuildKeyVault(Dictionary<string, string> values, Random random)
+        {
+            var entries = values.ToList();
+            for (int index = entries.Count - 1; index > 0; index--)
+            {
+                int swap = random.Next(index + 1);
+                (entries[index], entries[swap]) = (entries[swap], entries[index]);
+            }
+
+            var bytes = new List<int>();
+            var descriptors = new List<string>();
+            var references = new Dictionary<string, string>();
+            var tokens = new HashSet<int>();
+            foreach (KeyValuePair<string, string> entry in entries)
+            {
+                for (int pad = 0; pad < random.Next(1, 6); pad++) bytes.Add(random.Next(256));
+                int token;
+                do token = random.Next(10000, int.MaxValue); while (!tokens.Add(token));
+                int start = bytes.Count + 1;
+                int seed = random.Next(1, 256);
+                int step = random.Next(1, 256);
+                byte[] plain = Encoding.ASCII.GetBytes(entry.Value);
+                for (int index = 0; index < plain.Length; index++)
+                    bytes.Add((plain[index] + seed + (index + 1) * step) % 256);
+                descriptors.Add("[" + token + "]={" + start + "," + plain.Length + "," + seed + "," + step + "}");
+                references[entry.Key] = "GuardKey(" + token + ")";
+            }
+            for (int pad = 0; pad < random.Next(3, 9); pad++) bytes.Add(random.Next(256));
+            for (int index = descriptors.Count - 1; index > 0; index--)
+            {
+                int swap = random.Next(index + 1);
+                (descriptors[index], descriptors[swap]) = (descriptors[swap], descriptors[index]);
+            }
+
+            string prelude = "local GuardKeyBytes={" + string.Join(",", bytes) + "};" +
+                "local GuardKeyMeta={" + string.Join(",", descriptors) + "};" +
+                "local GuardKeyCache={};" +
+                "local function GuardKey(GuardLookupKey)" +
+                "local GuardLookupValue=GuardKeyCache[GuardLookupKey];if GuardLookupValue then return GuardLookupValue end;" +
+                "local GuardKeyRecord=GuardKeyMeta[GuardLookupKey];if not GuardKeyRecord then return nil end;" +
+                "local GuardKeyParts={};for GuardKeyIndex=1,GuardKeyRecord[2] do " +
+                "GuardKeyParts[GuardKeyIndex]=Char((GuardKeyBytes[GuardKeyRecord[1]+GuardKeyIndex-1]-GuardKeyRecord[3]-GuardKeyIndex*GuardKeyRecord[4])%256);end;" +
+                "GuardLookupValue=Concat(GuardKeyParts);GuardKeyCache[GuardLookupKey]=GuardLookupValue;return GuardLookupValue;end;";
+            return new KeyVault { Prelude = prelude, References = references };
+        }
 
         private static string BuildDecoyGraph(uint seed, Random random)
         {
@@ -61,7 +115,7 @@ local function GuardBXor(GuardLeft, GuardRight)
     return GuardXorValue;
 end;
 
-local function GuardDecoy(...)
+GuardDecoy = function(...)
     local GuardValue = (__IB2_DECOY_SEED__ + GuardState + Select('#', ...)) % 2147483648;
     local GuardLaneA = (GuardValue * __IB2_DECOY_MUL_A__ + __IB2_DECOY_ADD_A__) % 2147483648;
     local GuardLaneB = (GuardValue * __IB2_DECOY_MUL_B__ + __IB2_DECOY_ADD_B__) % 2147483648;
@@ -153,8 +207,71 @@ local function GuardDecoy(...)
             uint attestationOffset = unchecked(attestationToken - transcriptExpected);
             uint faultWord = unchecked((uint)random.NextInt64(0, 1L << 32));
             if (faultWord == 0) faultWord = 0xC2B2AE35u;
+            uint sealSaltB = unchecked((uint)random.NextInt64(1, int.MaxValue));
+            uint sealSaltC = unchecked((uint)random.NextInt64(1, int.MaxValue));
+
+            var keyValues = new Dictionary<string, string>
+            {
+                ["__KEY_GETGENV__"] = "getgenv",
+                ["__KEY_ENV_CANARY__"] = RN(random, 14, 20),
+                ["__KEY_IDENTIFY__"] = "identifyexecutor",
+                ["__KEY_CHECKCALLER__"] = "checkcaller",
+                ["__KEY_ISC__"] = "iscclosure",
+                ["__KEY_ISL__"] = "islclosure",
+                ["__KEY_NEWC__"] = "newcclosure",
+                ["__KEY_LOADSTRING__"] = "loadstring",
+                ["__KEY_TYPEOF__"] = "typeof",
+                ["__KEY_GAME__"] = "game",
+                ["__KEY_INSTANCE__"] = "Instance",
+                ["__KEY_VECTOR3__"] = "Vector3",
+                ["__KEY_TASK__"] = "task",
+                ["__KEY_GETINFO__"] = "getinfo",
+                ["__KEY_INFO__"] = "info",
+                ["__KEY_GETCONSTANTS__"] = "getconstants",
+                ["__KEY_GETUPVALUES__"] = "getupvalues",
+                ["__KEY_GETPROTO__"] = "getproto",
+                ["__KEY_GETPROTOS__"] = "getprotos",
+                ["__KEY_SETUPVALUE__"] = "setupvalue",
+                ["__VALUE_PLAYERS__"] = "Players",
+                ["__VALUE_VECTOR3__"] = "Vector3",
+                ["__VALUE_INVALID_CHUNK__"] = RN(random, 10, 16),
+                ["__VALUE_INVALID_SOURCE__"] = "return )",
+                ["__VALUE_LOAD_PREFIX__"] = "return "
+            };
+            KeyVault keyVault = BuildKeyVault(keyValues, random);
+
+            var captureStatements = new List<string>
+            {
+                "local GuardIdentify=GuardLookup(__KEY_IDENTIFY__);",
+                "local GuardCheckCaller=GuardLookup(__KEY_CHECKCALLER__);",
+                "local GuardIsC=GuardLookup(__KEY_ISC__);",
+                "local GuardIsL=GuardLookup(__KEY_ISL__);",
+                "local GuardNewC=GuardLookup(__KEY_NEWC__);",
+                "local GuardLoadString=GuardLookup(__KEY_LOADSTRING__);",
+                "local GuardTypeOf=GuardLookup(__KEY_TYPEOF__);",
+                "local GuardGame=GuardLookup(__KEY_GAME__);",
+                "local GuardInstance=GuardLookup(__KEY_INSTANCE__);",
+                "local GuardVector3=GuardLookup(__KEY_VECTOR3__);",
+                "local GuardTask=GuardLookup(__KEY_TASK__);",
+                "local GuardGetInfo=GuardDebug and RawGet(GuardDebug,__KEY_GETINFO__);",
+                "local GuardInfo=GuardDebug and RawGet(GuardDebug,__KEY_INFO__);",
+                "local GuardGetConstants=GuardDebug and RawGet(GuardDebug,__KEY_GETCONSTANTS__);",
+                "local GuardGetUpvalues=GuardDebug and RawGet(GuardDebug,__KEY_GETUPVALUES__);",
+                "local GuardGetProto=GuardDebug and RawGet(GuardDebug,__KEY_GETPROTO__);",
+                "local GuardGetProtos=GuardDebug and RawGet(GuardDebug,__KEY_GETPROTOS__);",
+                "local GuardSetupValue=GuardDebug and RawGet(GuardDebug,__KEY_SETUPVALUE__);"
+            };
+            for (int index = captureStatements.Count - 1; index > 0; index--)
+            {
+                int swap = random.Next(index + 1);
+                (captureStatements[index], captureStatements[swap]) = (captureStatements[swap], captureStatements[index]);
+            }
+            string captureBlock = string.Join("", captureStatements) +
+                "local GuardInspector=Type(GuardInfo)=='function' and GuardInfo or GuardGetInfo;";
 
             string guard = @"
+local GuardAttestation, GuardProbe, GuardBindPayload, GuardFaultWord, GuardDecoy;
+do
 local GuardString = string;
 local GuardTable = table;
 local GuardMath = math;
@@ -162,6 +279,7 @@ local GuardDebug = debug;
 local GuardUnpack = unpack;
 local GuardTableUnpack = GuardTable and GuardTable.unpack;
 local GuardGetFEnvGlobal = getfenv;
+__IB2_KEY_VAULT__
 
 local GuardEnvOK, GuardEnvironment = PCall(GetFEnv);
 if not GuardEnvOK or Type(GuardEnvironment) ~= 'table' then GuardEnvironment = nil; end;
@@ -188,57 +306,62 @@ local function GuardLookup(GuardLookupKey)
     return GuardLookupValue;
 end;
 
-local GuardIdentify = GuardLookup(__KEY_IDENTIFY__);
-local GuardCheckCaller = GuardLookup(__KEY_CHECKCALLER__);
-local GuardIsC = GuardLookup(__KEY_ISC__);
-local GuardIsL = GuardLookup(__KEY_ISL__);
-local GuardNewC = GuardLookup(__KEY_NEWC__);
-local GuardLoadString = GuardLookup(__KEY_LOADSTRING__);
-local GuardTypeOf = GuardLookup(__KEY_TYPEOF__);
-local GuardGame = GuardLookup(__KEY_GAME__);
-local GuardInstance = GuardLookup(__KEY_INSTANCE__);
-local GuardVector3 = GuardLookup(__KEY_VECTOR3__);
-local GuardTask = GuardLookup(__KEY_TASK__);
-
-local GuardGetInfo = GuardDebug and RawGet(GuardDebug, __KEY_GETINFO__);
-local GuardInfo = GuardDebug and RawGet(GuardDebug, __KEY_INFO__);
-local GuardInspector = Type(GuardInfo) == 'function' and GuardInfo or GuardGetInfo;
-local GuardGetConstants = GuardDebug and RawGet(GuardDebug, __KEY_GETCONSTANTS__);
-local GuardGetUpvalues = GuardDebug and RawGet(GuardDebug, __KEY_GETUPVALUES__);
-local GuardGetProto = GuardDebug and RawGet(GuardDebug, __KEY_GETPROTO__);
-local GuardGetProtos = GuardDebug and RawGet(GuardDebug, __KEY_GETPROTOS__);
-local GuardSetupValue = GuardDebug and RawGet(GuardDebug, __KEY_SETUPVALUE__);
+__IB2_API_CAPTURE_BLOCK__
 
 local GuardCounter = 0;
 local GuardNextProbe = 1;
 local GuardEpoch = 0;
 local GuardState = __IB2_DECOY_SEED__ % 2147483647;
-local GuardAttestation = 0;
-local GuardSeal = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
+GuardAttestation = 0;
+local GuardSealA = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
+local GuardSealB = (GuardState * 4099 + __IB2_SEAL_SALT_B__ + GuardAttestation % 104729) % 2147483647;
+local GuardSealC = (GuardState * 8191 + __IB2_SEAL_SALT_C__ + (GuardAttestation % 65521) * 131) % 2147483647;
 local GuardTripped = false;
 local GuardAttested = false;
 local GuardReportOnly = __IB2_REPORT_ONLY__;
-local GuardFaultWord = 0;
+GuardFaultWord = 0;
 local GuardPayloadState = 0;
 local GuardPayloadSeal = 0;
 local GuardPayloadActive = false;
 local GuardUpvalue = __IB2_UPVALUE_EXPECTED__;
 
-local function GuardReject()
+local function GuardRejectA()
     GuardTripped = true;
-    if GuardReportOnly then
-        GuardAttestation = __IB2_ATTESTATION_TOKEN__;
-        return false;
+    if GuardReportOnly then GuardAttestation = __IB2_ATTESTATION_TOKEN__; return false; end;
+    GuardFaultWord = __IB2_FAULT_WORD__; GuardAttestation = 0;
+    while GuardFaultWord == GuardFaultWord do
+        GuardFaultWord = (GuardFaultWord * __IB2_SINK_MUL_A__ + GuardState + __IB2_SINK_ADD_A__) % 2147483647;
+        GuardState = (GuardState + GuardFaultWord) % 2147483647;
     end;
-    -- Periodic failures do not require a dedicated visible branch.  The sticky
-    -- word is consumed by the normal opcode continuation decoder, so a failed
-    -- environment contract corrupts its next authenticated state transition.
-    GuardFaultWord = __IB2_FAULT_WORD__;
-    GuardAttestation = 0;
-    GuardPayloadState = (GuardPayloadState + GuardFaultWord) % 2147483647;
-    GuardPayloadSeal = 0;
-    return true;
 end;
+local function GuardRejectB()
+    GuardTripped = true;
+    if GuardReportOnly then GuardAttestation = __IB2_ATTESTATION_TOKEN__; return false; end;
+    GuardAttestation = 0; GuardPayloadSeal = __IB2_FAULT_WORD__;
+    repeat
+        GuardPayloadSeal = (GuardPayloadSeal * __IB2_SINK_MUL_B__ + GuardPayloadState + __IB2_SINK_ADD_B__) % 2147483647;
+        GuardPayloadState = (GuardPayloadState + GuardPayloadSeal) % 2147483647;
+    until GuardPayloadState ~= GuardPayloadState;
+end;
+local function GuardRejectC()
+    GuardTripped = true;
+    if GuardReportOnly then GuardAttestation = __IB2_ATTESTATION_TOKEN__; return false; end;
+    GuardAttestation = 0; GuardFaultWord = __IB2_FAULT_WORD__;
+    while not (GuardPayloadState ~= GuardPayloadState) do
+        GuardPayloadState = (GuardPayloadState * __IB2_SINK_MUL_C__ + GuardFaultWord) % 2147483647;
+        GuardFaultWord = (GuardFaultWord + GuardPayloadState + __IB2_SINK_ADD_C__) % 2147483647;
+    end;
+end;
+local function GuardRejectD()
+    GuardTripped = true;
+    if GuardReportOnly then GuardAttestation = __IB2_ATTESTATION_TOKEN__; return false; end;
+    GuardAttestation = 0; GuardFaultWord = __IB2_FAULT_WORD__;
+    while GuardTripped do
+        GuardState = (GuardState * __IB2_SINK_MUL_D__ + GuardFaultWord + __IB2_SINK_ADD_D__) % 2147483647;
+        GuardFaultWord = (GuardFaultWord * 257 + GuardState) % 2147483647;
+    end;
+end;
+--__IB2_GUARD_STAGE_1__
 
 local function GuardLuaProbe(GuardProbeValue) return GuardProbeValue; end;
 local function GuardConstantProbe() return __IB2_CONSTANT_EXPECTED__; end;
@@ -311,6 +434,7 @@ local function GuardCurrentIdentity()
         or RawGet(GuardDebug, __KEY_SETUPVALUE__) ~= GuardSetupValue then return false; end;
     return true;
 end;
+--__IB2_GUARD_STAGE_2__
 
 local function GuardStrictChallenge()
     if Type(GuardIdentify) ~= 'function' or Type(GuardCheckCaller) ~= 'function'
@@ -428,13 +552,13 @@ local function GuardStrictChallenge()
     if not GuardSawInactiveProto then return false, 0; end;
     GuardTranscriptWord(__IB2_PROTO_EXPECTED__);
 
-    local GuardInvalidSource = Char(114,101,116,117,114,110,32,41);
+    local GuardInvalidSource = __VALUE_INVALID_SOURCE__;
     local GuardInvalidOK, GuardInvalidFunction, GuardInvalidError = PCall(
         GuardLoadString, GuardInvalidSource, __VALUE_INVALID_CHUNK__);
     if not GuardInvalidOK or GuardInvalidFunction ~= nil or Type(GuardInvalidError) ~= 'string'
         or #GuardInvalidError < 1 then return false, 0; end;
 
-    local GuardLoadSource = Char(114,101,116,117,114,110,32) .. ToString(__IB2_LOAD_EXPECTED__);
+    local GuardLoadSource = __VALUE_LOAD_PREFIX__ .. ToString(__IB2_LOAD_EXPECTED__);
     local GuardCompileOK, GuardLoaded = PCall(GuardLoadString, GuardLoadSource);
     if not GuardCompileOK or Type(GuardLoaded) ~= 'function' then return false, 0; end;
     local GuardLoadedOK, GuardLoadedValue = PCall(GuardLoaded);
@@ -455,6 +579,7 @@ local function GuardStrictChallenge()
 
     return true, GuardTranscript;
 end;
+--__IB2_GUARD_STAGE_3__
 
 __IB2_DECOY_GRAPH__
 
@@ -462,12 +587,13 @@ local function GuardPayloadExpectedSeal()
     local GuardPayloadLow = GuardPayloadState % 65536;
     local GuardPayloadHigh = (GuardPayloadState - GuardPayloadLow) / 65536;
     return (GuardPayloadLow * 65599 + GuardPayloadHigh * 257
-        + GuardState * 4099 + GuardSeal + GuardAttestation + __IB2_PAYLOAD_SEAL_SALT__) % 2147483647;
+        + GuardState * 4099 + GuardSealA + GuardSealB + GuardSealC + GuardAttestation + __IB2_PAYLOAD_SEAL_SALT__) % 2147483647;
 end;
 
-local function GuardBindPayload(GuardVMState, GuardChunkState, GuardEntryState, GuardInstructionPoint, GuardOpcodeState, GuardOpcodeSeal)
+GuardBindPayload = function(GuardVMState, GuardChunkState, GuardEntryState, GuardInstructionPoint, GuardOpcodeState, GuardOpcodeSeal)
     if GuardTripped then return GuardReject(); end;
-    if GuardSeal ~= (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647 then
+    if GuardSealA ~= (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647
+        or GuardSealC ~= (GuardState * 8191 + __IB2_SEAL_SALT_C__ + (GuardAttestation % 65521) * 131) % 2147483647 then
         return GuardReject();
     end;
     if GuardPayloadActive and GuardPayloadSeal ~= GuardPayloadExpectedSeal() then return GuardReject(); end;
@@ -491,17 +617,20 @@ local function GuardBindPayload(GuardVMState, GuardChunkState, GuardEntryState, 
     -- reseals payload state. Periodic probes perform the inverse update below.
     GuardState = (GuardState + GuardPayloadState % 65521 + GuardInstructionPoint * 17
         + GuardOpcodeState % 32749 + GuardOpcodeSeal % 16381 + GuardEpoch) % 2147483647;
-    GuardSeal = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
+    GuardSealA = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
+    GuardSealB = (GuardState * 4099 + __IB2_SEAL_SALT_B__ + GuardAttestation % 104729) % 2147483647;
+    GuardSealC = (GuardState * 8191 + __IB2_SEAL_SALT_C__ + (GuardAttestation % 65521) * 131) % 2147483647;
     GuardPayloadSeal = GuardPayloadExpectedSeal();
     return false;
 end;
+--__IB2_GUARD_STAGE_4__
 
-local function GuardProbe(Force)
+GuardProbe = function(Force)
     GuardCounter = GuardCounter + 1;
     if GuardTripped then return GuardReject(); end;
     if GuardPayloadActive and GuardPayloadSeal ~= GuardPayloadExpectedSeal() then return GuardReject(); end;
     if not Force and GuardCounter < GuardNextProbe then return false; end;
-    if GuardSeal ~= (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647 then
+    if GuardSealB ~= (GuardState * 4099 + __IB2_SEAL_SALT_B__ + GuardAttestation % 104729) % 2147483647 then
         return GuardReject();
     end;
 
@@ -514,6 +643,9 @@ local function GuardProbe(Force)
     end;
     if GuardValid and GuardTranscript ~= __IB2_TRANSCRIPT_EXPECTED__ then GuardValid = false; end;
     if not GuardValid then return GuardReject(); end;
+    if GuardSealC ~= (GuardState * 8191 + __IB2_SEAL_SALT_C__ + (GuardAttestation % 65521) * 131) % 2147483647 then
+        return GuardReject();
+    end;
 
     if not GuardAttested then
         GuardAttestation = (GuardTranscript + __IB2_ATTESTATION_OFFSET__) % 4294967296;
@@ -522,13 +654,17 @@ local function GuardProbe(Force)
     if GuardAttestation ~= __IB2_ATTESTATION_TOKEN__ then return GuardReject(); end;
 
     GuardState = (GuardState * 48271 + GuardCounter + GuardEpoch * 17 + GuardAttestation % 65521) % 2147483647;
-    GuardSeal = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
+    GuardSealA = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
+    GuardSealB = (GuardState * 4099 + __IB2_SEAL_SALT_B__ + GuardAttestation % 104729) % 2147483647;
+    GuardSealC = (GuardState * 8191 + __IB2_SEAL_SALT_C__ + (GuardAttestation % 65521) * 131) % 2147483647;
     if GuardPayloadActive then GuardPayloadSeal = GuardPayloadExpectedSeal(); end;
     GuardNextProbe = GuardCounter + __IB2_GUARD_INTERVAL__ + (GuardState % __IB2_GUARD_JITTER__);
     return false;
 end;
+--__IB2_GUARD_STAGE_5__
 
 if GuardProbe(true) then return GuardDecoy(); end;
+end;
 ";
 
             var replacements = new Dictionary<string, string>
@@ -538,6 +674,16 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__IB2_HEAVY_PERIOD__"] = heavyPeriod.ToString(),
                 ["__IB2_DECOY_SEED__"] = decoySeed.ToString(),
                 ["__IB2_SEAL_SALT__"] = sealSalt.ToString(),
+                ["__IB2_SEAL_SALT_B__"] = sealSaltB.ToString(),
+                ["__IB2_SEAL_SALT_C__"] = sealSaltC.ToString(),
+                ["__IB2_SINK_MUL_A__"] = (30011 + random.Next(20000)).ToString(),
+                ["__IB2_SINK_ADD_A__"] = (257 + random.Next(100000)).ToString(),
+                ["__IB2_SINK_MUL_B__"] = (33013 + random.Next(20000)).ToString(),
+                ["__IB2_SINK_ADD_B__"] = (521 + random.Next(100000)).ToString(),
+                ["__IB2_SINK_MUL_C__"] = (36007 + random.Next(20000)).ToString(),
+                ["__IB2_SINK_ADD_C__"] = (911 + random.Next(100000)).ToString(),
+                ["__IB2_SINK_MUL_D__"] = (39019 + random.Next(20000)).ToString(),
+                ["__IB2_SINK_ADD_D__"] = (1237 + random.Next(100000)).ToString(),
                 ["__IB2_PAYLOAD_SEAL_SALT__"] = payloadSealSalt.ToString(),
                 ["__IB2_PAYLOAD_STATE_SALT__"] = payloadStateSalt.ToString(),
                 ["__IB2_CONSTANT_EXPECTED__"] = constantExpected.ToString(),
@@ -555,32 +701,18 @@ if GuardProbe(true) then return GuardDecoy(); end;
                 ["__IB2_FAULT_WORD__"] = faultWord.ToString(),
                 ["__IB2_REPORT_ONLY__"] = TemporaryGlobalSinkBypass ? "true" : "false",
                 ["__IB2_DECOY_GRAPH__"] = BuildDecoyGraph(decoySeed, random),
-                ["__KEY_GETGENV__"] = LuaChars("getgenv"),
-                ["__KEY_ENV_CANARY__"] = LuaChars(RN(random, 14, 20)),
-                ["__KEY_IDENTIFY__"] = LuaChars("identifyexecutor"),
-                ["__KEY_CHECKCALLER__"] = LuaChars("checkcaller"),
-                ["__KEY_ISC__"] = LuaChars("iscclosure"),
-                ["__KEY_ISL__"] = LuaChars("islclosure"),
-                ["__KEY_NEWC__"] = LuaChars("newcclosure"),
-                ["__KEY_LOADSTRING__"] = LuaChars("loadstring"),
-                ["__KEY_TYPEOF__"] = LuaChars("typeof"),
-                ["__KEY_GAME__"] = LuaChars("game"),
-                ["__KEY_INSTANCE__"] = LuaChars("Instance"),
-                ["__KEY_VECTOR3__"] = LuaChars("Vector3"),
-                ["__KEY_TASK__"] = LuaChars("task"),
-                ["__KEY_GETINFO__"] = LuaChars("getinfo"),
-                ["__KEY_INFO__"] = LuaChars("info"),
-                ["__KEY_GETCONSTANTS__"] = LuaChars("getconstants"),
-                ["__KEY_GETUPVALUES__"] = LuaChars("getupvalues"),
-                ["__KEY_GETPROTO__"] = LuaChars("getproto"),
-                ["__KEY_GETPROTOS__"] = LuaChars("getprotos"),
-                ["__KEY_SETUPVALUE__"] = LuaChars("setupvalue"),
-                ["__VALUE_PLAYERS__"] = LuaChars("Players"),
-                ["__VALUE_VECTOR3__"] = LuaChars("Vector3"),
-                ["__VALUE_INVALID_CHUNK__"] = LuaChars(RN(random, 10, 16))
+                ["__IB2_KEY_VAULT__"] = keyVault.Prelude,
+                ["__IB2_API_CAPTURE_BLOCK__"] = captureBlock
             };
             foreach (KeyValuePair<string, string> replacement in replacements)
                 guard = guard.Replace(replacement.Key, replacement.Value);
+            foreach (KeyValuePair<string, string> reference in keyVault.References)
+                guard = guard.Replace(reference.Key, reference.Value);
+
+            int rejectionOffset = random.Next(4);
+            int rejectionCount = 0;
+            guard = System.Text.RegularExpressions.Regex.Replace(guard, @"\bGuardReject\(\)", _ =>
+                "GuardReject" + (char)('A' + ((rejectionOffset + rejectionCount++) % 4)) + "()");
             return guard;
         }
 

@@ -59,6 +59,7 @@ namespace IronBrew2.Obfuscator
 		// 它们不是秘密，但会让旧 Build 的固定解析坐标无法直接复用。
 		public BuildSeed Seed;
 		public BuildDomains Domains;
+		public PayloadDerivationProfile PayloadDerivation;
 		public PayloadFormatLayout PayloadFormat;
 		
 		public ObfuscationContext(Chunk chunk, ObfuscationSettings settings, BuildSeed seed)
@@ -66,6 +67,7 @@ namespace IronBrew2.Obfuscator
 			HeadChunk = chunk;
 			Seed = seed ?? throw new ArgumentNullException(nameof(seed));
 			Domains = new BuildDomains(Seed.GetStream("payload.domains"));
+			PayloadDerivation = new PayloadDerivationProfile(Domains);
 			PayloadFormat = new PayloadFormatLayout(Domains);
 
 			BuildRandom schemaRandom = Seed.GetStream("bytecode.schema");
@@ -75,7 +77,7 @@ namespace IronBrew2.Obfuscator
 			InstructionSteps2 = Enumerable.Range(0, (int) InstructionStep2.StepCount).Select(i => (InstructionStep2) i).ToArray();
 			InstructionSteps2.Shuffle(schemaRandom);
 
-			Binder = new EnvBinder(Seed.GetStream("environment.binding"));
+			Binder = new EnvBinder(Seed.GetStream("environment.binding"), PayloadDerivation);
 
 			if (settings.EnvironmentLock)
 			{

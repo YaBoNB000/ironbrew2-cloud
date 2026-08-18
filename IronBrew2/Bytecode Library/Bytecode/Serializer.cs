@@ -70,7 +70,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			for (int i = 0; i < envelope.Length; i++)
 			{
 				encrypted[i] = (byte)(envelope[i] ^ (byte)(state >> 24));
-				state = unchecked(state * 1664525u + 1013904223u);
+				state = _context.PayloadDerivation.AdvanceStream(state);
 			}
 
 			uint head = _settings.EnvironmentLock ? _context.Binder.Salt : _context.XorSeed;
@@ -143,7 +143,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				for (int index = 0; index < framedPage.Length; index++)
 				{
 					maskedPage[index] = (byte)(framedPage[index] ^ (byte)(maskState >> 24));
-					maskState = unchecked(maskState * 1664525u + 1013904223u);
+					maskState = _context.PayloadDerivation.AdvanceStream(maskState);
 				}
 				maskedPages.Add(maskedPage);
 			}
@@ -575,9 +575,30 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return stream.ToArray();
 		}
 
+		private byte TransformPipelineByte(byte value, int ordinal)
+		{
+			PayloadFormatLayout format = _context.PayloadFormat;
+			switch (format.ByteTransformVariant)
+			{
+				case 0:
+					return value;
+				case 1:
+					return (byte)((value << 4) | (value >> 4));
+				case 2:
+					return (byte)(value ^ (byte)(format.ByteTransformParameter + ordinal * 29));
+				case 3:
+					int shift = format.ByteTransformParameter;
+					return (byte)((value << shift) | (value >> (8 - shift)));
+				default:
+					throw new InvalidOperationException("Unknown protected payload byte transform.");
+			}
+		}
+
 		private byte[] TransformEncodedPage(byte[] page, int ordinal, uint seed, uint nonce, uint entropyDigest)
 		{
-			var output = page.ToArray();
+			var output = new byte[page.Length];
+			for (int index = 0; index < page.Length; index++)
+				output[index] = TransformPipelineByte(page[index], ordinal);
 			switch (_context.PayloadFormat.PipelineVariant)
 			{
 				case 0:
@@ -592,7 +613,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 					{
 						byte plain = output[index];
 						output[index] = (byte)(plain ^ (byte)(state >> 24));
-						state = unchecked(state * 1664525u + 1013904223u + plain + (uint)index);
+						state = unchecked(_context.PayloadDerivation.AdvanceStream(state) + plain + (uint)index);
 					}
 					return output;
 				default:

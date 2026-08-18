@@ -1,5 +1,4 @@
 using System;
-using System.Text;
 
 namespace IronBrew2.Obfuscator
 {
@@ -16,6 +15,8 @@ namespace IronBrew2.Obfuscator
     /// </summary>
     public class EnvBinder
     {
+        private readonly PayloadDerivationProfile _profile;
+
         public uint Salt { get; private set; }
         public uint AttestationToken { get; private set; }
         public string SeedDeriveLua { get; private set; }
@@ -23,21 +24,23 @@ namespace IronBrew2.Obfuscator
         /// <summary>EnvironmentLock-disabled compatibility path for library callers.</summary>
         public const string PlainSeedLua = "local Xs = PayloadHead;";
 
-        public EnvBinder(BuildRandom random)
+        public EnvBinder(BuildRandom random, PayloadDerivationProfile profile)
         {
             if (random == null) throw new ArgumentNullException(nameof(random));
+            _profile = profile ?? throw new ArgumentNullException(nameof(profile));
             Salt = NextNonZeroUInt32(random);
             do
             {
                 AttestationToken = NextNonZeroUInt32(random);
             } while (DeriveSeed(AttestationToken) == 0);
 
-            SeedDeriveLua = @"
+            SeedDeriveLua = $@"
 local SeedText = ToString(PayloadHead) .. Char(124) .. ToString(GuardAttestation);
-local Xs = 0;
+local SeedMix = {_profile.BinderInitial};
 for SeedIndex = 1, #SeedText do
-    Xs = (Xs * 31 + Byte(SeedText, SeedIndex)) % 4294967296;
+    SeedMix = (SeedMix * {_profile.BinderMultiplier} + Byte(SeedText, SeedIndex) + {_profile.BinderIncrement}) % 4294967296;
 end;
+local Xs = BitXOR(SeedMix, {_profile.BinderFinalXor}) % 4294967296;
 ";
         }
 
@@ -48,15 +51,7 @@ end;
             return value;
         }
 
-        public static uint Hash(string value)
-        {
-            uint hash = 0;
-            foreach (byte item in Encoding.UTF8.GetBytes(value))
-                hash = unchecked(hash * 31u + item);
-            return hash;
-        }
-
         public uint DeriveSeed(uint attestationToken) =>
-            Hash(Salt.ToString() + "|" + attestationToken.ToString());
+            _profile.DeriveEnvironmentSeed(Salt, attestationToken);
     }
 }

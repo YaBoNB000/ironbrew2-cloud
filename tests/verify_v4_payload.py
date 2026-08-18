@@ -48,6 +48,12 @@ LCG_MULTIPLIER = 1664525
 LCG_INCREMENT = 1013904223
 LCG_INVERSE = pow(LCG_MULTIPLIER, -1, MOD32)
 POLY31_INVERSE = pow(31, -1, MOD32)
+STREAM_MULTIPLIER = 0
+STREAM_INCREMENT = 0
+BINDER_MULTIPLIER = 0
+BINDER_INCREMENT = 0
+BINDER_INITIAL = 0
+BINDER_FINAL_XOR = 0
 
 
 def activate_domains(domains: BuildDomains) -> None:
@@ -58,6 +64,8 @@ def activate_domains(domains: BuildDomains) -> None:
     global CODE_DATA_PERMUTATION_DOMAIN, INSTRUCTION_STATE_DOMAIN, OPCODE_STATE_DOMAIN
     global PAYLOAD_FORMAT_DOMAIN, DECODE_PIPELINE_DOMAIN
     global FLOW_VERIFIER_MASK, BLOCK_FIELD_STRIDE, ENTROPY_KIND, DATA_KIND
+    global STREAM_MULTIPLIER, STREAM_INCREMENT
+    global BINDER_MULTIPLIER, BINDER_INCREMENT, BINDER_INITIAL, BINDER_FINAL_XOR
     INTEGRITY_DOMAIN = domains.integrity
     BLOCK_INTEGRITY_DOMAIN = domains.block_integrity
     FLOW_DOMAIN = domains.flow
@@ -81,6 +89,15 @@ def activate_domains(domains: BuildDomains) -> None:
     BLOCK_FIELD_STRIDE = domains.block_field_stride
     ENTROPY_KIND = domains.entropy_record_kind
     DATA_KIND = domains.data_record_kind
+    BINDER_MULTIPLIER = ((domains.flow ^ domains.payload_format) & 0xFFFF) | 1
+    if BINDER_MULTIPLIER == 1:
+        BINDER_MULTIPLIER = 3
+    BINDER_INCREMENT = ((domains.chunk_state ^ domains.decode_pipeline) & 0xFFFF) | 1
+    BINDER_INITIAL = domains.envelope_mask ^ domains.prototype_integrity
+    BINDER_FINAL_XOR = domains.integrity ^ domains.block_integrity
+    stream_seed = (domains.envelope_mask ^ domains.decode_pipeline) % 1048572
+    STREAM_MULTIPLIER = (stream_seed & 0xFFFFFC) + 5
+    STREAM_INCREMENT = ((domains.entropy_digest ^ domains.payload_format) & 0x3FFFFFFF) | 1
 
 
 @dataclass(frozen=True)
@@ -100,6 +117,8 @@ class PayloadLayout:
     page_length_width: int
     page_length_suffix: bool
     pipeline_variant: int
+    byte_transform_variant: int
+    byte_transform_parameter: int
 
 
 @dataclass(frozen=True)
@@ -316,14 +335,18 @@ def is_base91_literal(value: str) -> bool:
 
 
 def extract_payload(source: str) -> tuple[list[Literal], bytes]:
+    # Carrier assignments are injected into five guard stages as contiguous
+    # logical runs. Their tables, nested tables and writer closures randomize
+    # physical placement while source order remains the authenticated order
+    # needed by this mutation harness.
     candidates = [
         literal
         for literal in scan_string_literals(source)
         if len(literal.content) >= 1024 and is_base91_literal(literal.content)
     ]
     candidates.sort(key=lambda item: item.content_start)
-    if not 2 <= len(candidates) <= 6:
-        raise ValueError(f"expected 2–6 large base91 payload segments, found {len(candidates)}")
+    if not 7 <= len(candidates) <= 14:
+        raise ValueError(f"expected 7–14 large base91 payload segments, found {len(candidates)}")
     payload = decode_base91("".join(item.content for item in candidates))
     if len(payload) < 9:
         raise ValueError("decoded payload is shorter than the fixed v4 header")
@@ -355,6 +378,12 @@ def derive_payload_layout(domains: BuildDomains) -> PayloadLayout:
         page_length_width=2 if ((domain >> 11) & 1) == 0 else 4,
         page_length_suffix=((domain >> 15) & 1) != 0,
         pipeline_variant=domains.decode_pipeline % 3,
+        byte_transform_variant=(domains.decode_pipeline >> 8) % 4,
+        byte_transform_parameter=(
+            ((domains.decode_pipeline >> 18) % 7) + 1
+            if ((domains.decode_pipeline >> 8) % 4) == 3
+            else ((domains.decode_pipeline >> 16) ^ domains.payload_format) & 0xFF
+        ),
     )
 
 
@@ -388,6 +417,15 @@ def stream_xor(data: bytes, seed: int) -> bytes:
     return bytes(output)
 
 
+def payload_stream_xor(data: bytes, seed: int) -> bytes:
+    output = bytearray(len(data))
+    state = seed & MASK32
+    for index, value in enumerate(data):
+        output[index] = value ^ (state >> 24)
+        state = (state * STREAM_MULTIPLIER + STREAM_INCREMENT) & MASK32
+    return bytes(output)
+
+
 def recover_outer_seed(stored_integrity: int, flags: int, encrypted: bytes) -> int:
     """Invert the public polynomial tag to recover the serializer seed.
 
@@ -403,7 +441,10 @@ def recover_outer_seed(stored_integrity: int, flags: int, encrypted: bytes) -> i
 
 
 def binder_seed(head: int, attestation: int) -> int:
-    return hash_bytes(0, f"{head}|{attestation}".encode("ascii"))
+    state = BINDER_INITIAL
+    for item in f"{head}|{attestation}".encode("ascii"):
+        state = (state * BINDER_MULTIPLIER + item + BINDER_INCREMENT) & MASK32
+    return state ^ BINDER_FINAL_XOR
 
 
 def recover_attestation_token(source: str, head: int, seed: int) -> int:
@@ -958,30 +999,46 @@ def parse_prototype(
     return prototype
 
 
+def transform_pipeline_byte(value: int, layout: PayloadLayout, ordinal: int, inverse: bool) -> int:
+    if layout.byte_transform_variant == 0:
+        return value
+    if layout.byte_transform_variant == 1:
+        return ((value & 0x0F) << 4) | (value >> 4)
+    if layout.byte_transform_variant == 2:
+        return value ^ ((layout.byte_transform_parameter + ordinal * 29) & 0xFF)
+    shift = layout.byte_transform_parameter
+    if inverse:
+        return ((value >> shift) | (value << (8 - shift))) & 0xFF
+    return ((value << shift) | (value >> (8 - shift))) & 0xFF
+
+
 def pipeline_inverse(data: bytes, layout: PayloadLayout, seed: int, nonce: int, digest: int, ordinal: int) -> bytes:
     if layout.pipeline_variant == 0:
-        return data
-    if layout.pipeline_variant == 1:
-        return data[::-1]
-    state = (seed ^ nonce ^ digest ^ DECODE_PIPELINE_DOMAIN ^ ((ordinal * 0x9E3779B9) & MASK32)) & MASK32
-    output = bytearray(len(data))
-    for index, encoded in enumerate(data):
-        plain = encoded ^ ((state >> 24) & 0xFF)
-        output[index] = plain
-        state = (state * LCG_MULTIPLIER + LCG_INCREMENT + plain + index) & MASK32
-    return bytes(output)
+        transformed = data
+    elif layout.pipeline_variant == 1:
+        transformed = data[::-1]
+    else:
+        state = (seed ^ nonce ^ digest ^ DECODE_PIPELINE_DOMAIN ^ ((ordinal * 0x9E3779B9) & MASK32)) & MASK32
+        output = bytearray(len(data))
+        for index, encoded in enumerate(data):
+            plain = encoded ^ ((state >> 24) & 0xFF)
+            output[index] = plain
+            state = (state * STREAM_MULTIPLIER + STREAM_INCREMENT + plain + index) & MASK32
+        transformed = bytes(output)
+    return bytes(transform_pipeline_byte(value, layout, ordinal, True) for value in transformed)
 
 
 def pipeline_forward(data: bytes, layout: PayloadLayout, seed: int, nonce: int, digest: int, ordinal: int) -> bytes:
+    transformed = bytes(transform_pipeline_byte(value, layout, ordinal, False) for value in data)
     if layout.pipeline_variant == 0:
-        return data
+        return transformed
     if layout.pipeline_variant == 1:
-        return data[::-1]
+        return transformed[::-1]
     state = (seed ^ nonce ^ digest ^ DECODE_PIPELINE_DOMAIN ^ ((ordinal * 0x9E3779B9) & MASK32)) & MASK32
-    output = bytearray(len(data))
-    for index, plain in enumerate(data):
+    output = bytearray(len(transformed))
+    for index, plain in enumerate(transformed):
         output[index] = plain ^ ((state >> 24) & 0xFF)
-        state = (state * LCG_MULTIPLIER + LCG_INCREMENT + plain + index) & MASK32
+        state = (state * STREAM_MULTIPLIER + STREAM_INCREMENT + plain + index) & MASK32
     return bytes(output)
 
 
@@ -1018,7 +1075,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
         raise ValueError("strict EnvironmentLock unexpectedly exposed the serializer seed in the payload head")
     attestation_token = recover_attestation_token(source, head, seed)
     PAYLOAD_ATTESTATION = attestation_token
-    envelope = stream_xor(encrypted, seed)
+    envelope = payload_stream_xor(encrypted, seed)
     if len(envelope) < 32:
         raise ValueError("entropy envelope is shorter than its fixed header")
 
@@ -1106,9 +1163,9 @@ def parse_and_verify(path: Path) -> PayloadInfo:
     page_lengths: list[int] = []
     for ordinal in range(1, data_count + 1):
         masked_page = data_records[ordinal]
-        framed_page = stream_xor(masked_page, mask_state)
+        framed_page = payload_stream_xor(masked_page, mask_state)
         for _ in masked_page:
-            mask_state = (mask_state * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
+            mask_state = (mask_state * STREAM_MULTIPLIER + STREAM_INCREMENT) & MASK32
         if len(framed_page) < layout.page_length_width + 1 or len(framed_page) > 16384:
             raise ValueError("bounded payload page has invalid framed length")
         length_offset = len(framed_page) - layout.page_length_width if layout.page_length_suffix else 0
@@ -1149,7 +1206,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
 
 
 def build_outer_payload(info: PayloadInfo, envelope: bytes) -> bytes:
-    encrypted = stream_xor(envelope, info.seed)
+    encrypted = payload_stream_xor(envelope, info.seed)
     integrity = hash_bytes(((info.seed ^ INTEGRITY_DOMAIN) * 31 + info.flags) & MASK32, encrypted)
     values = {"head": info.head, "integrity": integrity, "flags": info.flags}
     output = bytearray()
@@ -1225,7 +1282,7 @@ def envelope_for_body(info: PayloadInfo, body: bytes) -> bytes:
     mask_state = (
         info.seed ^ info.nonce ^ info.entropy_digest ^ ENVELOPE_MASK_DOMAIN ^ PAYLOAD_FORMAT_DOMAIN ^ DECODE_PIPELINE_DOMAIN ^ real_length
     ) & MASK32
-    masked_stream = stream_xor(b"".join(framed_pages), mask_state)
+    masked_stream = payload_stream_xor(b"".join(framed_pages), mask_state)
     data_records: dict[int, bytes] = {}
     position = 0
     for ordinal, framed_page in enumerate(framed_pages, 1):
