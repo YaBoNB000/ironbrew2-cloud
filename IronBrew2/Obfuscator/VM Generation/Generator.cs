@@ -957,6 +957,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardPersistent","GuardProtoConstants","GuardProtoConstantsOK","GuardProtosValid","GuardReject","GuardRejectA","GuardRejectB","GuardRejectC","GuardRejectD","GuardRepeatEnvironment","GuardRepeatOK","GuardReportOnly","GuardSawInactiveProto","GuardSeparated",
 				"GuardThreadMarker","GuardThreadOld","GuardCanaryOK","GuardCapabilityRestoreOK","GuardThreadRestoreOK","GuardWrappedUpvalues","GuardWrappedUpvaluesOK",
 				"GuardPrimitiveIndex","GuardPrimitives",
+				"PrimitiveEnvironmentReader","PrimitiveEnvironment","PrimitiveRawGet","PrimitiveString","PrimitiveTable","PrimitiveMath","PrimitiveDebug","PrimitiveGlobalUnpack","PrimitiveTableUnpack","PrimitiveBootstrapChar",
+				"PrimitiveKeyBytes","PrimitiveKeyMeta","PrimitiveKeyCache","PrimitiveDecode","PrimitiveToken","PrimitiveRecord","PrimitiveText","PrimitiveIndex","PrimitiveLookup","PrimitiveRoot","PrimitiveMember","PrimitiveParent",
 				"PayloadRejectA","PayloadRejectB","PayloadRejectC","PayloadRejectD",
 				"PayloadRejectVoidA","PayloadRejectVoidB","PayloadRejectVoidC","PayloadRejectVoidD",
 				"PayloadRejectCodeA","PayloadRejectCodeB","PayloadRejectCodeC","PayloadRejectCodeD",
@@ -1480,6 +1482,180 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				return "local " + sv + "=0;repeat " + sv + "=" + sv + "+1;if " + sv + "==" + k + " then " + code + " end;until " + sv + ">=" + k + ";";
 			}
 
+			string BuildPrimitivePrelude()
+			{
+				string BootstrapLiteral(string value)
+				{
+					var parts = new List<string>();
+					int position = 0;
+					while (position < value.Length)
+					{
+						int remaining = value.Length - position;
+						int width = remaining == 1 ? 1 : 1 + r.Next(Math.Min(3, remaining));
+						var literal = new StringBuilder("\"");
+						for (int i = 0; i < width; i++)
+							literal.Append("\\" + ((int)value[position + i]).ToString("D3"));
+						literal.Append('"');
+						parts.Add(literal.ToString());
+						position += width;
+					}
+					return string.Join("..", parts);
+				}
+
+				var keyNames = new Dictionary<string, string>
+				{
+					["StringTable"] = "string", ["TableTable"] = "table", ["MathTable"] = "math", ["DebugTable"] = "debug",
+					["Byte"] = "byte", ["Char"] = "char", ["Sub"] = "sub", ["Concat"] = "concat",
+					["Insert"] = "insert", ["LDExp"] = "ldexp", ["GetFEnv"] = "getfenv",
+					["Setmetatable"] = "setmetatable", ["Getmetatable"] = "getmetatable",
+					["RawGet"] = "rawget", ["RawSet"] = "rawset", ["RawEqual"] = "rawequal",
+					["Next"] = "next", ["Select"] = "select", ["PCall"] = "pcall", ["Type"] = "type",
+					["ToString"] = "tostring", ["GlobalUnpack"] = "unpack", ["TableUnpack"] = "unpack",
+					["ToNumber"] = "tonumber"
+				};
+				var storageOrder = keyNames.Keys.ToList();
+				storageOrder.Shuffle(r);
+				var tokens = new Dictionary<string, int>();
+				var starts = new Dictionary<string, int>();
+				var lengths = new Dictionary<string, int>();
+				var salts = new Dictionary<string, int>();
+				var usedTokens = new HashSet<int>();
+				var encodedBytes = new List<int>();
+				int multiplier = new[] { 29, 37, 53, 61, 73 }[r.Next(5)];
+				int increment = 17 + r.Next(197);
+
+				foreach (string label in storageOrder)
+				{
+					int padding = 1 + r.Next(7);
+					for (int i = 0; i < padding; i++) encodedBytes.Add(r.Next(256));
+					int token;
+					do token = 17 + r.Next(220); while (!usedTokens.Add(token));
+					int salt = 1 + r.Next(255);
+					tokens[label] = token;
+					starts[label] = encodedBytes.Count + 1;
+					lengths[label] = keyNames[label].Length;
+					salts[label] = salt;
+					int state = (token * multiplier + salt) & 255;
+					for (int i = 0; i < keyNames[label].Length; i++)
+					{
+						state = (state * multiplier + increment + i) & 255;
+						encodedBytes.Add((keyNames[label][i] + state) & 255);
+					}
+				}
+				for (int i = 0; i < 2 + r.Next(8); i++) encodedBytes.Add(r.Next(256));
+
+				var descriptorOrder = keyNames.Keys.ToList();
+				descriptorOrder.Shuffle(r);
+				var descriptorStatements = descriptorOrder.Select(label =>
+					"PrimitiveKeyMeta[" + tokens[label] + "]={" + starts[label] + "," + lengths[label] + "," + salts[label] + "};").ToList();
+				string byteLiteral = "{" + string.Join(",", encodedBytes) + "}";
+				int vaultTopology = r.Next(3);
+				var prelude = new StringBuilder("return(function()");
+
+				int bootstrapTopology = r.Next(3);
+				if (bootstrapTopology == 0)
+				{
+					prelude.Append("local PrimitiveEnvironmentReader=getfenv or function()return _G end;local PrimitiveEnvironment=PrimitiveEnvironmentReader();");
+					prelude.Append("local PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];");
+					prelude.Append("local PrimitiveString=PrimitiveRawGet(PrimitiveEnvironment," + BootstrapLiteral("string") + ");");
+					prelude.Append("local PrimitiveBootstrapChar=PrimitiveRawGet(PrimitiveString," + BootstrapLiteral("char") + ");");
+				}
+				else if (bootstrapTopology == 1)
+				{
+					prelude.Append("local PrimitiveEnvironment;local PrimitiveEnvironmentReader=getfenv;if PrimitiveEnvironmentReader then PrimitiveEnvironment=PrimitiveEnvironmentReader()else PrimitiveEnvironment=_G end;");
+					prelude.Append("local PrimitiveRawGet,PrimitiveString,PrimitiveBootstrapChar;");
+					prelude.Append("PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];PrimitiveString=PrimitiveRawGet(PrimitiveEnvironment," + BootstrapLiteral("string") + ");PrimitiveBootstrapChar=PrimitiveRawGet(PrimitiveString," + BootstrapLiteral("char") + ");");
+				}
+				else
+				{
+					prelude.Append("local PrimitiveEnvironmentReader=getfenv;local PrimitiveEnvironment=(PrimitiveEnvironmentReader and PrimitiveEnvironmentReader())or _G;PrimitiveEnvironmentReader=PrimitiveEnvironmentReader or function()return PrimitiveEnvironment end;");
+					prelude.Append("local PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];local PrimitiveString=PrimitiveRawGet(PrimitiveEnvironment," + BootstrapLiteral("string") + ");local PrimitiveBootstrapChar=PrimitiveRawGet(PrimitiveString," + BootstrapLiteral("char") + ");");
+				}
+
+				if (vaultTopology == 0)
+				{
+					prelude.Append("local PrimitiveKeyBytes=" + byteLiteral + ";local PrimitiveKeyMeta={};local PrimitiveKeyCache={};");
+					foreach (string statement in descriptorStatements) prelude.Append(statement);
+				}
+				else if (vaultTopology == 1)
+				{
+					prelude.Append("local PrimitiveKeyMeta={};");
+					foreach (string statement in descriptorStatements) prelude.Append(statement);
+					prelude.Append("local PrimitiveKeyCache={};local PrimitiveKeyBytes=" + byteLiteral + ";");
+				}
+				else
+				{
+					prelude.Append("local PrimitiveKeyBytes,PrimitiveKeyMeta,PrimitiveKeyCache=" + byteLiteral + ",{},{};");
+					foreach (string statement in descriptorStatements) prelude.Append(statement);
+				}
+
+				prelude.Append("local function PrimitiveDecode(PrimitiveToken)local PrimitiveText=PrimitiveKeyCache[PrimitiveToken];if PrimitiveText then return PrimitiveText end;local PrimitiveRecord=PrimitiveKeyMeta[PrimitiveToken];PrimitiveText='';local PrimitiveIndex=(PrimitiveToken*" + multiplier + "+PrimitiveRecord[3])%256;for PrimitiveParent=0,PrimitiveRecord[2]-1 do PrimitiveIndex=(PrimitiveIndex*" + multiplier + "+" + increment + "+PrimitiveParent)%256;PrimitiveText=PrimitiveText..PrimitiveBootstrapChar((PrimitiveKeyBytes[PrimitiveRecord[1]+PrimitiveParent]-PrimitiveIndex)%256);end;PrimitiveKeyCache[PrimitiveToken]=PrimitiveText;return PrimitiveText end;");
+
+				int resolverTopology = r.Next(3);
+				string RootLookup(string label)
+				{
+					if (resolverTopology == 0) return "PrimitiveLookup(" + tokens[label] + ")";
+					if (resolverTopology == 1) return "PrimitiveRoot(" + tokens[label] + ")";
+					return "PrimitiveRawGet(PrimitiveEnvironment,PrimitiveDecode(" + tokens[label] + "))";
+				}
+				string MemberLookup(string parent, string label)
+				{
+					if (resolverTopology == 0) return "PrimitiveLookup(" + tokens[label] + "," + parent + ")";
+					if (resolverTopology == 1) return "PrimitiveMember(" + parent + "," + tokens[label] + ")";
+					return "PrimitiveRawGet(" + parent + ",PrimitiveDecode(" + tokens[label] + "))";
+				}
+				if (resolverTopology == 0)
+					prelude.Append("local function PrimitiveLookup(PrimitiveToken,PrimitiveParent)return PrimitiveRawGet(PrimitiveParent or PrimitiveEnvironment,PrimitiveDecode(PrimitiveToken))end;");
+				else if (resolverTopology == 1)
+					prelude.Append("local function PrimitiveRoot(PrimitiveToken)return PrimitiveRawGet(PrimitiveEnvironment,PrimitiveDecode(PrimitiveToken))end;local function PrimitiveMember(PrimitiveParent,PrimitiveToken)return PrimitiveRawGet(PrimitiveParent,PrimitiveDecode(PrimitiveToken))end;");
+
+				var libraryAssignments = new List<KeyValuePair<string, string>>
+				{
+					new KeyValuePair<string, string>("StringTable", "PrimitiveString=" + RootLookup("StringTable") + ";"),
+					new KeyValuePair<string, string>("TableTable", "PrimitiveTable=" + RootLookup("TableTable") + ";"),
+					new KeyValuePair<string, string>("MathTable", "PrimitiveMath=" + RootLookup("MathTable") + ";"),
+					new KeyValuePair<string, string>("DebugTable", "PrimitiveDebug=" + RootLookup("DebugTable") + ";")
+				};
+				libraryAssignments.Shuffle(r);
+				prelude.Append("local PrimitiveTable,PrimitiveMath,PrimitiveDebug;");
+				foreach (KeyValuePair<string, string> assignment in libraryAssignments) prelude.Append(assignment.Value);
+				prelude.Append("local PrimitiveGlobalUnpack=" + RootLookup("GlobalUnpack")
+					+ ";local PrimitiveTableUnpack=" + MemberLookup("PrimitiveTable", "TableUnpack") + ";");
+
+				var assignments = new Dictionary<string, string>
+				{
+					["Byte"] = MemberLookup("PrimitiveString", "Byte"), ["Char"] = MemberLookup("PrimitiveString", "Char"),
+					["Sub"] = MemberLookup("PrimitiveString", "Sub"), ["Concat"] = MemberLookup("PrimitiveTable", "Concat"),
+					["Insert"] = MemberLookup("PrimitiveTable", "Insert"), ["LDExp"] = MemberLookup("PrimitiveMath", "LDExp"),
+					["GetFEnv"] = RootLookup("GetFEnv") + " or PrimitiveEnvironmentReader",
+					["Setmetatable"] = RootLookup("Setmetatable"), ["Getmetatable"] = RootLookup("Getmetatable"),
+					["RawGet"] = RootLookup("RawGet"), ["RawSet"] = RootLookup("RawSet"), ["RawEqual"] = RootLookup("RawEqual"),
+					["Next"] = RootLookup("Next"), ["Select"] = RootLookup("Select"), ["PCall"] = RootLookup("PCall"),
+					["Type"] = RootLookup("Type"), ["ToString"] = RootLookup("ToString"),
+					["Unpack"] = "PrimitiveGlobalUnpack or PrimitiveTableUnpack",
+					["ToNumber"] = RootLookup("ToNumber")
+				};
+				var declarationOrder = assignments.Keys.ToList();
+				declarationOrder.Shuffle(r);
+				var resolutionOrder = assignments.Keys.ToList();
+				resolutionOrder.Shuffle(r);
+				prelude.Append("local " + string.Join(",", declarationOrder) + ";");
+				foreach (string semanticName in resolutionOrder)
+					prelude.Append(semanticName + "=" + assignments[semanticName] + ";");
+
+				uint resolutionSignature = 2166136261u;
+				foreach (KeyValuePair<string, string> assignment in libraryAssignments)
+					foreach (char character in assignment.Key)
+						resolutionSignature = (resolutionSignature ^ character) * 16777619u;
+				foreach (string semanticName in resolutionOrder)
+					foreach (char character in semanticName)
+						resolutionSignature = (resolutionSignature ^ character) * 16777619u;
+				Console.WriteLine("Primitive resolver: bootstrap=" + bootstrapTopology + "; vault=" + vaultTopology
+					+ "; topology=" + resolverTopology + "; keys=" + keyNames.Count
+					+ "; order=" + resolutionSignature.ToString("x8") + ".");
+				return prelude.ToString();
+			}
+
 			byte[] bs = new Serializer(_context, settings).SerializeLChunk(_context.HeadChunk);
 			string data = Base91Encode(bs);
 			PayloadCarrierPlan payloadCarrier = BuildPayloadCarrierPlan(data, payloadCarrierRandom);
@@ -1488,27 +1664,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				+ "; assembly=" + payloadCarrier.AssemblyTopology
 				+ "; stages=" + string.Join(",", payloadCarrier.StageCounts) + ".");
 
-			vm += T(@"return(function()
-local Byte         = string.byte;
-local Char         = string.char;
-local Sub          = string.sub;
-local Concat       = table.concat;
-local Insert       = table.insert;
-local LDExp        = math.ldexp;
-local GetFEnv      = getfenv or function() return _G end;
-local Setmetatable = setmetatable;
-local Getmetatable = getmetatable;
-local RawGet       = rawget;
-local RawSet       = rawset;
-local RawEqual     = rawequal;
-local Next         = next;
-local Select       = select;
-local PCall        = pcall;
-local Type         = type;
-local ToString     = tostring;
-
-local Unpack = unpack or table.unpack;
-local ToNumber = tonumber;");
+			vm += T(BuildPrimitivePrelude());
 
 			// Carrier declarations remain in the outer loader scope, while each literal
 			// assignment is injected only after identifier rewriting. This avoids

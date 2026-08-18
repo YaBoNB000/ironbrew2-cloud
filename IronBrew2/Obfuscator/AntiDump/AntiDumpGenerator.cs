@@ -212,6 +212,29 @@ GuardDecoy = function(...)
 
             var keyValues = new Dictionary<string, string>
             {
+                ["__KEY_STRING_TABLE__"] = "string",
+                ["__KEY_TABLE_TABLE__"] = "table",
+                ["__KEY_MATH_TABLE__"] = "math",
+                ["__KEY_DEBUG_TABLE__"] = "debug",
+                ["__KEY_BYTE__"] = "byte",
+                ["__KEY_CHAR__"] = "char",
+                ["__KEY_SUB__"] = "sub",
+                ["__KEY_CONCAT__"] = "concat",
+                ["__KEY_INSERT__"] = "insert",
+                ["__KEY_LDEXP__"] = "ldexp",
+                ["__KEY_PCALL__"] = "pcall",
+                ["__KEY_TYPE__"] = "type",
+                ["__KEY_RAWGET__"] = "rawget",
+                ["__KEY_RAWSET__"] = "rawset",
+                ["__KEY_NEXT__"] = "next",
+                ["__KEY_GETMETATABLE__"] = "getmetatable",
+                ["__KEY_SETMETATABLE__"] = "setmetatable",
+                ["__KEY_RAWEQUAL__"] = "rawequal",
+                ["__KEY_TOSTRING__"] = "tostring",
+                ["__KEY_SELECT__"] = "select",
+                ["__KEY_TONUMBER__"] = "tonumber",
+                ["__KEY_GETFENV__"] = "getfenv",
+                ["__KEY_UNPACK__"] = "unpack",
                 ["__KEY_GETGENV__"] = "getgenv",
                 ["__KEY_ENV_CANARY__"] = RN(random, 14, 20),
                 ["__KEY_IDENTIFY__"] = "identifyexecutor",
@@ -272,14 +295,15 @@ GuardDecoy = function(...)
             string guard = @"
 local GuardAttestation, GuardProbe, GuardBindPayload, GuardFaultWord, GuardDecoy;
 do
-local GuardString = string;
-local GuardTable = table;
-local GuardMath = math;
-local GuardDebug = debug;
-local GuardUnpack = unpack;
-local GuardTableUnpack = GuardTable and GuardTable.unpack;
-local GuardGetFEnvGlobal = getfenv;
+local GuardString = PrimitiveString;
+local GuardTable = PrimitiveTable;
+local GuardMath = PrimitiveMath;
+local GuardDebug = PrimitiveDebug;
+local GuardUnpack = PrimitiveGlobalUnpack;
+local GuardTableUnpack = PrimitiveTableUnpack;
+local GuardGetFEnvGlobal;
 __IB2_KEY_VAULT__
+GuardGetFEnvGlobal = RawGet(PrimitiveEnvironment, __KEY_GETFENV__);
 
 local GuardEnvOK, GuardEnvironment = PCall(GetFEnv);
 if not GuardEnvOK or Type(GuardEnvironment) ~= 'table' then GuardEnvironment = nil; end;
@@ -398,15 +422,31 @@ local function GuardClassifies(GuardFunction, GuardExpectedC)
 end;
 
 local function GuardCurrentIdentity()
-    if string ~= GuardString or table ~= GuardTable or math ~= GuardMath or debug ~= GuardDebug
-        or pcall ~= PCall or type ~= Type or rawget ~= RawGet or rawset ~= RawSet
-        or next ~= Next or getmetatable ~= Getmetatable or setmetatable ~= Setmetatable
-        or rawequal ~= RawEqual or tostring ~= ToString or select ~= Select
-        or tonumber ~= ToNumber or getfenv ~= GuardGetFEnvGlobal
-        or GuardString.byte ~= Byte or GuardString.char ~= Char or GuardString.sub ~= Sub
-        or GuardTable.concat ~= Concat or GuardTable.insert ~= Insert
-        or GuardMath.ldexp ~= LDExp or unpack ~= GuardUnpack
-        or GuardTable.unpack ~= GuardTableUnpack or (unpack or GuardTable.unpack) ~= Unpack then
+    if RawGet(PrimitiveEnvironment, __KEY_STRING_TABLE__) ~= GuardString
+        or RawGet(PrimitiveEnvironment, __KEY_TABLE_TABLE__) ~= GuardTable
+        or RawGet(PrimitiveEnvironment, __KEY_MATH_TABLE__) ~= GuardMath
+        or RawGet(PrimitiveEnvironment, __KEY_DEBUG_TABLE__) ~= GuardDebug
+        or RawGet(PrimitiveEnvironment, __KEY_PCALL__) ~= PCall
+        or RawGet(PrimitiveEnvironment, __KEY_TYPE__) ~= Type
+        or RawGet(PrimitiveEnvironment, __KEY_RAWGET__) ~= RawGet
+        or RawGet(PrimitiveEnvironment, __KEY_RAWSET__) ~= RawSet
+        or RawGet(PrimitiveEnvironment, __KEY_NEXT__) ~= Next
+        or RawGet(PrimitiveEnvironment, __KEY_GETMETATABLE__) ~= Getmetatable
+        or RawGet(PrimitiveEnvironment, __KEY_SETMETATABLE__) ~= Setmetatable
+        or RawGet(PrimitiveEnvironment, __KEY_RAWEQUAL__) ~= RawEqual
+        or RawGet(PrimitiveEnvironment, __KEY_TOSTRING__) ~= ToString
+        or RawGet(PrimitiveEnvironment, __KEY_SELECT__) ~= Select
+        or RawGet(PrimitiveEnvironment, __KEY_TONUMBER__) ~= ToNumber
+        or RawGet(PrimitiveEnvironment, __KEY_GETFENV__) ~= GuardGetFEnvGlobal
+        or RawGet(GuardString, __KEY_BYTE__) ~= Byte
+        or RawGet(GuardString, __KEY_CHAR__) ~= Char
+        or RawGet(GuardString, __KEY_SUB__) ~= Sub
+        or RawGet(GuardTable, __KEY_CONCAT__) ~= Concat
+        or RawGet(GuardTable, __KEY_INSERT__) ~= Insert
+        or RawGet(GuardMath, __KEY_LDEXP__) ~= LDExp
+        or RawGet(PrimitiveEnvironment, __KEY_UNPACK__) ~= GuardUnpack
+        or RawGet(GuardTable, __KEY_UNPACK__) ~= GuardTableUnpack
+        or (GuardUnpack or GuardTableUnpack) ~= Unpack then
         return false;
     end;
     if not GuardEnvironment or Type(GuardGetGenV) ~= 'function'

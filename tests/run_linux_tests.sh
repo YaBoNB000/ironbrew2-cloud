@@ -373,6 +373,7 @@ echo "PASS unsupported dispatcher shape falls back without partial metadata"
 for ((i = 1; i <= RANDOM_RUNS; i++)); do
     obfuscate "$WORK/random.lua"
     cp "$WORK/obfuscator.log" "$WORK/obfuscator-$i.log"
+    cp "$ROOT/temp/t2.lua" "$WORK/primitive-build-$i.lua"
     python3 tests/runtime_layout.py "$ROOT/temp/t2.lua" --include-shape > "$WORK/runtime-layout-$i.out"
     python3 tests/payload_carrier_layout.py "$WORK/random.lua" "$WORK/obfuscator-$i.log" > "$WORK/payload-carrier-$i.out"
     if (( i <= 5 )); then
@@ -382,6 +383,11 @@ for ((i = 1; i <= RANDOM_RUNS; i++)); do
     run_executor "$WORK/random.lua" > "$WORK/random.out"
     cmp -s "$WORK/baseline.out" "$WORK/random.out"
 done
+primitive_builds=()
+for ((i = 1; i <= RANDOM_RUNS; i++)); do
+    primitive_builds+=("$WORK/primitive-build-$i.lua:$WORK/obfuscator-$i.log")
+done
+python3 tests/primitive_bootstrap.py "${primitive_builds[@]}"
 python3 - "$WORK" "$RANDOM_RUNS" <<'PY'
 from itertools import combinations
 from pathlib import Path
