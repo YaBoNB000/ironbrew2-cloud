@@ -2004,7 +2004,7 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     local TargetSlot = TargetIndex - Block[1] + 1;
     if TargetSlot < 1 or TargetSlot > Block[2] then error('invalid protected payload', 0); end;
     local Record = ReadFragment(TargetSlot);
-    local Digest = InstructionDigest(Record, TargetIndex, K1, K2, K3);
+    local Digest = InstructionDigest(Record, TargetIndex, K1, K2, K3, CurrentChunkState, EntryState);
 
     -- Parse just the requested instruction record. Five field roles remain
     -- independently framed and state-permuted, but no block-wide columns or

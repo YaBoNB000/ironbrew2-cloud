@@ -32,8 +32,9 @@
 >
 > 更新（2026-08-19，内部 MAC 第一批）：constant capsule tag 已替换为 keyed
 > two-lane cross-coupled authenticator，移除该边界的 polynomial `hash*31+byte`。
-> 完整 prototype-slice 与 block manifest tag 随后也完成同一 two-lane keyed 迁移；
-> instruction digest 仍使用旧算法，后续继续迁移。
+> 完整 prototype-slice、block manifest 与 instruction record digest 随后也完成
+> two-lane keyed 迁移；Payload 内部主要认证边界已不再使用 polynomial
+> `hash*31+byte`。当前 wire tag 仍压缩为 32-bit。
 
 日期：2026-08-15  
 本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）

@@ -816,7 +816,9 @@ def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) ->
         descriptors.append(descriptor)
         orders.append(column_order)
         column_spans.append(record_spans)
-        digest = instruction_digest(record, block.start_pc + offset, prototype)
+        digest = instruction_digest(
+            record, block.start_pc + offset, prototype, source_chunk_state, block.entry_state
+        )
         instruction_state = instruction_state_advance(
             instruction_state, digest, block.start_pc + offset,
             source_chunk_state, block.entry_state,
@@ -888,12 +890,30 @@ def constant_integrity(encoded: bytes, index: int, prototype: Prototype, capsule
     return (left ^ rotate16(right)) & MASK32
 
 
-def instruction_digest(record: bytes, index: int, prototype: Prototype) -> int:
-    value = hash_word(INSTRUCTION_STATE_DOMAIN ^ index, prototype.k1)
-    value = hash_word(value, prototype.k2)
-    value = hash_word(value, prototype.k3)
-    value = hash_word(value, len(record))
-    return hash_bytes(value, record)
+def instruction_digest(
+    record: bytes, index: int, prototype: Prototype, current_chunk_state: int, entry_state: int
+) -> int:
+    domain = INSTRUCTION_STATE_DOMAIN
+    keyed = (prototype.k1 * 65537 + prototype.k2 * 257 + prototype.k3) & MASK32
+    left = keyed ^ domain ^ index ^ entry_state
+    right = current_chunk_state ^ rotate16(keyed) ^ (index * 257 & MASK32) ^ rotate16(entry_state)
+    counter = 1
+
+    def absorb(word: int) -> None:
+        nonlocal left, right, counter
+        mixed = (word + counter * 257) & MASK32
+        left = ((left ^ mixed) * 65599 + 0x9E3779B9) & MASK32
+        right = ((right + mixed + (left >> 16)) * 48271 + 0x6D2B79F5) & MASK32
+        left = (left ^ rotate16(right)) & MASK32
+        counter += 1
+
+    for word in (index, prototype.k1, prototype.k2, prototype.k3, len(record)):
+        absorb(word)
+    for value in record:
+        absorb(value)
+    left = ((left ^ right ^ len(record)) * 65599 + domain) & MASK32
+    right = ((right ^ rotate16(left) ^ index) * 48271 + 0xC4D29A6B) & MASK32
+    return (left ^ rotate16(right)) & MASK32
 
 
 def instruction_state_begin(

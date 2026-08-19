@@ -185,7 +185,9 @@ def decode_opcodes(
                 )
             fragment = block.fragment_spans[offset]
             record = info.body[fragment[1]:fragment[2]]
-            digest = payload.instruction_digest(record, pc, proto)
+            digest = payload.instruction_digest(
+                record, pc, proto, current_chunk_state, block.entry_state
+            )
             state = advance_opcode_state(
                 state, digest, pc, current_chunk_state, block.entry_state
             )

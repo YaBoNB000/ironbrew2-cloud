@@ -387,13 +387,27 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			                 (_context.Domains.OpcodeStateDomain & 0xffffu)) & 0xffffu);
 		}
 
-		private uint ComputeInstructionDigest(byte[] record, int index, ushort k1, ushort k2, ushort k3)
+		private uint ComputeInstructionDigest(byte[] record, int index, ushort k1, ushort k2, ushort k3,
+			uint chunkState, uint entryState)
 		{
-			uint hash = unchecked((_context.Domains.InstructionStateDomain ^ (uint)index) * 31u + k1);
-			hash = HashWord(hash, k2);
-			hash = HashWord(hash, k3);
-			hash = HashWord(hash, (uint)record.Length);
-			return HashBytes(hash, record);
+			uint domain = _context.Domains.InstructionStateDomain;
+			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
+			uint left = keyed ^ domain ^ (uint)index ^ entryState;
+			uint right = chunkState ^ Rotate16(keyed) ^ unchecked((uint)index * 257u) ^ Rotate16(entryState);
+			uint counter = 1;
+			void Absorb(uint word)
+			{
+				uint mixed = unchecked(word + counter * 257u);
+				left = unchecked((left ^ mixed) * 65599u + 0x9E3779B9u);
+				right = unchecked((right + mixed + (left >> 16)) * 48271u + 0x6D2B79F5u);
+				left ^= Rotate16(right);
+				counter++;
+			}
+			Absorb((uint)index); Absorb(k1); Absorb(k2); Absorb(k3); Absorb((uint)record.Length);
+			foreach (byte value in record) Absorb(value);
+			left = unchecked((left ^ right ^ (uint)record.Length) * 65599u + domain);
+			right = unchecked((right ^ Rotate16(left) ^ (uint)index) * 48271u + 0xC4D29A6Bu);
+			return left ^ Rotate16(right);
 		}
 
 		private ushort BlockFieldMask(uint entryState, int pc, int slot, ushort k1, ushort k2, ushort k3)
@@ -990,7 +1004,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								byte[] record = instructionRecord.ToArray();
 								instructionRecords.Add(record);
 								opcodeState = AdvanceOpcodeState(opcodeState,
-									ComputeInstructionDigest(record, instructionIndex, k1, k2, k3), instructionIndex,
+									ComputeInstructionDigest(record, instructionIndex, k1, k2, k3, sourceChunkState, entryState), instructionIndex,
 									sourceChunkState, entryState, payloadAttestation);
 							}
 
