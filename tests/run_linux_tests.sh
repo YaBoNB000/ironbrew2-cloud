@@ -84,6 +84,8 @@ cp "$ROOT/temp/t2.lua" "$WORK/fixed-vm.lua"
 python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
 python3 tests/materializer_replay.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/prototype_decoder_families.py "$WORK/fixed.lua"
+python3 tests/streaming_carrier.py "$WORK/fixed.lua"
 python3 tests/static_attack_baseline.py "$WORK/fixed.lua" \
     --expect-string constants --expect-string closure --expect-string nested \
     --require-current-baseline --report "$WORK/static-attack-baseline.json"
@@ -230,6 +232,7 @@ stream_leak = re.search(
     r"\b(?:DeriveBlockPermutation|DeriveCodeDataPermutation|Column(?:Order|Positions|Read8|Read16|Read32|Data|Position)|"
     r"Fragment(?:Order|Spans|Count|State)|Instruction(?:Digest|State|Seal)|BeginInstructionState|AdvanceInstructionState|"
     r"OpcodeState(?:Key|Seal)?|BeginOpcodeState|AdvanceOpcodeState|PreviousOpcodeState|CurrentOpcode(?:State|Seal)|"
+    r"PrototypeDecoderMode|DecodePrototypeColumn|DecoderMode|"
     r"CipherByte|KeyByte|LengthOffset|EncodedIndex|Pipeline(?:State|Index)|TransformedByte|InstrPoint|Inst|GetInstruction)\b",
     source + "\n" + final_source,
 )
@@ -475,6 +478,7 @@ payload_layouts = [payload_layout(layout["domains"]) for layout in layouts]
 derivation_profiles = [derivation_profile(layout["domains"]) for layout in layouts]
 payload_layout_vectors = [json.dumps(layout, sort_keys=True) for layout in payload_layouts]
 super_records = []
+semantic_records = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
     match = re.search(
@@ -486,6 +490,16 @@ for index in range(1, runs + 1):
     lengths = {int(size): int(count) for size, count in
                (entry.split(":") for entry in match.group(3).split(","))}
     super_records.append((int(match.group(1)), int(match.group(2)), lengths, match.group(4)))
+    semantic = re.search(
+        r"Semantic lowering: writes=([0-9,]+); raw-stack-reads=(\d+); raw-environment-reads=(\d+)\.",
+        log,
+    )
+    if not semantic:
+        raise SystemExit(f"missing semantic-lowering record for build {index}")
+    writes = tuple(int(value) for value in semantic.group(1).split(","))
+    if len(writes) != 6:
+        raise SystemExit(f"semantic-lowering write profile is not six-way: {writes}")
+    semantic_records.append((writes, int(semantic.group(2)), int(semantic.group(3))))
 slot_abis = [json.dumps({key: layout[key] for key in ("chunk", "block", "flow", "flow_cache")}, sort_keys=True)
              for layout in layouts]
 if min(counts) <= 44:
@@ -560,6 +574,13 @@ if any(len(record[2]) < 2 or sum(record[2].values()) != record[0] for record in 
     raise SystemExit(f"short super-operator length structure is degenerate: {super_records}")
 if len({record[3] for record in super_records}) != runs:
     raise SystemExit("a short super-operator semantic structure was reused across builds")
+write_totals = tuple(sum(record[0][index] for record in semantic_records) for index in range(6))
+if min(write_totals) <= 0:
+    raise SystemExit(f"not all six semantic write lowerings were emitted: {write_totals}")
+if len({record[0] for record in semantic_records}) < runs // 2:
+    raise SystemExit("semantic write-lowering profiles did not vary across builds")
+if sum(record[1] for record in semantic_records) < runs or sum(record[2] for record in semantic_records) < 3:
+    raise SystemExit(f"raw accessor lowering coverage is insufficient: {semantic_records}")
 if len(set(slot_abis)) != runs:
     raise SystemExit("a runtime slot ABI was reused across builds")
 
@@ -663,6 +684,7 @@ print(
     f"payload carriers={sorted(carrier_topologies)}, assemblies={sorted(assembly_topologies)}, "
     f"segments={sorted(segment_counts)}, "
     f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, "
+    f"semantic writes={write_totals}, raw reads={sum(record[1] for record in semantic_records)}/{sum(record[2] for record in semantic_records)}, "
     f"similarity dispatcher={max_similarity:.3f}/{mean_similarity:.3f}, "
     f"slot-ABI={max_slot_similarity:.3f}/{mean_slot_similarity:.3f}, "
     f"payload-grammar={max_grammar_similarity:.3f}/{mean_grammar_similarity:.3f}, "

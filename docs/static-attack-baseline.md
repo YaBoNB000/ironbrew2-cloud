@@ -38,6 +38,12 @@ The exact carrier count, entropy size, seed, attestation value and opcode IDs va
 per build. The security-relevant baseline is that a final-file-only analyzer can
 still recover all of them.
 
+The attack harness has already been adapted to the first M2–M5 changes: nested
+segment tables, 2 KiB decoded-ciphertext chunks, four prototype-local column
+families and two-stage materializer replay. It still recovers the complete body,
+constants and canonical opcode IDs. This prevents us from mistaking structural
+novelty for a broken static recovery chain.
+
 Run it with:
 
 ```bash

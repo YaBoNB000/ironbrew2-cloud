@@ -14,6 +14,13 @@
 > 最终 Lua 并量化当前静态恢复链。现阶段预期攻击成功：可恢复 carrier、binding、
 > 完整 body、prototype/block、常量 capsule、`"print"`/`"idk"` 和 canonical opcode IDs。
 > 该结果作为后续 M1–M5 的攻击回归基线，不作为当前防护能力声明。
+>
+> 更新（2026-08-19，M2/M3/M4/M5 第一批）：Base91 carrier 改为递归增量消费，
+> decoded ciphertext 以 2 KiB chunks 保存并通过 accessor 读取；instruction columns
+> 增加四套 prototype-local decoder family；materializer overlay 拆成 header/tail 并
+> 经过两阶段 replay；handler 写回增加六种 lowering，并随机混用 RawGet/RawSet。
+> 最终文件攻击器已同步适配，仍可恢复完整常量与 canonical opcode，说明这些改动
+> 提高工作量但尚未打断静态闭环。
 
 日期：2026-08-15  
 本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）

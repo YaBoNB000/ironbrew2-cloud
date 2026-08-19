@@ -611,6 +611,76 @@ def block_field_mask(entry_state: int, pc: int, slot: int, prototype: Prototype)
     ) & 0xFFFF
 
 
+def prototype_decoder_mode(prototype: Prototype) -> int:
+    return (
+        prototype.k1 * 13
+        + prototype.k2 * 7
+        + prototype.k3 * 11
+        + DECODE_PIPELINE_DOMAIN
+    ) % 4
+
+
+def _column_mask(
+    prototype: Prototype, block: Block, role: int, pc: int, index: int
+) -> int:
+    low, high = block.entry_state & 0xFFFF, block.entry_state >> 16
+    return (
+        low
+        + high * 3
+        + prototype.k1 * 5
+        + prototype.k2 * 7
+        + prototype.k3 * 11
+        + pc * 13
+        + role * 17
+        + index * 29
+        + DECODE_PIPELINE_DOMAIN
+    ) & 0xFF
+
+
+def encode_prototype_column(
+    column: bytes, prototype: Prototype, block: Block, role: int, pc: int
+) -> bytes:
+    mode = prototype_decoder_mode(prototype)
+    output = bytearray(len(column))
+    for index, value in enumerate(column):
+        mask = _column_mask(prototype, block, role, pc, index)
+        if mode == 0:
+            encoded = value ^ mask
+        elif mode == 1:
+            encoded = (value + mask) & 0xFF
+        elif mode == 2:
+            encoded = (((value << 4) | (value >> 4)) & 0xFF) ^ mask
+        else:
+            shift = ((role + pc + index) % 7) + 1
+            encoded = (((value << shift) | (value >> (8 - shift))) + mask) & 0xFF
+        destination = len(column) - index - 1 if mode in (1, 3) else index
+        output[destination] = encoded
+    return bytes(output)
+
+
+def decode_prototype_column(
+    column: bytes, prototype: Prototype, block: Block, role: int, pc: int
+) -> bytes:
+    mode = prototype_decoder_mode(prototype)
+    output = bytearray(len(column))
+    for encoded_index, encoded in enumerate(column):
+        index = len(column) - encoded_index - 1 if mode in (1, 3) else encoded_index
+        mask = _column_mask(prototype, block, role, pc, index)
+        if mode == 0:
+            value = encoded ^ mask
+        elif mode == 1:
+            value = (encoded - mask) & 0xFF
+        elif mode == 2:
+            value = encoded ^ mask
+            value = ((value << 4) | (value >> 4)) & 0xFF
+        else:
+            value = (encoded - mask) & 0xFF
+            shift = ((role + pc + index) % 7) + 1
+            value = ((value >> shift) | (value << (8 - shift))) & 0xFF
+        output[index] = value
+    return bytes(output)
+
+
 def validate_instruction_record(
     record: bytes, prototype: Prototype, block: Block, offset: int,
     record_start: int, record_end: int,
@@ -632,6 +702,10 @@ def validate_instruction_record(
     if cursor.position != len(record) or set(columns) != set(range(5)):
         raise ValueError("instruction record columns were not consumed exactly")
     pc = block.start_pc + offset
+    columns = {
+        role: decode_prototype_column(value, prototype, block, role, pc)
+        for role, value in columns.items()
+    }
     if len(columns[0]) != 1:
         raise ValueError("instruction descriptor page is not scalar")
     descriptor = columns[0][0] ^ (block_field_mask(block.entry_state, pc, 7, prototype) & 0xFF)
@@ -1518,7 +1592,14 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
         entry_block.entry_state, entry_block.start_pc + normal_offset, 7, info.root
     )
     column_consumption_variant = bytearray(info.body)
-    column_consumption_variant[descriptor_offset] = (1 ^ descriptor_mask) & 0xFF
+    encoded_descriptor = encode_prototype_column(
+        bytes([(1 ^ descriptor_mask) & 0xFF]),
+        info.root,
+        entry_block,
+        0,
+        entry_block.start_pc + normal_offset,
+    )
+    column_consumption_variant[descriptor_offset] = encoded_descriptor[0]
     patch_u32(
         column_consumption_variant,
         entry_block.tag_offset,

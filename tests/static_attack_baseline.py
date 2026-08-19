@@ -160,9 +160,12 @@ def decode_opcodes(
             else:
                 opcode_span = block.record_column_spans[offset][1]
                 encoded = info.body[opcode_span[1]:opcode_span[2]]
-                if len(encoded) != 2:
+                decoded_column = payload.decode_prototype_column(
+                    encoded, proto, block, 1, pc
+                )
+                if len(decoded_column) != 2:
                     raise ValueError("opcode column is not a uint16 field")
-                stored = int.from_bytes(encoded, "little")
+                stored = int.from_bytes(decoded_column, "little")
                 local_opcode = (
                     stored
                     ^ opcode_mask(pc, proto.k1, proto.k2, proto.k3)

@@ -158,17 +158,25 @@ end;
 
 -- v5 Build-local outer grammar. The field positions are generated into this VM
 -- rather than carried by a generic format selector in the payload.
-if #ByteString < 41 then error('invalid protected payload', 0); end;
-local PayloadCiphertext = ByteString;
-local PayloadHead = Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__, __IB2_OUTER_HEAD_OFFSET__)
-         + Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__ + 1, __IB2_OUTER_HEAD_OFFSET__ + 1) * 256
-         + Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__ + 2, __IB2_OUTER_HEAD_OFFSET__ + 2) * 65536
-         + Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__ + 3, __IB2_OUTER_HEAD_OFFSET__ + 3) * 16777216;
-local PayloadTag = Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__, __IB2_OUTER_TAG_OFFSET__)
-         + Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__ + 1, __IB2_OUTER_TAG_OFFSET__ + 1) * 256
-         + Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__ + 2, __IB2_OUTER_TAG_OFFSET__ + 2) * 65536
-         + Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__ + 3, __IB2_OUTER_TAG_OFFSET__ + 3) * 16777216;
-local PayloadFlags = Byte(PayloadCiphertext, __IB2_OUTER_FLAGS_OFFSET__, __IB2_OUTER_FLAGS_OFFSET__);
+if PayloadLength < 41 then error('invalid protected payload', 0); end;
+local function PayloadByteAt(Index)
+    if Index < 1 or Index > PayloadLength then error('invalid protected payload', 0); end;
+    local ZeroIndex = Index - 1;
+    local PayloadChunkIndex = (ZeroIndex - ZeroIndex % 2048) / 2048 + 1;
+    local PayloadChunkOffset = ZeroIndex % 2048 + 1;
+    local PayloadChunk = PayloadCiphertext[PayloadChunkIndex];
+    if PayloadChunk == nil then error('invalid protected payload', 0); end;
+    return Byte(PayloadChunk, PayloadChunkOffset, PayloadChunkOffset);
+end;
+local PayloadHead = PayloadByteAt(__IB2_OUTER_HEAD_OFFSET__)
+         + PayloadByteAt(__IB2_OUTER_HEAD_OFFSET__ + 1) * 256
+         + PayloadByteAt(__IB2_OUTER_HEAD_OFFSET__ + 2) * 65536
+         + PayloadByteAt(__IB2_OUTER_HEAD_OFFSET__ + 3) * 16777216;
+local PayloadTag = PayloadByteAt(__IB2_OUTER_TAG_OFFSET__)
+         + PayloadByteAt(__IB2_OUTER_TAG_OFFSET__ + 1) * 256
+         + PayloadByteAt(__IB2_OUTER_TAG_OFFSET__ + 2) * 65536
+         + PayloadByteAt(__IB2_OUTER_TAG_OFFSET__ + 3) * 16777216;
+local PayloadFlags = PayloadByteAt(__IB2_OUTER_FLAGS_OFFSET__);
 local PayloadFeatures = PayloadFlags % 16;
 local PayloadVersion = (PayloadFlags - PayloadFeatures) / 16;
 if PayloadVersion ~= 5 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
@@ -186,16 +194,16 @@ local function PayloadRotate16(Value)
 end;
 local PayloadAuthA = (BitXOR(Xi, __IB2_DOMAIN_INTEGRITY__) + 2781082087 + PayloadFlags * 257) % 4294967296;
 local PayloadAuthB = (Xi + PayloadRotate16(__IB2_DOMAIN_INTEGRITY__) + 2135587861
-    + (#PayloadCiphertext - 9) * 17) % 4294967296;
-for PayloadIndex = 10, #PayloadCiphertext do
-    local PayloadByte = Byte(PayloadCiphertext, PayloadIndex, PayloadIndex);
+    + (PayloadLength - 9) * 17) % 4294967296;
+for PayloadIndex = 10, PayloadLength do
+    local PayloadByte = PayloadByteAt(PayloadIndex);
     local PayloadMix = (PayloadByte + (PayloadIndex - 9) * 257 + PayloadFlags * 17) % 4294967296;
     PayloadAuthA = (BitXOR(PayloadAuthA, PayloadMix) * 65599 + 2654435769) % 4294967296;
     PayloadAuthB = ((PayloadAuthB + PayloadMix + (PayloadAuthA - PayloadAuthA % 65536) / 65536)
         * 48271 + 1831565813) % 4294967296;
     PayloadAuthA = BitXOR(PayloadAuthA, PayloadRotate16(PayloadAuthB)) % 4294967296;
 end;
-PayloadAuthA = (BitXOR(BitXOR(PayloadAuthA, PayloadAuthB), #PayloadCiphertext - 9)
+PayloadAuthA = (BitXOR(BitXOR(PayloadAuthA, PayloadAuthB), PayloadLength - 9)
     * 65599 + __IB2_DOMAIN_INTEGRITY__) % 4294967296;
 PayloadAuthB = (BitXOR(BitXOR(PayloadAuthB, PayloadRotate16(PayloadAuthA)), PayloadFlags)
     * 48271 + 3302136427) % 4294967296;
@@ -210,8 +218,8 @@ local EnvelopeCipherState = Xs;
 local EnvelopePlainPos = 0;
 local EnvelopeHash = (BitXOR(OuterSeed, __IB2_DOMAIN_ENVELOPE_INTEGRITY__) * 31) % 4294967296;
 local function EnvelopeRead8()
-    if EnvelopeCipherPos > #PayloadCiphertext then error('invalid protected payload', 0); end;
-    local CipherByte = Byte(PayloadCiphertext, EnvelopeCipherPos, EnvelopeCipherPos);
+    if EnvelopeCipherPos > PayloadLength then error('invalid protected payload', 0); end;
+    local CipherByte = PayloadByteAt(EnvelopeCipherPos);
     local KeyByte = (EnvelopeCipherState - EnvelopeCipherState % 16777216) / 16777216;
     local PlainByte = BitXOR(CipherByte, KeyByte);
     EnvelopeCipherState = (EnvelopeCipherState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
@@ -235,7 +243,7 @@ or EnvelopeEntropyLength < 65536 or EnvelopeEntropyLength > 98304
 or EnvelopeDataCount < 1 or EnvelopeDataCount > 65535
 or EnvelopeEntropyCount < 8 or EnvelopeEntropyCount > 64
 or EnvelopeRecordCount ~= EnvelopeDataCount + EnvelopeEntropyCount
-or EnvelopeNonce == 0 or EnvelopeExpected ~= #PayloadCiphertext - 9 then error('invalid protected payload', 0); end;
+or EnvelopeNonce == 0 or EnvelopeExpected ~= PayloadLength - 9 then error('invalid protected payload', 0); end;
 
 local PayloadPageDescriptors = {};
 local EntropyDescriptors = {};
@@ -252,7 +260,7 @@ end;
 for EnvelopeIndex = 1, EnvelopeRecordCount do
     local EnvelopeKind, EnvelopeOrdinal, EnvelopeLength;
     __IB2_RECORD_FIELD_READS__
-    if EnvelopeLength < 1 or EnvelopeCipherPos + EnvelopeLength - 1 > #PayloadCiphertext then error('invalid protected payload', 0); end;
+    if EnvelopeLength < 1 or EnvelopeCipherPos + EnvelopeLength - 1 > PayloadLength then error('invalid protected payload', 0); end;
     local Descriptor = {EnvelopeCipherPos, EnvelopeLength, EnvelopeCipherState};
     if EnvelopeKind == __IB2_DATA_RECORD_KIND__ then
         if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeDataCount or PayloadPageDescriptors[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
@@ -267,7 +275,7 @@ for EnvelopeIndex = 1, EnvelopeRecordCount do
     end;
     for EnvelopeByteIndex = 1, EnvelopeLength do EnvelopeRead8(); end;
 end;
-if EnvelopeCipherPos ~= #PayloadCiphertext + 1 or EnvelopeDataLength ~= EnvelopeRealLength
+if EnvelopeCipherPos ~= PayloadLength + 1 or EnvelopeDataLength ~= EnvelopeRealLength
 or EnvelopeEntropySeenLength ~= EnvelopeEntropyLength or EnvelopeHash ~= EnvelopeTag then error('invalid protected payload', 0); end;
 
 -- Entropy is authenticated in logical order without retaining any entropy record.
@@ -282,7 +290,7 @@ for EnvelopeIndex = 1, EnvelopeEntropyCount do
     local DescriptorState = Descriptor[3];
     for DescriptorOffset = 0, Descriptor[2] - 1 do
         local KeyByte = (DescriptorState - DescriptorState % 16777216) / 16777216;
-        local PlainByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + DescriptorOffset, Descriptor[1] + DescriptorOffset), KeyByte);
+        local PlainByte = BitXOR(PayloadByteAt(Descriptor[1] + DescriptorOffset), KeyByte);
         EntropyHash = (EntropyHash * 31 + PlainByte) % 4294967296;
         DescriptorState = (DescriptorState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
     end;
@@ -306,7 +314,7 @@ for PageOrdinal = 1, EnvelopeDataCount do
         local OuterKey = (DescriptorState - DescriptorState % 16777216) / 16777216;
         local InnerKey = (EnvelopeMaskState - EnvelopeMaskState % 16777216) / 16777216;
         if PageByteIndex >= LengthOffset and PageByteIndex < LengthOffset + __IB2_PAGE_LENGTH_WIDTH__ then
-            local NestedByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + PageByteIndex, Descriptor[1] + PageByteIndex), OuterKey);
+            local NestedByte = BitXOR(PayloadByteAt(Descriptor[1] + PageByteIndex), OuterKey);
             RawLength = RawLength + BitXOR(NestedByte, InnerKey) * Multiplier;
             Multiplier = Multiplier * 256;
         end;
@@ -337,7 +345,7 @@ local function LoadPayloadPage()
     for PageByteIndex = 0, Descriptor[2] - 1 do
         local OuterKey = (DescriptorState - DescriptorState % 16777216) / 16777216;
         local InnerKey = (MaskState - MaskState % 16777216) / 16777216;
-        local NestedByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + PageByteIndex, Descriptor[1] + PageByteIndex), OuterKey);
+        local NestedByte = BitXOR(PayloadByteAt(Descriptor[1] + PageByteIndex), OuterKey);
         local PlainByte = BitXOR(NestedByte, InnerKey);
         if PageByteIndex >= LengthOffset and PageByteIndex < LengthOffset + __IB2_PAGE_LENGTH_WIDTH__ then
             FramedLength = FramedLength + PlainByte * Multiplier;
@@ -396,7 +404,7 @@ end;
 
 -- Source abstraction: root reads bounded pages; child prototypes and opaque block
 -- or capsule slices use the same readers over a local string source.
-ByteString = nil;
+local ByteString = nil;
 local Pos = 1;
 local ActiveSourceLength = PayloadSourceLength;
 local SourceIsPaged = true;
@@ -836,7 +844,7 @@ local function Wrap(Chunk, Upvalues, Env)
     end;
 end;	
 local Root = Deserialize();
-ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext, PayloadByteAt, PayloadLength = nil, nil, nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
@@ -847,7 +855,7 @@ end)()(...);
     end;
 end;	
 local Root = Deserialize();
-ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext, PayloadByteAt, PayloadLength = nil, nil, nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
@@ -969,7 +977,7 @@ local function Wrap(Chunk, Upvalues, Env)
 	end;
 end;	
 local Root = Deserialize();
-ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext, PayloadByteAt, PayloadLength = nil, nil, nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
@@ -989,7 +997,7 @@ end)()(...);
 	end;
 end;	
 local Root = Deserialize();
-ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext, PayloadByteAt, PayloadLength = nil, nil, nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";

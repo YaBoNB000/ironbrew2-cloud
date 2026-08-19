@@ -529,6 +529,48 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return values;
 		}
 
+		private int PrototypeDecoderMode(ushort k1, ushort k2, ushort k3) =>
+			(int)(((uint)k1 * 13u + (uint)k2 * 7u + (uint)k3 * 11u +
+			       _context.Domains.DecodePipelineDomain) % 4u);
+
+		private byte[] EncodePrototypeColumn(IReadOnlyList<byte> column, int role, int pc,
+			uint entryState, ushort k1, ushort k2, ushort k3)
+		{
+			int mode = PrototypeDecoderMode(k1, k2, k3);
+			var output = new byte[column.Count];
+			uint low = entryState & 0xFFFFu;
+			uint high = entryState >> 16;
+			for (int index = 0; index < column.Count; index++)
+			{
+				byte value = column[index];
+				int mask = (int)((low + high * 3u + (uint)k1 * 5u + (uint)k2 * 7u +
+				                      (uint)k3 * 11u + (uint)pc * 13u + (uint)role * 17u +
+				                      (uint)index * 29u + _context.Domains.DecodePipelineDomain) & 0xFFu);
+				byte encoded;
+				switch (mode)
+				{
+					case 0:
+						encoded = (byte)(value ^ mask);
+						break;
+					case 1:
+						encoded = (byte)(value + mask);
+						break;
+					case 2:
+						byte nibble = (byte)((value << 4) | (value >> 4));
+						encoded = (byte)(nibble ^ mask);
+						break;
+					default:
+						int shift = ((role + pc + index) % 7) + 1;
+						byte rotated = (byte)((value << shift) | (value >> (8 - shift)));
+						encoded = (byte)(rotated + mask);
+						break;
+				}
+				int destination = mode == 1 || mode == 3 ? column.Count - index - 1 : index;
+				output[destination] = encoded;
+			}
+			return output;
+		}
+
 		private static int[] DeriveCodeDataPermutation(int instructionCount, int constantCount,
 			uint stateValue, ushort k1, ushort k2, ushort k3, uint domain)
 		{
@@ -898,8 +940,11 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								var instructionRecord = new List<byte>();
 								foreach (int logicalColumn in columnOrder)
 								{
-									WriteUInt32(instructionRecord, (uint)columns[logicalColumn].Count);
-									instructionRecord.AddRange(columns[logicalColumn]);
+									byte[] encodedColumn = EncodePrototypeColumn(
+										columns[logicalColumn], logicalColumn, instructionIndex,
+										entryState, k1, k2, k3);
+									WriteUInt32(instructionRecord, (uint)encodedColumn.Length);
+									instructionRecord.AddRange(encodedColumn);
 								}
 								byte[] record = instructionRecord.ToArray();
 								instructionRecords.Add(record);
