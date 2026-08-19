@@ -13,11 +13,13 @@ import verify_v4_payload as verifier_module
 SERIALIZER = ROOT / "IronBrew2" / "Bytecode Library" / "Bytecode" / "Serializer.cs"
 VM_STRINGS = ROOT / "IronBrew2" / "Obfuscator" / "VM Generation" / "VMStrings.cs"
 DERIVATION = ROOT / "IronBrew2" / "Obfuscator" / "PayloadDerivationProfile.cs"
+ANTI_DUMP = ROOT / "IronBrew2" / "Obfuscator" / "AntiDump" / "AntiDumpGenerator.cs"
 VERIFIER = ROOT / "tests" / "verify_v4_payload.py"
 
 serializer = SERIALIZER.read_text(encoding="utf-8-sig")
 vm = VM_STRINGS.read_text(encoding="utf-8-sig")
 derivation = DERIVATION.read_text(encoding="utf-8-sig")
+anti_dump = ANTI_DUMP.read_text(encoding="utf-8-sig")
 verifier = VERIFIER.read_text(encoding="utf-8-sig")
 
 if "private const byte FormatVersion = 5;" not in serializer:
@@ -42,6 +44,8 @@ if "ComputeIntegrity(encrypted, _context.OuterIntegrityKey, flags)" not in seria
     raise SystemExit("serializer does not separate the outer-auth key from XorSeed")
 if "DeriveBindingWords" not in derivation or "DeriveOuterIntegrityKey" not in derivation or "DerivePayloadBinding" not in derivation:
     raise SystemExit("outer-auth and payload keys do not use the four-word binding state")
+if "__IB2_ATTESTATION_TOKEN__" in anti_dump or "GuardAttestation ~= " in anti_dump:
+    raise SystemExit("guard restored a shipped final-token literal/equality oracle")
 
 if "PayloadVersion ~= 5" not in vm:
     raise SystemExit("generated runtime does not require the v5 payload")

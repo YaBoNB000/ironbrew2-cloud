@@ -499,6 +499,24 @@ def _attestation_candidates(source: str) -> set[int]:
     for left, operator, right in re.findall(r"\(\s*(\d+)\s*([+\-*])\s*(\d+)\s*\)", source):
         lhs, rhs = int(left), int(right)
         candidates.add(lhs + rhs if operator == "+" else lhs - rhs if operator == "-" else lhs * rhs)
+
+    # The production guard no longer ships or compares the final token literal.
+    # It restores the compatibility scalar as transcript + a Build-local offset;
+    # combine that public offset with numeric transcript candidates before the
+    # envelope/framing oracle filters them.
+    ident = r"[A-Za-z_]\w*"
+    offsets = {
+        int(value)
+        for value in re.findall(
+            rf"if\s+not\s+{ident}\s+then\s+{ident}\s*=\s*\(\s*{ident}\s*\+\s*(\d+)\s*\)"
+            rf"\s*%\s*4294967296\s*;",
+            source,
+            re.S,
+        )
+    }
+    base_candidates = list(candidates)
+    for offset in offsets:
+        candidates.update((candidate + offset) & MASK32 for candidate in base_candidates)
     return {candidate for candidate in candidates if 0 < candidate <= MASK32}
 
 

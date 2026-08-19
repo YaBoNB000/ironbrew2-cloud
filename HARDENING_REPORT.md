@@ -24,8 +24,9 @@
 >
 > 更新（2026-08-19，M1 第一批）：环境绑定 KDF 改为四个并行 32-bit words，
 > envelope seed、outer-integrity key 与 payload/chunk/instruction state binding 使用
-> 不同 fold；payload state 不再直接等于 `GuardAttestation`。兼容 guard 仍保留最终
-> scalar token，因此最终文件攻击器依旧可以模拟并恢复全部 words，M1 尚未完成。
+> 不同 fold；payload state 不再直接等于 `GuardAttestation`。最终 token literal 和
+> 集中式 equality 已删除；兼容 scalar 仍由 `transcript + offset` 在运行时恢复，因此
+> 最终文件攻击器仍可组合公开 transcript/offset 并恢复全部 words，M1 尚未完成。
 
 日期：2026-08-15  
 本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）

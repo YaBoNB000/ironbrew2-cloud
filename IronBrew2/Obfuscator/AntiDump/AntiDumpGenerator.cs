@@ -351,7 +351,7 @@ local GuardUpvalue = __IB2_UPVALUE_EXPECTED__;
 
 local function GuardRejectA()
     GuardTripped = true;
-    if GuardReportOnly then GuardAttestation = __IB2_ATTESTATION_TOKEN__; return false; end;
+    if GuardReportOnly then GuardAttestation = (__IB2_FAULT_WORD__ + 1) % 4294967296; return false; end;
     GuardFaultWord = __IB2_FAULT_WORD__; GuardAttestation = 0;
     while GuardFaultWord == GuardFaultWord do
         GuardFaultWord = (GuardFaultWord * __IB2_SINK_MUL_A__ + GuardState + __IB2_SINK_ADD_A__) % 2147483647;
@@ -360,7 +360,7 @@ local function GuardRejectA()
 end;
 local function GuardRejectB()
     GuardTripped = true;
-    if GuardReportOnly then GuardAttestation = __IB2_ATTESTATION_TOKEN__; return false; end;
+    if GuardReportOnly then GuardAttestation = (__IB2_FAULT_WORD__ + 1) % 4294967296; return false; end;
     GuardAttestation = 0; GuardPayloadSeal = __IB2_FAULT_WORD__;
     repeat
         GuardPayloadSeal = (GuardPayloadSeal * __IB2_SINK_MUL_B__ + GuardPayloadState + __IB2_SINK_ADD_B__) % 2147483647;
@@ -369,7 +369,7 @@ local function GuardRejectB()
 end;
 local function GuardRejectC()
     GuardTripped = true;
-    if GuardReportOnly then GuardAttestation = __IB2_ATTESTATION_TOKEN__; return false; end;
+    if GuardReportOnly then GuardAttestation = (__IB2_FAULT_WORD__ + 1) % 4294967296; return false; end;
     GuardAttestation = 0; GuardFaultWord = __IB2_FAULT_WORD__;
     while not (GuardPayloadState ~= GuardPayloadState) do
         GuardPayloadState = (GuardPayloadState * __IB2_SINK_MUL_C__ + GuardFaultWord) % 2147483647;
@@ -378,7 +378,7 @@ local function GuardRejectC()
 end;
 local function GuardRejectD()
     GuardTripped = true;
-    if GuardReportOnly then GuardAttestation = __IB2_ATTESTATION_TOKEN__; return false; end;
+    if GuardReportOnly then GuardAttestation = (__IB2_FAULT_WORD__ + 1) % 4294967296; return false; end;
     GuardAttestation = 0; GuardFaultWord = __IB2_FAULT_WORD__;
     while GuardTripped do
         GuardState = (GuardState * __IB2_SINK_MUL_D__ + GuardFaultWord + __IB2_SINK_ADD_D__) % 2147483647;
@@ -691,7 +691,6 @@ GuardProbe = function(Force)
         GuardAttestation = (GuardTranscript + __IB2_ATTESTATION_OFFSET__) % 4294967296;
         GuardAttested = true;
     end;
-    if GuardAttestation ~= __IB2_ATTESTATION_TOKEN__ then return GuardReject(); end;
 
     GuardState = (GuardState * 48271 + GuardCounter + GuardEpoch * 17 + GuardAttestation % 65521) % 2147483647;
     GuardSealA = (GuardState * 65599 + __IB2_SEAL_SALT__ + GuardAttestation) % 2147483647;
@@ -737,7 +736,6 @@ end;
                 ["__IB2_TRANSCRIPT_SEED__"] = transcriptSeed.ToString(),
                 ["__IB2_TRANSCRIPT_EXPECTED__"] = transcriptExpected.ToString(),
                 ["__IB2_ATTESTATION_OFFSET__"] = attestationOffset.ToString(),
-                ["__IB2_ATTESTATION_TOKEN__"] = attestationToken.ToString(),
                 ["__IB2_FAULT_WORD__"] = faultWord.ToString(),
                 ["__IB2_REPORT_ONLY__"] = TemporaryGlobalSinkBypass ? "true" : "false",
                 ["__IB2_DECOY_GRAPH__"] = BuildDecoyGraph(decoySeed, random),
