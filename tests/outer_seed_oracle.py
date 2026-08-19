@@ -85,11 +85,11 @@ verifier_module.BINDER_INITIAL = 0x11223344
 verifier_module.BINDER_FINAL_XOR = 0x55667788
 verifier_module.BINDER_MULTIPLIER = 65521
 verifier_module.BINDER_INCREMENT = 32749
-if verifier_module.binder_seed(123456789, 987654321) != 0xA6E2839F:
+if verifier_module.binder_seed(123456789, 987654321) != 0x9BDBA850:
     raise SystemExit("four-word environment stream-seed derivation vector changed")
-if verifier_module.binder_integrity_key(123456789, 987654321) != 0x5AC2E11E:
+if verifier_module.binder_integrity_key(123456789, 987654321) != 0x5D271662:
     raise SystemExit("four-word outer-integrity-key derivation vector changed")
-if verifier_module.binder_payload_binding(123456789, 987654321) != 0x290E3B08:
+if verifier_module.binder_payload_binding(123456789, 987654321) != 0x944CCFB5:
     raise SystemExit("four-word payload-state binding vector changed")
 
 print("PASS v5 outer tag has no direct polynomial stream-seed inverse")

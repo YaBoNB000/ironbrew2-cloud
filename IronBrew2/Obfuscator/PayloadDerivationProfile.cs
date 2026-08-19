@@ -40,8 +40,8 @@ namespace IronBrew2.Obfuscator
 			{
 				unchecked(attestationToken * 65599u + 0x9E3779B9u),
 				unchecked(attestationToken * 48271u + 0x6D2B79F5u),
-				unchecked((attestationToken ^ 0xA5C3F1E7u) * 131071u + 0x7F4A7C15u),
-				unchecked((attestationToken ^ 0xC4D29A6Bu) * 524287u + 0xC2B2AE35u)
+				unchecked((attestationToken + 0xA5C3F1E7u) * 131071u + 0x7F4A7C15u),
+				unchecked((attestationToken + 0xC4D29A6Bu) * 524287u + 0xC2B2AE35u)
 			};
 		}
 

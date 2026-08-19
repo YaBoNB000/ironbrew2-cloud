@@ -29,6 +29,10 @@
 > 立即生成 `GuardEvidenceA..D`，随后清零。Guard seal 使用不可反推四字内容的 fold，
 > payload KDF 直接消费四字 evidence。最终文件攻击器仍可模拟公开 transcript/offset
 > 并恢复全部 words，因此这是客户端成本放大而非秘密。
+>
+> 更新（2026-08-19，内部 MAC 第一批）：constant capsule tag 已替换为 keyed
+> two-lane cross-coupled authenticator，移除该边界的 polynomial `hash*31+byte`。
+> prototype/block/instruction 边界仍使用旧 tag，后续继续迁移。
 
 日期：2026-08-15  
 本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）

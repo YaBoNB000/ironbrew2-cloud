@@ -555,11 +555,21 @@ end;
 
 local function ComputeConstantIntegrity(EncodedBody, Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3)
     local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
-    local Hash = (BitXOR(BitXOR(BitXOR(Keyed, __IB2_DOMAIN_CONSTANT_INTEGRITY__), EntryState), CurrentChunkState) * 31 + BlockStart) % 4294967296;
-    Hash = (Hash * 31 + Index) % 4294967296;
-    Hash = (Hash * 31 + #EncodedBody) % 4294967296;
-    for I = 1, #EncodedBody do Hash = (Hash * 31 + Byte(EncodedBody, I, I)) % 4294967296; end;
-    return Hash;
+    local Left = BitXOR(BitXOR(BitXOR(Keyed, __IB2_DOMAIN_CONSTANT_INTEGRITY__), EntryState), PayloadRotate16(CurrentChunkState)) % 4294967296;
+    local Right = BitXOR(BitXOR(BitXOR(CurrentChunkState, PayloadRotate16(Keyed)), (BlockStart * 257) % 4294967296), Index) % 4294967296;
+    local Counter = 1;
+    local function Absorb(Word)
+        local Mixed = (Word + Counter * 257) % 4294967296;
+        Left = (BitXOR(Left, Mixed) * 65599 + 2654435769) % 4294967296;
+        Right = ((Right + Mixed + (Left - Left % 65536) / 65536) * 48271 + 1831565813) % 4294967296;
+        Left = BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
+        Counter = Counter + 1;
+    end;
+    Absorb(BlockStart); Absorb(Index); Absorb(#EncodedBody);
+    for I = 1, #EncodedBody do Absorb(Byte(EncodedBody, I, I)); end;
+    Left = (BitXOR(BitXOR(Left, Right), #EncodedBody) * 65599 + __IB2_DOMAIN_CONSTANT_INTEGRITY__) % 4294967296;
+    Right = (BitXOR(BitXOR(Right, PayloadRotate16(Left)), Index) * 48271 + 3302136427) % 4294967296;
+    return BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
 end;
 
 local function InstructionDigest(Record, Index, K1, K2, K3)

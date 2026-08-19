@@ -458,8 +458,8 @@ def evidence_words(attestation: int) -> tuple[int, int, int, int]:
     return (
         (attestation * 65599 + 0x9E3779B9) & MASK32,
         (attestation * 48271 + 0x6D2B79F5) & MASK32,
-        ((attestation ^ 0xA5C3F1E7) * 131071 + 0x7F4A7C15) & MASK32,
-        ((attestation ^ 0xC4D29A6B) * 524287 + 0xC2B2AE35) & MASK32,
+        ((attestation + 0xA5C3F1E7) * 131071 + 0x7F4A7C15) & MASK32,
+        ((attestation + 0xC4D29A6B) * 524287 + 0xC2B2AE35) & MASK32,
     )
 
 
@@ -866,13 +866,26 @@ def constant_mask_state(index: int, prototype: Prototype, capsule: Capsule) -> i
 
 def constant_integrity(encoded: bytes, index: int, prototype: Prototype, capsule: Capsule) -> int:
     keyed = (prototype.k1 * 65537 + prototype.k2 * 257 + prototype.k3) & MASK32
-    value = hash_word(
-        keyed ^ CONSTANT_INTEGRITY_DOMAIN ^ capsule.entry_state ^ capsule.chunk_state,
-        capsule.block_start,
-    )
-    value = hash_word(value, index)
-    value = hash_word(value, len(encoded))
-    return hash_bytes(value, encoded)
+    left = keyed ^ CONSTANT_INTEGRITY_DOMAIN ^ capsule.entry_state ^ rotate16(capsule.chunk_state)
+    right = capsule.chunk_state ^ rotate16(keyed) ^ (capsule.block_start * 257 & MASK32) ^ index
+    counter = 1
+
+    def absorb(word: int) -> None:
+        nonlocal left, right, counter
+        mixed = (word + counter * 257) & MASK32
+        left = ((left ^ mixed) * 65599 + 0x9E3779B9) & MASK32
+        right = ((right + mixed + (left >> 16)) * 48271 + 0x6D2B79F5) & MASK32
+        left = (left ^ rotate16(right)) & MASK32
+        counter += 1
+
+    absorb(capsule.block_start)
+    absorb(index)
+    absorb(len(encoded))
+    for value in encoded:
+        absorb(value)
+    left = ((left ^ right ^ len(encoded)) * 65599 + CONSTANT_INTEGRITY_DOMAIN) & MASK32
+    right = ((right ^ rotate16(left) ^ index) * 48271 + 0xC4D29A6B) & MASK32
+    return (left ^ rotate16(right)) & MASK32
 
 
 def instruction_digest(record: bytes, index: int, prototype: Prototype) -> int:

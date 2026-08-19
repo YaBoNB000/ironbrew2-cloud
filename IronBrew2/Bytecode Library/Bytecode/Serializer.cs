@@ -427,11 +427,25 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			uint entryState, uint chunkState, int blockStart, ushort k1, ushort k2, ushort k3)
 		{
 			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
-			uint hash = HashWord(keyed ^ _context.Domains.ConstantIntegrityDomain ^ entryState ^ chunkState,
-				(uint)blockStart);
-			hash = HashWord(hash, (uint)oneBasedIndex);
-			hash = HashWord(hash, (uint)encodedBody.Length);
-			return HashBytes(hash, encodedBody);
+			uint domain = _context.Domains.ConstantIntegrityDomain;
+			uint left = keyed ^ domain ^ entryState ^ Rotate16(chunkState);
+			uint right = chunkState ^ Rotate16(keyed) ^ unchecked((uint)blockStart * 257u) ^ (uint)oneBasedIndex;
+			uint counter = 1;
+			void Absorb(uint word)
+			{
+				uint mixed = unchecked(word + counter * 257u);
+				left = unchecked((left ^ mixed) * 65599u + 0x9E3779B9u);
+				right = unchecked((right + mixed + (left >> 16)) * 48271u + 0x6D2B79F5u);
+				left ^= Rotate16(right);
+				counter++;
+			}
+			Absorb((uint)blockStart);
+			Absorb((uint)oneBasedIndex);
+			Absorb((uint)encodedBody.Length);
+			foreach (byte value in encodedBody) Absorb(value);
+			left = unchecked((left ^ right ^ (uint)encodedBody.Length) * 65599u + domain);
+			right = unchecked((right ^ Rotate16(left) ^ (uint)oneBasedIndex) * 48271u + 0xC4D29A6Bu);
+			return left ^ Rotate16(right);
 		}
 
 		private uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
