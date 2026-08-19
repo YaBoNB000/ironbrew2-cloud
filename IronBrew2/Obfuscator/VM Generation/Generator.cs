@@ -918,7 +918,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			string[] identKeys = {
 				"ByteString","InstrPoint","GetFEnv","Setmetatable","Getmetatable","RawGet","RawSet","RawEqual","Next","ToNumber","ToString","ConstCount","Deserialize",
 				"PayloadParts","ConsumePayloadPart","PayloadChunks","PayloadLength","EmitPayloadByte","PayloadByteAt","PayloadChunk","PayloadChunkIndex","PayloadChunkOffset",
-				"Wrap","Upvalues","NewProto","Indexes","Concat","Insert","LDExp","Select","Unpack",
+				"Wrap","Upvalues","NewProto","NewPrototypeRecord","Layout","Storage","Proxy","Key","Slot","Indexes","Concat","Insert","LDExp","Select","Unpack",
 				"BitXOR","gBits32","gBits8","gBits16","gFloat","gSizet","gString","gInt","Byte","Char","Sub",
 				"gBit","Instrs","Functions","Lines","Consts","ConstCapsules","Capsule","Instr","Proto","Params","Top","Vararg","Args",
 				"PCount","Lupvals","Stk","Inst","Enum","Chunk","decompress","Pos","Xs","Xd","_R","Env",
@@ -1814,7 +1814,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 	            end;
 	            local Length = gBits32();
 	            if Length < 25 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
-	            local Block = {};
+	            local Block = NewPrototypeRecord(
+	                10, K1, K2, K3, BlockStart + Verifier % 65536);
 	            Block[1] = BlockStart;
 	            Block[2] = Count;
 	            Block[3] = SourceReadBytes(Length);

@@ -752,20 +752,42 @@ local function DeriveCodeDataPermutation(InstructionCount, ConstantCount, StateV
     return Values;
 end;
 
+local function NewPrototypeRecord(Count, K1, K2, K3, Salt)
+    local Layout = DerivePermutation(
+        Count, K1, K2, K3,
+        (__IB2_DOMAIN_SCHEMA_PERMUTATION__ + Salt * 257) % 4294967296);
+    local Storage = {};
+    local Proxy = {};
+    Setmetatable(Proxy,
+    {
+        __index = function(_, Key)
+            local Slot = Layout[Key];
+            if Slot == nil then return nil; end;
+            return RawGet(Storage, Slot + 1);
+        end,
+        __newindex = function(_, Key, Value)
+            local Slot = Layout[Key];
+            if Slot == nil then error('invalid protected payload', 0); end;
+            RawSet(Storage, Slot + 1, Value);
+        end
+    });
+    return Proxy;
+end;
+
 local function Deserialize()
     local PrototypeLength = ActiveSourceLength;
     ActivePrototypeHash = nil;
     local Instrs = {};
     local Functions = {};
 		local Lines = {};
-    local Chunk = {};
-    Chunk[1] = Instrs;
-    Chunk[2] = Functions;
-    Chunk[4] = Lines;
     local K1 = gBits16();
     local K2 = gBits16();
     local K3 = gBits16();
     local PrototypeTag = gBits32();
+    local Chunk = NewPrototypeRecord(16, K1, K2, K3, PrototypeLength);
+    Chunk[1] = Instrs;
+    Chunk[2] = Functions;
+    Chunk[4] = Lines;
     BeginPrototypeIntegrity(PrototypeLength, K1, K2, K3);
     Chunk[5], Chunk[6], Chunk[7] = K1, K2, K3;
     local OpcodeBank = DerivePermutation(__IB2_OPCODE_COUNT__, K1, K2, K3, __IB2_DOMAIN_OPCODE_PERMUTATION__);

@@ -35,6 +35,11 @@
 > 完整 prototype-slice、block manifest 与 instruction record digest 随后也完成
 > two-lane keyed 迁移；Payload 内部主要认证边界已不再使用 polynomial
 > `hash*31+byte`。当前 wire tag 仍压缩为 32-bit。
+>
+> 更新（2026-08-19，prototype-local runtime ABI）：Chunk/Block 构造器改为
+> prototype-local proxy；现有 build-wide slot permutation 作为逻辑 ABI，proxy 再将
+> 访问映射到 K1/K2/K3 与 prototype/block metadata 派生的独立 storage layout。
+> 父子 prototypes 及同 prototype 的不同 blocks 不再共享一套实际数字槽位。
 
 日期：2026-08-15  
 本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）

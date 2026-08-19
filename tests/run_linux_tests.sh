@@ -85,6 +85,7 @@ python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
 python3 tests/materializer_replay.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/prototype_decoder_families.py "$WORK/fixed.lua"
+python3 tests/prototype_runtime_abi.py "$WORK/fixed.lua"
 python3 tests/streaming_carrier.py "$WORK/fixed.lua"
 python3 tests/static_attack_baseline.py "$WORK/fixed.lua" \
     --expect-string constants --expect-string closure --expect-string nested \
