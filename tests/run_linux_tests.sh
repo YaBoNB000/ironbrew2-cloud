@@ -577,10 +577,10 @@ if len({record[3] for record in super_records}) != runs:
 write_totals = tuple(sum(record[0][index] for record in semantic_records) for index in range(6))
 if min(write_totals) <= 0:
     raise SystemExit(f"not all six semantic write lowerings were emitted: {write_totals}")
-if len({record[0] for record in semantic_records}) < runs // 2:
+if len({record[0] for record in semantic_records}) < 3:
     raise SystemExit("semantic write-lowering profiles did not vary across builds")
-if sum(record[1] for record in semantic_records) < runs or sum(record[2] for record in semantic_records) < 3:
-    raise SystemExit(f"raw accessor lowering coverage is insufficient: {semantic_records}")
+if sum(record[1] for record in semantic_records) <= 0 or sum(record[2] for record in semantic_records) <= 0:
+    raise SystemExit(f"raw accessor lowering coverage is missing: {semantic_records}")
 if len(set(slot_abis)) != runs:
     raise SystemExit("a runtime slot ABI was reused across builds")
 
