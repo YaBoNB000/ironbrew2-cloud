@@ -951,7 +951,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
 				"GuardBehaviorKey","GuardFirstKey","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential",
 				"AllowMaterializer","MaterializeIndexSlot","MaterializeHeaderSlot","MaterializeTailSlot","MaterializeStageSlot","MaterializeStage","MaterializeMode","MaterializeEnum","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedHeader","MaterializedTail","MaterializedInstruction",
-				"GuardAttestation","GuardAttested","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
+				"GuardAttestation","GuardAttested","GuardKeyA","GuardKeyB","GuardKeyC","GuardKeyD","GuardPayloadBinding","BinderRotate16","SeedByte","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
 				"GuardClassOK1","GuardClassOK2","GuardClassOK3","GuardClassOK4","GuardCompileOK","GuardConstantProbe","GuardConstants","GuardConstantsOK",
 				"GuardCurrentEnvOK","GuardCurrentEnvironment","GuardCurrentIdentity","GuardExpected","GuardGame","GuardGetConstants","GuardGetProto","GuardGetProtos",
 				"GuardGetUpvalues","GuardHostOK","GuardHostResult","GuardIdOK1","GuardIdOK2","GuardIdentify","GuardInstance","GuardLaneA","GuardLaneB","GuardLaneC",
@@ -1761,7 +1761,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			vm += T(ApplyBuildDomains(VMStrings.VMP1
 				// 环境绑定：注入种子派生代码（读盐 → 跑探针 → Hash 派生 Xs）
 				.Replace("__IB2_SEED__", settings.EnvironmentLock ? _context.Binder.SeedDeriveLua : EnvBinder.PlainSeedLua)
-				.Replace("__IB2_PAYLOAD_ATTESTATION__", settings.AntiDump ? "GuardAttestation" : "OuterSeed")
+				.Replace("__IB2_PAYLOAD_ATTESTATION__", settings.AntiDump ? "GuardPayloadBinding" : "OuterSeed")
 				.Replace("__IB2_WATERMARK__", EscapeLuaString(settings.Watermark))
 				.Replace("__IB2_OPCODE_COUNT__", virtuals.Count.ToString())));
 			

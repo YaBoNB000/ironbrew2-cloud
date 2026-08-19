@@ -21,6 +21,11 @@
 > 经过两阶段 replay；handler 写回增加六种 lowering，并随机混用 RawGet/RawSet。
 > 最终文件攻击器已同步适配，仍可恢复完整常量与 canonical opcode，说明这些改动
 > 提高工作量但尚未打断静态闭环。
+>
+> 更新（2026-08-19，M1 第一批）：环境绑定 KDF 改为四个并行 32-bit words，
+> envelope seed、outer-integrity key 与 payload/chunk/instruction state binding 使用
+> 不同 fold；payload state 不再直接等于 `GuardAttestation`。兼容 guard 仍保留最终
+> scalar token，因此最终文件攻击器依旧可以模拟并恢复全部 words，M1 尚未完成。
 
 日期：2026-08-15  
 本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）

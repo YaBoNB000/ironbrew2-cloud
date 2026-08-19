@@ -803,7 +803,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				do state = NextState32(); while (!usedBlockStates.Add(state));
 				blockStates.Add(block, state);
 			}
-			uint payloadAttestation = _settings.AntiDump ? _context.Binder.AttestationToken : _context.XorSeed;
+			uint payloadAttestation = _settings.AntiDump ? _context.Binder.PayloadBinding : _context.XorSeed;
 			var blockChunkStates = instructionBlocks.ToDictionary(
 				block => block,
 				block => ChunkState(blockStates[block], block.Start + 1, block.Count, k1, k2, k3,

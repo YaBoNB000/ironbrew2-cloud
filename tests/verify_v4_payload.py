@@ -454,20 +454,37 @@ def outer_integrity(encrypted: bytes, integrity_key: int, flags: int) -> int:
     return (left ^ rotate16(right)) & MASK32
 
 
+def binder_words(head: int, attestation: int) -> tuple[int, int, int, int]:
+    words = [
+        BINDER_INITIAL,
+        BINDER_INITIAL ^ 0xA5C3F1E7,
+        BINDER_FINAL_XOR ^ 0x6D2B79F5,
+        head ^ attestation ^ 0x9E3779B9,
+    ]
+    for index, item in enumerate(f"{head}|{attestation}".encode("ascii"), start=1):
+        words[0] = (words[0] * BINDER_MULTIPLIER + item + BINDER_INCREMENT) & MASK32
+        words[1] = (
+            words[1] * (BINDER_MULTIPLIER + 2)
+            + item + BINDER_INCREMENT + index * 17
+        ) & MASK32
+        words[2] = (words[2] * 65599 + item + (words[0] >> 16)) & MASK32
+        words[3] = (words[3] * 48271 + item + (words[1] & 0xFFFF) + index) & MASK32
+    return tuple(words)
+
+
 def binder_seed(head: int, attestation: int) -> int:
-    state = BINDER_INITIAL
-    for item in f"{head}|{attestation}".encode("ascii"):
-        state = (state * BINDER_MULTIPLIER + item + BINDER_INCREMENT) & MASK32
-    return state ^ BINDER_FINAL_XOR
+    a, b, c, d = binder_words(head, attestation)
+    return a ^ rotate16(b) ^ c ^ d ^ BINDER_FINAL_XOR
+
+
+def binder_payload_binding(head: int, attestation: int) -> int:
+    a, b, c, d = binder_words(head, attestation)
+    return ((a ^ b) + (c ^ d) + 0xC2B2AE35) & MASK32
 
 
 def binder_integrity_key(head: int, attestation: int) -> int:
-    state = BINDER_INITIAL ^ 0xA5C3F1E7
-    for index, item in enumerate(f"{attestation}#{head}".encode("ascii"), start=1):
-        state = (
-            state * BINDER_MULTIPLIER + item + BINDER_INCREMENT + index * 257
-        ) & MASK32
-    result = state ^ BINDER_FINAL_XOR ^ 0xC4D29A6B
+    _a, b, c, d = binder_words(head, attestation)
+    result = b ^ rotate16(c) ^ d ^ BINDER_FINAL_XOR ^ 0xC4D29A6B
     return 0xC4D29A6B if result == 0 else result
 
 
@@ -1339,7 +1356,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
     # authenticate the complete prototype graph.
     roots: list[tuple[int, Prototype]] = []
     for candidate in attestation_candidates:
-        PAYLOAD_ATTESTATION = candidate
+        PAYLOAD_ATTESTATION = binder_payload_binding(head, candidate)
         try:
             roots.append((candidate, parse_prototype(body, 0, len(body), seed)))
         except (ValueError, IndexError, struct.error):
@@ -1350,7 +1367,7 @@ def parse_and_verify(path: Path) -> PayloadInfo:
             f"{[candidate for candidate, _root in roots]}"
         )
     attestation_token, root = roots[0]
-    PAYLOAD_ATTESTATION = attestation_token
+    PAYLOAD_ATTESTATION = binder_payload_binding(head, attestation_token)
 
     entropy = b"".join(entropy_records[index] for index in range(1, entropy_count + 1))
     entropy_score = shannon_entropy(entropy)

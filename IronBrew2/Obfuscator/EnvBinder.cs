@@ -19,10 +19,11 @@ namespace IronBrew2.Obfuscator
 
         public uint Salt { get; private set; }
         public uint AttestationToken { get; private set; }
+        public uint PayloadBinding { get; private set; }
         public string SeedDeriveLua { get; private set; }
 
         /// <summary>EnvironmentLock-disabled compatibility path for library callers.</summary>
-        public const string PlainSeedLua = "local Xs = PayloadHead; local Xi = Xs;";
+        public const string PlainSeedLua = "local Xs = PayloadHead; local Xi = Xs; local GuardPayloadBinding = Xs;";
 
         public EnvBinder(BuildRandom random, PayloadDerivationProfile profile)
         {
@@ -33,22 +34,31 @@ namespace IronBrew2.Obfuscator
             {
                 AttestationToken = NextNonZeroUInt32(random);
             } while (DeriveSeed(AttestationToken) == 0);
+            PayloadBinding = _profile.DerivePayloadBinding(Salt, AttestationToken);
 
             SeedDeriveLua = $@"
 local SeedText = ToString(PayloadHead) .. Char(124) .. ToString(GuardAttestation);
-local SeedMix = {_profile.BinderInitial};
+local GuardKeyA = {_profile.BinderInitial};
+local GuardKeyB = BitXOR({_profile.BinderInitial}, 2781082087) % 4294967296;
+local GuardKeyC = BitXOR({_profile.BinderFinalXor}, 1831565813) % 4294967296;
+local GuardKeyD = BitXOR(BitXOR(PayloadHead, GuardAttestation), 2654435769) % 4294967296;
 for SeedIndex = 1, #SeedText do
-    SeedMix = (SeedMix * {_profile.BinderMultiplier} + Byte(SeedText, SeedIndex) + {_profile.BinderIncrement}) % 4294967296;
+    local SeedByte = Byte(SeedText, SeedIndex);
+    GuardKeyA = (GuardKeyA * {_profile.BinderMultiplier} + SeedByte + {_profile.BinderIncrement}) % 4294967296;
+    GuardKeyB = (GuardKeyB * {_profile.BinderMultiplier + 2u} + SeedByte + {_profile.BinderIncrement} + SeedIndex * 17) % 4294967296;
+    GuardKeyC = (GuardKeyC * 65599 + SeedByte + (GuardKeyA - GuardKeyA % 65536) / 65536) % 4294967296;
+    GuardKeyD = (GuardKeyD * 48271 + SeedByte + GuardKeyB % 65536 + SeedIndex) % 4294967296;
 end;
-local Xs = BitXOR(SeedMix, {_profile.BinderFinalXor}) % 4294967296;
-local OuterIntegrityText = ToString(GuardAttestation) .. Char(35) .. ToString(PayloadHead);
-local OuterIntegrityState = BitXOR({_profile.BinderInitial}, 2781082087) % 4294967296;
-for OuterIntegrityIndex = 1, #OuterIntegrityText do
-    OuterIntegrityState = (OuterIntegrityState * {_profile.BinderMultiplier} + Byte(OuterIntegrityText, OuterIntegrityIndex)
-        + {_profile.BinderIncrement} + OuterIntegrityIndex * 257) % 4294967296;
+local function BinderRotate16(Value)
+    local Low = Value % 65536;
+    return (Low * 65536 + (Value - Low) / 65536) % 4294967296;
 end;
-local Xi = BitXOR(BitXOR(OuterIntegrityState, {_profile.BinderFinalXor}), 3302136427) % 4294967296;
+local Xs = BitXOR(BitXOR(GuardKeyA, BinderRotate16(GuardKeyB)), BitXOR(GuardKeyC, GuardKeyD));
+Xs = BitXOR(Xs, {_profile.BinderFinalXor}) % 4294967296;
+local Xi = BitXOR(BitXOR(GuardKeyB, BinderRotate16(GuardKeyC)), GuardKeyD);
+Xi = BitXOR(BitXOR(Xi, {_profile.BinderFinalXor}), 3302136427) % 4294967296;
 if Xi == 0 then Xi = 3302136427; end;
+local GuardPayloadBinding = (BitXOR(GuardKeyA, GuardKeyB) + BitXOR(GuardKeyC, GuardKeyD) + 3266489909) % 4294967296;
 ";
         }
 
@@ -64,5 +74,8 @@ if Xi == 0 then Xi = 3302136427; end;
 
         public uint DeriveIntegrityKey(uint attestationToken) =>
             _profile.DeriveOuterIntegrityKey(Salt, attestationToken);
+
+        public uint DerivePayloadBinding(uint attestationToken) =>
+            _profile.DerivePayloadBinding(Salt, attestationToken);
     }
 }

@@ -40,8 +40,8 @@ if "hash = unchecked(hash * 31u + value)" in integrity_region:
     raise SystemExit("serializer restored the reversible v4 outer byte recurrence")
 if "ComputeIntegrity(encrypted, _context.OuterIntegrityKey, flags)" not in serializer:
     raise SystemExit("serializer does not separate the outer-auth key from XorSeed")
-if "DeriveOuterIntegrityKey" not in derivation or 'attestationToken.ToString() + "#" + salt.ToString()' not in derivation:
-    raise SystemExit("outer-auth key does not use its independent binding transcript")
+if "DeriveBindingWords" not in derivation or "DeriveOuterIntegrityKey" not in derivation or "DerivePayloadBinding" not in derivation:
+    raise SystemExit("outer-auth and payload keys do not use the four-word binding state")
 
 if "PayloadVersion ~= 5" not in vm:
     raise SystemExit("generated runtime does not require the v5 payload")
@@ -81,9 +81,11 @@ verifier_module.BINDER_INITIAL = 0x11223344
 verifier_module.BINDER_FINAL_XOR = 0x55667788
 verifier_module.BINDER_MULTIPLIER = 65521
 verifier_module.BINDER_INCREMENT = 32749
-if verifier_module.binder_seed(123456789, 987654321) != 0xC8ABF389:
-    raise SystemExit("environment stream-seed derivation vector changed")
-if verifier_module.binder_integrity_key(123456789, 987654321) != 0x9A577426:
-    raise SystemExit("independent outer-integrity-key derivation vector changed")
+if verifier_module.binder_seed(123456789, 987654321) != 0x32497E7B:
+    raise SystemExit("four-word environment stream-seed derivation vector changed")
+if verifier_module.binder_integrity_key(123456789, 987654321) != 0x5CCF5788:
+    raise SystemExit("four-word outer-integrity-key derivation vector changed")
+if verifier_module.binder_payload_binding(123456789, 987654321) != 0x5F4E68EC:
+    raise SystemExit("four-word payload-state binding vector changed")
 
 print("PASS v5 outer tag has no direct polynomial stream-seed inverse")

@@ -5,7 +5,7 @@
 ## 2026-08-19 静态攻击路线（进行中）
 
 - [x] M0：建立只接收最终 Lua 的攻击基线，恢复 carrier、binding keys、完整 body、prototype/block、常量 capsule 和 canonical opcode IDs；当前 `test.lua` 的 `"print"`/`"idk"` 可完整恢复。
-- [ ] M1：取消单一 `GuardAttestation`/全局 seed，改为多字 challenge state 和 page/prototype/block/constant/opcode 独立 key。
+- [~] M1：payload KDF 已从单一 accumulator 改为四字 `GuardKeyA..D`，分别折叠出 envelope seed、outer-integrity key 与独立 `GuardPayloadBinding`，chunk/instruction/opcode state 不再直接使用 `GuardAttestation`；guard challenge 本身仍保留单一 `GuardAttestation` 兼容门，后续需移除该最终标量并让多字状态直接来自行为 transcript。
 - [~] M2：已完成递归增量 Base91 segment 消费、禁止大型 segment 直接拼接，并将 decoded ciphertext 改为 2 KiB chunks + chunk-aware byte accessor；尚未做到 page 消费后立即释放全部早期 ciphertext chunks。
 - [~] M3：已完成 4 套 prototype-key-derived instruction-column decoder family（XOR、reverse/add、nibble/XOR、reverse/rotate/add），同一构建内父子 prototype 可使用不同模式；prototype-local Chunk/Block ABI 仍待实施。
 - [~] M4：已将单 instruction pending overlay 扩展为 header/tail 分离、两阶段 synthetic materializer 和两次 PC replay；serializer 初始 record 仍可由完整静态模拟器重组，opcode/A/B/C/constant 独立 materialization 尚待实施。
