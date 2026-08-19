@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Verify and tamper-test IronBrew2's authenticated v4 payload format."""
+"""Verify and tamper-test IronBrew2's authenticated v5 payload format.
+
+The filename is retained so existing CI/tooling imports keep working.
+"""
 
 from __future__ import annotations
 
@@ -47,7 +50,6 @@ ENTROPY_MAX = 96 * 1024
 LCG_MULTIPLIER = 1664525
 LCG_INCREMENT = 1013904223
 LCG_INVERSE = pow(LCG_MULTIPLIER, -1, MOD32)
-POLY31_INVERSE = pow(31, -1, MOD32)
 STREAM_MULTIPLIER = 0
 STREAM_INCREMENT = 0
 BINDER_MULTIPLIER = 0
@@ -349,7 +351,7 @@ def extract_payload(source: str) -> tuple[list[Literal], bytes]:
         raise ValueError(f"expected 7–14 large base91 payload segments, found {len(candidates)}")
     payload = decode_base91("".join(item.content for item in candidates))
     if len(payload) < 9:
-        raise ValueError("decoded payload is shorter than the fixed v4 header")
+        raise ValueError("decoded payload is shorter than the fixed v5 header")
     return candidates, payload
 
 
@@ -426,18 +428,30 @@ def payload_stream_xor(data: bytes, seed: int) -> bytes:
     return bytes(output)
 
 
-def recover_outer_seed(stored_integrity: int, flags: int, encrypted: bytes) -> int:
-    """Invert the public polynomial tag to recover the serializer seed.
+def rotate16(value: int) -> int:
+    value &= MASK32
+    return ((value << 16) | (value >> 16)) & MASK32
 
-    EnvironmentLock writes a salt, not this seed, in the payload head. This
-    inversion is intentional verifier tooling and also documents that the
-    client-side binding is a coupling/cost amplifier rather than a secret key.
+
+def outer_integrity(encrypted: bytes, integrity_key: int, flags: int) -> int:
+    """Mirror v5's two-lane outer authenticator.
+
+    Unlike v4's polynomial, the public tag is a compression of two coupled
+    states and cannot be walked backwards byte-by-byte to recover a key. The
+    authenticator key is also derived separately from the envelope stream seed.
+    Both remain client-side state; this helper deliberately does not claim
+    server-backed authenticity.
     """
-    value = stored_integrity
-    for item in reversed(encrypted):
-        value = ((value - item) * POLY31_INVERSE) & MASK32
-    value = ((value - flags) * POLY31_INVERSE) & MASK32
-    return value ^ INTEGRITY_DOMAIN
+    left = ((integrity_key ^ INTEGRITY_DOMAIN) + 0xA5C3F1E7 + flags * 257) & MASK32
+    right = (integrity_key + rotate16(INTEGRITY_DOMAIN) + 0x7F4A7C15 + len(encrypted) * 17) & MASK32
+    for index, value in enumerate(encrypted, start=1):
+        mixed_byte = (value + index * 257 + flags * 17) & MASK32
+        left = ((left ^ mixed_byte) * 65599 + 0x9E3779B9) & MASK32
+        right = ((right + mixed_byte + (left >> 16)) * 48271 + 0x6D2B79F5) & MASK32
+        left = (left ^ rotate16(right)) & MASK32
+    left = ((left ^ right ^ len(encrypted)) * 65599 + INTEGRITY_DOMAIN) & MASK32
+    right = ((right ^ rotate16(left) ^ flags) * 48271 + 0xC4D29A6B) & MASK32
+    return (left ^ rotate16(right)) & MASK32
 
 
 def binder_seed(head: int, attestation: int) -> int:
@@ -447,11 +461,20 @@ def binder_seed(head: int, attestation: int) -> int:
     return state ^ BINDER_FINAL_XOR
 
 
-def recover_attestation_token(source: str, head: int, seed: int) -> int:
-    # The strict guard must compare against the token it eventually publishes.
-    # Large-literal scrambling may represent that token as one arithmetic pair,
-    # so evaluate both raw uint literals and generated pair forms, then bind
-    # candidates through the same decimal head|token transcript as EnvBinder.
+def binder_integrity_key(head: int, attestation: int) -> int:
+    state = BINDER_INITIAL ^ 0xA5C3F1E7
+    for index, item in enumerate(f"{attestation}#{head}".encode("ascii"), start=1):
+        state = (
+            state * BINDER_MULTIPLIER + item + BINDER_INCREMENT + index * 257
+        ) & MASK32
+    result = state ^ BINDER_FINAL_XOR ^ 0xC4D29A6B
+    return 0xC4D29A6B if result == 0 else result
+
+
+def _attestation_candidates(source: str) -> set[int]:
+    # The strict guard still ships client-side evidence. The white-box verifier
+    # may evaluate raw uint literals and generated arithmetic spellings, but it
+    # must no longer obtain the stream seed by reversing the outer tag.
     candidates = {
         int(value)
         for value in re.findall(r"(?<![\w.])(\d+)(?![\w.])", source)
@@ -459,13 +482,54 @@ def recover_attestation_token(source: str, head: int, seed: int) -> int:
     for left, operator, right in re.findall(r"\(\s*(\d+)\s*([+\-*])\s*(\d+)\s*\)", source):
         lhs, rhs = int(left), int(right)
         candidates.add(lhs + rhs if operator == "+" else lhs - rhs if operator == "-" else lhs * rhs)
-    matches = {
-        candidate for candidate in candidates
-        if 0 < candidate <= MASK32 and binder_seed(head, candidate) == seed
-    }
+    return {candidate for candidate in candidates if 0 < candidate <= MASK32}
+
+
+def recover_attestation_binding(
+    source: str,
+    head: int,
+    flags: int,
+    encrypted: bytes,
+    stored_integrity: int,
+    layout: PayloadLayout,
+) -> tuple[int, int, int]:
+    """Recover the test build's shipped attestation value without a tag inverse.
+
+    Candidate seeds first have to decrypt a structurally valid randomized
+    envelope header; only the surviving candidate is checked against the v5
+    authenticator. This keeps the white-box mutation harness functional while
+    making any remaining client-side recoverability explicit and separate from
+    the removed O(n) outer-seed oracle.
+    """
+    if len(encrypted) < 32:
+        raise ValueError("encrypted entropy envelope is shorter than its header")
+    record_header_width = 1 + layout.record_ordinal_width + layout.record_length_width
+    matches: list[tuple[int, int, int]] = []
+    for candidate in _attestation_candidates(source):
+        seed = binder_seed(head, candidate)
+        integrity_key = binder_integrity_key(head, candidate)
+        if seed == 0 or integrity_key == 0:
+            continue
+        prefix = payload_stream_xor(encrypted[:32], seed)
+        values = {
+            field_name: read_uint(prefix, slot * 4, 4)
+            for slot, field_name in enumerate(layout.envelope_order)
+        }
+        record_count = values["record_count"]
+        data_count = values["data_count"]
+        entropy_count = values["entropy_count"]
+        expected = 32 + record_count * record_header_width + values["real_length"] + values["entropy_length"]
+        if not ENTROPY_MIN <= values["entropy_length"] <= ENTROPY_MAX:
+            continue
+        if not (1 <= data_count <= 65535 and 8 <= entropy_count <= 64):
+            continue
+        if record_count != data_count + entropy_count or values["nonce"] == 0 or expected != len(encrypted):
+            continue
+        if outer_integrity(encrypted, integrity_key, flags) == stored_integrity:
+            matches.append((candidate, seed, integrity_key))
     if len(matches) != 1:
-        raise ValueError(f"could not uniquely recover environment attestation token: {sorted(matches)}")
-    return matches.pop()
+        raise ValueError(f"could not uniquely recover shipped environment binding: {matches}")
+    return matches[0]
 
 
 def shannon_entropy(data: bytes) -> float:
@@ -1061,19 +1125,19 @@ def parse_and_verify(path: Path) -> PayloadInfo:
     stored_integrity = outer_values["integrity"]
     flags = outer_values["flags"]
     version, features = flags >> 4, flags & 0x0F
-    if version != 4:
-        raise ValueError(f"expected payload version 4, found {version}")
+    if version != 5:
+        raise ValueError(f"expected payload version 5, found {version}")
     if features not in (14, 15):
-        raise ValueError(f"unexpected v4 feature bits (block + dispatcher + entropy required): {features}")
+        raise ValueError(f"unexpected v5 feature bits (block + dispatcher + entropy required): {features}")
 
     encrypted = payload[outer_offset:]
-    seed = recover_outer_seed(stored_integrity, flags, encrypted)
-    integrity = hash_bytes(((seed ^ INTEGRITY_DOMAIN) * 31 + flags) & MASK32, encrypted)
-    if integrity != stored_integrity or seed == 0:
-        raise ValueError("could not recover the environment-bound outer serializer seed")
+    attestation_token, seed, integrity_key = recover_attestation_binding(
+        source, head, flags, encrypted, stored_integrity, layout
+    )
+    if seed == 0 or integrity_key == 0 or outer_integrity(encrypted, integrity_key, flags) != stored_integrity:
+        raise ValueError("v5 outer authenticator rejected the independently derived integrity key")
     if head == seed:
         raise ValueError("strict EnvironmentLock unexpectedly exposed the serializer seed in the payload head")
-    attestation_token = recover_attestation_token(source, head, seed)
     PAYLOAD_ATTESTATION = attestation_token
     envelope = payload_stream_xor(encrypted, seed)
     if len(envelope) < 32:
@@ -1207,7 +1271,8 @@ def parse_and_verify(path: Path) -> PayloadInfo:
 
 def build_outer_payload(info: PayloadInfo, envelope: bytes) -> bytes:
     encrypted = payload_stream_xor(envelope, info.seed)
-    integrity = hash_bytes(((info.seed ^ INTEGRITY_DOMAIN) * 31 + info.flags) & MASK32, encrypted)
+    integrity_key = binder_integrity_key(info.head, info.attestation_token)
+    integrity = outer_integrity(encrypted, integrity_key, info.flags)
     values = {"head": info.head, "integrity": integrity, "flags": info.flags}
     output = bytearray()
     for field_name in info.layout.outer_order:
@@ -1492,7 +1557,7 @@ def describe(info: PayloadInfo) -> str:
     if len(fragment_orders) != count_blocks(info.root) or any(not order for order in fragment_orders):
         raise ValueError("code/data fragment validation did not cover every block")
     return (
-        f"PASS authenticated v4 payload: features={info.flags & 15}, "
+        f"PASS authenticated v5 payload: features={info.flags & 15}, "
         f"prototypes={count_prototypes(info.root)}, blocks={count_blocks(info.root)}, "
         f"fragment_layouts={len(set(fragment_orders))}, capsules={count_capsules(info.root)}, entropy={info.entropy_length} bytes, "
         f"instruction_records={count_instruction_records(info.root)}, pages={info.data_count}, max_page={max(info.page_lengths)}, "
@@ -1506,7 +1571,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("generated", type=Path)
     parser.add_argument("--compare", type=Path, help="verify a second generation has independent entropy")
-    parser.add_argument("--tamper-dir", type=Path, help="write authenticated outer/envelope and v4 manifest tamper variants")
+    parser.add_argument("--tamper-dir", type=Path, help="write authenticated outer/envelope and v5 manifest tamper variants")
     args = parser.parse_args()
     try:
         info = parse_and_verify(args.generated)
@@ -1525,7 +1590,7 @@ def main() -> int:
             print("PASS independent entropy across generations")
         if args.tamper_dir:
             write_tampered_variants(info, args.tamper_dir)
-            print(f"PASS wrote entropy and v4 manifest tamper variants to {args.tamper_dir}")
+            print(f"PASS wrote entropy and v5 manifest tamper variants to {args.tamper_dir}")
     except (OSError, ValueError, struct.error, StopIteration) as error:
         raise SystemExit(str(error)) from error
     return 0

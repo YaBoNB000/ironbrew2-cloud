@@ -156,7 +156,7 @@ local function inflate(d, expected)
 	return Concat(res);
 end;
 
--- v4 Build-local outer grammar. The field positions are generated into this VM
+-- v5 Build-local outer grammar. The field positions are generated into this VM
 -- rather than carried by a generic format selector in the payload.
 if #ByteString < 41 then error('invalid protected payload', 0); end;
 local PayloadCiphertext = ByteString;
@@ -171,15 +171,35 @@ local PayloadTag = Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__, __IB2_OUTER
 local PayloadFlags = Byte(PayloadCiphertext, __IB2_OUTER_FLAGS_OFFSET__, __IB2_OUTER_FLAGS_OFFSET__);
 local PayloadFeatures = PayloadFlags % 16;
 local PayloadVersion = (PayloadFlags - PayloadFeatures) / 16;
-if PayloadVersion ~= 4 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
+if PayloadVersion ~= 5 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
 __IB2_SEED__
 local OuterSeed = Xs;
 local PayloadAttestation = __IB2_PAYLOAD_ATTESTATION__;
 
-local PayloadHash = (BitXOR(Xs, __IB2_DOMAIN_INTEGRITY__) * 31 + PayloadFlags) % 4294967296;
-for PayloadIndex = 10, #PayloadCiphertext do
-    PayloadHash = (PayloadHash * 31 + Byte(PayloadCiphertext, PayloadIndex, PayloadIndex)) % 4294967296;
+-- v4's polynomial tag was directly reversible because every public byte was
+-- absorbed with multiplication by 31. v5 derives Xi separately from OuterSeed,
+-- uses two coupled lanes and emits only their final compression, so the outer
+-- tag no longer discloses the envelope stream seed via a backwards O(n) recurrence.
+local function PayloadRotate16(Value)
+    local PayloadLow = Value % 65536;
+    return (PayloadLow * 65536 + (Value - PayloadLow) / 65536) % 4294967296;
 end;
+local PayloadAuthA = (BitXOR(Xi, __IB2_DOMAIN_INTEGRITY__) + 2781082087 + PayloadFlags * 257) % 4294967296;
+local PayloadAuthB = (Xi + PayloadRotate16(__IB2_DOMAIN_INTEGRITY__) + 2135587861
+    + (#PayloadCiphertext - 9) * 17) % 4294967296;
+for PayloadIndex = 10, #PayloadCiphertext do
+    local PayloadByte = Byte(PayloadCiphertext, PayloadIndex, PayloadIndex);
+    local PayloadMix = (PayloadByte + (PayloadIndex - 9) * 257 + PayloadFlags * 17) % 4294967296;
+    PayloadAuthA = (BitXOR(PayloadAuthA, PayloadMix) * 65599 + 2654435769) % 4294967296;
+    PayloadAuthB = ((PayloadAuthB + PayloadMix + (PayloadAuthA - PayloadAuthA % 65536) / 65536)
+        * 48271 + 1831565813) % 4294967296;
+    PayloadAuthA = BitXOR(PayloadAuthA, PayloadRotate16(PayloadAuthB)) % 4294967296;
+end;
+PayloadAuthA = (BitXOR(BitXOR(PayloadAuthA, PayloadAuthB), #PayloadCiphertext - 9)
+    * 65599 + __IB2_DOMAIN_INTEGRITY__) % 4294967296;
+PayloadAuthB = (BitXOR(BitXOR(PayloadAuthB, PayloadRotate16(PayloadAuthA)), PayloadFlags)
+    * 48271 + 3302136427) % 4294967296;
+local PayloadHash = BitXOR(PayloadAuthA, PayloadRotate16(PayloadAuthB)) % 4294967296;
 if PayloadHash ~= PayloadTag then error('invalid protected payload', 0); end;
 
 -- The outer XOR stream is consumed once to authenticate envelope framing. Record

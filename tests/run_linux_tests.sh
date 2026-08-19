@@ -35,6 +35,7 @@ cd "$ROOT"
 CLI="$ROOT/IronBrew2 CLI/bin/Release/net8.0/IronBrew2 CLI.dll"
 "$DOTNET" run --project tests/cfg_regression/cfg_regression.csproj --configuration Debug --nologo
 python3 tests/build_seed_wiring.py
+python3 tests/outer_seed_oracle.py
 "$LUA" tests/semantic.lua > "$WORK/baseline.out"
 
 obfuscate() {
@@ -106,7 +107,7 @@ for entropy_case in modify delete reorder; do
 done
 echo "PASS entropy record modification, deletion and reordering rejection after outer-tag recomputation"
 
-# Rebuild every outer/envelope layer around deliberately damaged v4 internals.
+# Rebuild every outer/envelope layer around deliberately damaged v5 internals.
 # Each case leaves exactly the named prototype, complete block-manifest,
 # authenticated instruction-record parser/consumption, or block-local
 # capsule-integrity layer as the first rejecting boundary.
@@ -118,9 +119,9 @@ for payload_case in prototype-tag initial-chunk-state successor-chunk-state bloc
     payload_code=$?
     set -e
     assert_payload_rejected "$payload_code" "$WORK/payload-$payload_case.stdout" \
-        "$WORK/payload-$payload_case.stderr" "v4 $payload_case tamper"
+        "$WORK/payload-$payload_case.stderr" "v5 $payload_case tamper"
 done
-echo "PASS v4 prototype, attested chunk-chain, block-manifest, record framing/consumption and block-local capsule tamper rejection"
+echo "PASS v5 prototype, attested chunk-chain, block-manifest, record framing/consumption and block-local capsule tamper rejection"
 
 # The trusted test executor must pass every retained hard-AND behavior contract.
 # Compatibility paths model proxy-backed globals, empty C-upvalue results and
@@ -669,7 +670,7 @@ python3 tests/phase4_cross_build_extractor.py \
     "$WORK/extractor-build-5.lua:$WORK/extractor-build-5-vm.lua"
 echo "PASS randomized opcode handlers and non-identity runtime layouts: $RANDOM_RUNS/$RANDOM_RUNS"
 
-# Tamper with v4's invocation-local flow metadata only after the outer payload
+# Tamper with v5's invocation-local flow metadata only after the outer payload
 # has been authenticated and deserialized. These probes target the unminified
 # generated VM so each rejection is attributable to block/flow validation, not
 # to the top-level encrypted-payload checksum.

@@ -43,6 +43,25 @@ namespace IronBrew2.Obfuscator
 			return hash ^ BinderFinalXor;
 		}
 
+		/// <summary>
+		/// Derives an outer-authenticator key in a separate transcript/domain from
+		/// the payload stream seed. Even if an authenticator implementation leaks or
+		/// is inverted, its key is not the state that decrypts the envelope.
+		/// </summary>
+		public uint DeriveOuterIntegrityKey(uint salt, uint attestationToken)
+		{
+			uint hash = BinderInitial ^ 0xA5C3F1E7u;
+			string transcript = attestationToken.ToString() + "#" + salt.ToString();
+			uint index = 1;
+			foreach (char value in transcript)
+			{
+				hash = unchecked(hash * BinderMultiplier + (byte)value + BinderIncrement + index * 257u);
+				index++;
+			}
+			uint result = hash ^ BinderFinalXor ^ 0xC4D29A6Bu;
+			return result == 0 ? 0xC4D29A6Bu : result;
+		}
+
 		public uint AdvanceStream(uint state) =>
 			unchecked(state * StreamMultiplier + StreamIncrement);
 	}

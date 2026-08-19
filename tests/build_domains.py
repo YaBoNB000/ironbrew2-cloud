@@ -54,8 +54,7 @@ def extract_build_domains(source: str) -> BuildDomains:
     integrity = _one(
         source,
         rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)"
-        rf"\s*\*\s*31\s*\+\s*{ident}\s*\)\s*%\s*4294967296\s*;\s*"
-        rf"for\s+{ident}\s*=\s*10\s*,\s*#{ident}",
+        rf"\s*\+\s*2781082087\s*\+\s*{ident}\s*\*\s*257\s*\)\s*%\s*4294967296",
         "payload integrity domain",
     )
     envelope_integrity = _one(

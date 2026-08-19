@@ -22,7 +22,7 @@ namespace IronBrew2.Obfuscator
         public string SeedDeriveLua { get; private set; }
 
         /// <summary>EnvironmentLock-disabled compatibility path for library callers.</summary>
-        public const string PlainSeedLua = "local Xs = PayloadHead;";
+        public const string PlainSeedLua = "local Xs = PayloadHead; local Xi = Xs;";
 
         public EnvBinder(BuildRandom random, PayloadDerivationProfile profile)
         {
@@ -41,6 +41,14 @@ for SeedIndex = 1, #SeedText do
     SeedMix = (SeedMix * {_profile.BinderMultiplier} + Byte(SeedText, SeedIndex) + {_profile.BinderIncrement}) % 4294967296;
 end;
 local Xs = BitXOR(SeedMix, {_profile.BinderFinalXor}) % 4294967296;
+local OuterIntegrityText = ToString(GuardAttestation) .. Char(35) .. ToString(PayloadHead);
+local OuterIntegrityState = BitXOR({_profile.BinderInitial}, 2781082087) % 4294967296;
+for OuterIntegrityIndex = 1, #OuterIntegrityText do
+    OuterIntegrityState = (OuterIntegrityState * {_profile.BinderMultiplier} + Byte(OuterIntegrityText, OuterIntegrityIndex)
+        + {_profile.BinderIncrement} + OuterIntegrityIndex * 257) % 4294967296;
+end;
+local Xi = BitXOR(BitXOR(OuterIntegrityState, {_profile.BinderFinalXor}), 3302136427) % 4294967296;
+if Xi == 0 then Xi = 3302136427; end;
 ";
         }
 
@@ -53,5 +61,8 @@ local Xs = BitXOR(SeedMix, {_profile.BinderFinalXor}) % 4294967296;
 
         public uint DeriveSeed(uint attestationToken) =>
             _profile.DeriveEnvironmentSeed(Salt, attestationToken);
+
+        public uint DeriveIntegrityKey(uint attestationToken) =>
+            _profile.DeriveOuterIntegrityKey(Salt, attestationToken);
     }
 }
