@@ -895,8 +895,17 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					+ " sequences; lengths " + lengthProfile + "; structure " + structureSignature.ToString("x8") + ".");
 			}
 
+			// Four synthetic replay leaves back the invocation-local instruction overlay.
+			// They are never assigned to serialized source instructions; GetInstruction
+			// selects one from prototype keys after materializing the real instruction.
+			var materializerOpcodes = Enumerable.Range(0, 4)
+				.Select(mode => new OpMaterialize {Mode = mode})
+				.ToArray();
+			virtuals.AddRange(materializerOpcodes);
+
 			AddOpcodeAliases(virtuals, r);
-			Console.WriteLine("Added " + _context.VirtualOpcodeAliasCount + " build-local opcode aliases.");
+			Console.WriteLine("Added " + _context.VirtualOpcodeAliasCount + " build-local opcode aliases and "
+				+ materializerOpcodes.Length + " prototype-selectable materializer modes.");
 			virtuals.Shuffle(r);
 			
 			for (int i = 0; i < virtuals.Count; i++)
@@ -913,7 +922,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"BitXOR","gBits32","gBits8","gBits16","gFloat","gSizet","gString","gInt","Byte","Char","Sub",
 				"gBit","Instrs","Functions","Lines","Consts","ConstCapsules","Capsule","Instr","Proto","Params","Top","Vararg","Args",
 				"PCount","Lupvals","Stk","Inst","Enum","Chunk","decompress","Pos","Xs","Xd","_R","Env",
-				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2","K3","OpcodeKey","FieldKey","FieldKey32","U32","U32Mul",
+				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2","K3","OpcodeKey","FieldKey","FieldKey32","U32","U32Mul","Xi",
+				"OuterIntegrityText","OuterIntegrityState","OuterIntegrityIndex",
 				"DerivePermutation","DeriveBlockPermutation","DeriveCodeDataPermutation","Count","Domain","Values","State","Identity","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank","InstructionCount","ConstantCount","StateValue","SawData","Interleaved",
 				"Columns","ColumnOrder","ColumnPositions","ColumnRead8","ColumnRead16","ColumnRead32","ColumnData","ColumnPosition","PhysicalSlot","Role",
 				"Body","BodyPosition","FragmentCount","FragmentOrder","FragmentSpans","LogicalSlot","MinimumLength","ReadFragment","TargetSlot","Record","ReferenceSlots",
@@ -939,6 +949,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
 				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
 				"GuardBehaviorKey","GuardFirstKey","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential",
+				"AllowMaterializer","MaterializeIndexSlot","MaterializeInstructionSlot","MaterializeMode","MaterializeEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction",
 				"GuardAttestation","GuardAttested","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
 				"GuardClassOK1","GuardClassOK2","GuardClassOK3","GuardClassOK4","GuardCompileOK","GuardConstantProbe","GuardConstants","GuardConstantsOK",
 				"GuardCurrentEnvOK","GuardCurrentEnvironment","GuardCurrentIdentity","GuardExpected","GuardGame","GuardGetConstants","GuardGetProto","GuardGetProtos",
@@ -963,6 +974,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"PayloadRejectVoidA","PayloadRejectVoidB","PayloadRejectVoidC","PayloadRejectVoidD",
 				"PayloadRejectCodeA","PayloadRejectCodeB","PayloadRejectCodeC","PayloadRejectCodeD",
 				"PayloadHead","PayloadTag","PayloadFlags","PayloadFeatures","PayloadVersion","OuterSeed","PayloadHash","PayloadIndex","PayloadDecoded","PayloadByte","PayloadKey",
+				"PayloadRotate16","PayloadLow","PayloadAuthA","PayloadAuthB","PayloadMix",
 				"EnvelopePos","EnvelopeRead32","EnvelopeRealLength","EnvelopeEntropyLength","EnvelopeRecordCount","EnvelopeDataCount","EnvelopeEntropyCount","EnvelopeNonce","EnvelopeDigest","EnvelopeTag","EnvelopeExpected",
 				"EnvelopeHash","EnvelopeIndex","EnvelopeDataRecords","EnvelopeEntropyRecords","EnvelopeDataLength","EnvelopeEntropySeenLength","EnvelopeKind","EnvelopeOrdinal","EnvelopeLength","EnvelopeRecord",
 				"EntropyHash","EnvelopeByteIndex","EnvelopeState","EnvelopeBody","EnvelopeBodyIndex","EnvelopeKey",
@@ -2023,14 +2035,31 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     return Inst, Digest;
 end;
 
-local function GetInstruction(Chunk, Index, Flow)
+local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     local BlockMap = Chunk[10];
     local Block = BlockMap and BlockMap[Index];
     if not Block then error('invalid protected payload', 0); end;
 
+    -- The real instruction is decoded once into an invocation-local overlay.
+    -- A synthetic materializer leaf rewinds both PC and Flow by one; the next
+    -- top-level fetch consumes this private entry and replays the same PC.
+    local MaterializeIndexSlot = 32 + ((Chunk[5] * 257 + Chunk[6] * 17 + Chunk[7]
+        + __IB2_DOMAIN_CODE_DATA_PERMUTATION__) % 104729);
+    local MaterializeInstructionSlot = MaterializeIndexSlot + 104729;
+    local FlowCache = Flow[4];
+    if AllowMaterializer and FlowCache and FlowCache[MaterializeIndexSlot] == Index then
+        local MaterializedInstruction = FlowCache[MaterializeInstructionSlot];
+        if type(MaterializedInstruction) ~= 'table' or Flow[1] ~= Index - 1
+        or Flow[2] ~= Block or FlowCache[1] ~= Block or FlowCache[2] ~= Flow[3] then
+            error('invalid protected payload', 0);
+        end;
+        FlowCache[MaterializeIndexSlot], FlowCache[MaterializeInstructionSlot] = nil, nil;
+        Flow[1] = Index;
+        return MaterializedInstruction;
+    end;
+
     local LastIndex = Flow[1];
     local CurrentBlock = Flow[2];
-    local FlowCache = Flow[4];
     local EntryState;
     local CurrentChunkState;
     local PreviousInstructionState;
@@ -2087,8 +2116,21 @@ local function GetInstruction(Chunk, Index, Flow)
     FlowCache[1], FlowCache[2], FlowCache[3], FlowCache[4], FlowCache[5], FlowCache[6], FlowCache[7] =
         Block, EntryState, CurrentChunkState, CurrentInstructionState, CurrentInstructionSeal, CurrentOpcodeState, CurrentOpcodeSeal;
     Flow[1], Flow[2], Flow[3], Flow[4] = Index, Block, EntryState, FlowCache;
+    local MaterializeEnum;
+    if AllowMaterializer then
+        local MaterializedInstruction = Inst;
+        FlowCache[MaterializeIndexSlot] = Index;
+        FlowCache[MaterializeInstructionSlot] = MaterializedInstruction;
+        Inst = {};
+        local MaterializeMode = (Chunk[5] * 13 + Chunk[6] * 7 + Chunk[7]
+            + __IB2_DOMAIN_CODE_DATA_PERMUTATION__) % 4;
+        if MaterializeMode == 0 then MaterializeEnum = __IB2_MATERIALIZER_OPCODE_0__;
+        elseif MaterializeMode == 1 then MaterializeEnum = __IB2_MATERIALIZER_OPCODE_1__;
+        elseif MaterializeMode == 2 then MaterializeEnum = __IB2_MATERIALIZER_OPCODE_2__;
+        else MaterializeEnum = __IB2_MATERIALIZER_OPCODE_3__; end;
+    end;
     __IB2_GUARD_BIND__
-    return Inst;
+    return Inst, MaterializeEnum;
 end;
 
 
@@ -2132,6 +2174,12 @@ end;";
 					.Replace("__IB2_FIRST_BLOCK_CHECK__", "")
 					.Replace("__IB2_GUARD_BIND__", "");
 			}
+			for (int mode = 0; mode < materializerOpcodes.Length; mode++)
+				blockRuntime = blockRuntime.Replace(
+					"__IB2_MATERIALIZER_OPCODE_" + mode + "__",
+					materializerOpcodes[mode].VIndex.ToString());
+			if (Regex.IsMatch(blockRuntime, @"__IB2_MATERIALIZER_OPCODE_\d+__"))
+				throw new InvalidOperationException("A materializer opcode placeholder was not replaced.");
 			vm += T(ApplyBuildDomains(blockRuntime));
 
 			string loopRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2);
