@@ -1,1 +1,1 @@
-print("idk")
+local aop = 9

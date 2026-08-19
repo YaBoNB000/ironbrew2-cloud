@@ -2,6 +2,18 @@
 
 > 目标不是复制 Luraph 私有实现，而是吸收已观察到的架构特征：多层数据恢复、按原型变化、状态相关 opcode、常量延迟恢复、VM 多态和完整性耦合。
 
+## 2026-08-19 静态攻击路线（进行中）
+
+- [x] M0：建立只接收最终 Lua 的攻击基线，恢复 carrier、binding keys、完整 body、prototype/block、常量 capsule 和 canonical opcode IDs；当前 `test.lua` 的 `"print"`/`"idk"` 可完整恢复。
+- [x] M1：最终 token literal、集中式 equality 与长生命周期 `GuardAttestation` 已删除；行为 transcript 仅在局部作用域经 Build-local offset 形成一次性 compatibility value，立即扩展为 `GuardEvidenceA..D` 后清零。payload KDF 再结合 salt 将四字 evidence 折叠为独立 envelope seed、outer-integrity key 与 `GuardPayloadBinding`；chunk/instruction/opcode/flow state 只使用后者。全部逻辑仍在客户端，静态模拟器仍可重算 evidence。
+- [~] M2：已完成递归增量 Base91 segment 消费、禁止大型 segment 直接拼接，并将 decoded ciphertext 改为 2 KiB chunks + chunk-aware byte accessor；尚未做到 page 消费后立即释放全部早期 ciphertext chunks。
+- [x] M3：已完成 4 套 prototype-key-derived instruction-column decoder family（XOR、reverse/add、nibble/XOR、reverse/rotate/add）；Chunk 与 Block 现在都是 prototype-local proxy，build-wide ABI 之下再叠加 K1/K2/K3、prototype length 或 block start/verifier 派生的独立 storage permutation。同一构建内父子 prototype 与不同 blocks 不再共享单一实际槽位布局。
+- [~] M4：已将单 instruction pending overlay 扩展为 header/tail 分离、两阶段 synthetic materializer 和两次 PC replay；serializer 初始 record 仍可由完整静态模拟器重组，opcode/A/B/C/constant 独立 materialization 尚待实施。
+- [~] M5：已增加 6 种 register write lowering、RawGet/RawSet stack/global access 变体并保留 continuation fragments/短 fusion；完整 handler fragment sharing 与 IR-native fusion 仍待实施。
+- [x] M6：constant capsule、完整 prototype-slice、block manifest 与 instruction record digest 已全部从 `hash*31+byte` 迁移为 keyed two-lane cross-coupled authenticator；各层分别绑定 prototype keys、entry/chunk state、PC/manifest metadata。wire tag 目前仍压缩为 32-bit，本阶段完成算法迁移，后续可独立扩展 tag 宽度。
+
+攻击基线与阶段验收见 [`docs/static-attack-baseline.md`](docs/static-attack-baseline.md)。该测试当前预期攻击成功；后续每个 milestone 必须先更新攻击器以适应公开 runtime，再以恢复率下降作为验收，而不是把 parser 失效误报成防护成功。
+
 ## 基线问题
 
 当前版本的主要薄弱点：

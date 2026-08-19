@@ -1,5 +1,46 @@
 # IronBrew2 加固实施报告
 
+> 更新（2026-08-19）：当前实现已升级到 v5 outer authenticator。下文的 v4
+> 章节保留为该轮实施历史；v5 删除了可从 polynomial outer tag 逐字节逆推
+> environment-derived stream seed 的 O(n) 反演关系；outer integrity key 也改为独立
+> transcript 派生，不再复用 envelope stream seed，并新增静态回归测试。
+>
+> 更新（2026-08-19，runtime materializer 第一阶段）：每个顶层取指会先把已认证的
+> 真实 instruction 放入 prototype-keyed、invocation-local Flow overlay，分派四种由
+> prototype keys 选择的 synthetic materializer handler 之一，回退 PC/Flow 后在同一
+> PC replay 时才交付真实 instruction。CLOSURE/SuperOperator 的内部取指保持直接路径。
+>
+> 更新（2026-08-19，静态攻击 M0）：新增 `tests/static_attack_baseline.py`，只读取
+> 最终 Lua 并量化当前静态恢复链。现阶段预期攻击成功：可恢复 carrier、binding、
+> 完整 body、prototype/block、常量 capsule、`"print"`/`"idk"` 和 canonical opcode IDs。
+> 该结果作为后续 M1–M5 的攻击回归基线，不作为当前防护能力声明。
+>
+> 更新（2026-08-19，M2/M3/M4/M5 第一批）：Base91 carrier 改为递归增量消费，
+> decoded ciphertext 以 2 KiB chunks 保存并通过 accessor 读取；instruction columns
+> 增加四套 prototype-local decoder family；materializer overlay 拆成 header/tail 并
+> 经过两阶段 replay；handler 写回增加六种 lowering，并随机混用 RawGet/RawSet。
+> 最终文件攻击器已同步适配，仍可恢复完整常量与 canonical opcode，说明这些改动
+> 提高工作量但尚未打断静态闭环。
+>
+> 更新（2026-08-19，M1 第一批）：环境绑定 KDF 改为四个并行 32-bit words，
+> envelope seed、outer-integrity key 与 payload/chunk/instruction state binding 使用
+> 不同 fold；payload state 不再直接等于 `GuardAttestation`。最终 token literal 和
+> 集中式 equality 与 `GuardAttestation` 变量已删除；局部 compatibility value 只用于
+> 立即生成 `GuardEvidenceA..D`，随后清零。Guard seal 使用不可反推四字内容的 fold，
+> payload KDF 直接消费四字 evidence。最终文件攻击器仍可模拟公开 transcript/offset
+> 并恢复全部 words，因此这是客户端成本放大而非秘密。
+>
+> 更新（2026-08-19，内部 MAC 第一批）：constant capsule tag 已替换为 keyed
+> two-lane cross-coupled authenticator，移除该边界的 polynomial `hash*31+byte`。
+> 完整 prototype-slice、block manifest 与 instruction record digest 随后也完成
+> two-lane keyed 迁移；Payload 内部主要认证边界已不再使用 polynomial
+> `hash*31+byte`。当前 wire tag 仍压缩为 32-bit。
+>
+> 更新（2026-08-19，prototype-local runtime ABI）：Chunk/Block 构造器改为
+> prototype-local proxy；现有 build-wide slot permutation 作为逻辑 ABI，proxy 再将
+> 访问映射到 K1/K2/K3 与 prototype/block metadata 派生的独立 storage layout。
+> 父子 prototypes 及同 prototype 的不同 blocks 不再共享一套实际数字槽位。
+
 日期：2026-08-15  
 本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）
 

@@ -107,12 +107,45 @@ if not exist "out.lua" (
 )
 
 move /y "out.lua" "!OUT!" >nul
-if exist "!OUT!" (
-    echo [OK] output: !OUT!
-) else (
+if not exist "!OUT!" (
     echo [FAILED] cannot write: !OUT!
     set /a FAIL=1
+    shift
+    goto next
 )
+
+rem ---- syntax validation: generated output must stay valid Lua 5.1 ----
+luac -p "!OUT!" >nul 2>&1
+if errorlevel 1 (
+    echo [FAILED] Lua 5.1 syntax validation failed: !OUT!
+    set /a FAIL=1
+    shift
+    goto next
+)
+echo [CHECK] Lua 5.1 syntax OK
+
+rem ---- Luau parser validation when luau-compile is installed/on PATH ----
+where luau-compile >nul 2>&1
+if errorlevel 1 (
+    if defined IB2_REQUIRE_LUAU_VALIDATION (
+        echo [FAILED] luau-compile not found while Luau validation is required.
+        set /a FAIL=1
+        shift
+        goto next
+    )
+    echo [WARN] luau-compile not found; skipped Luau syntax validation.
+) else (
+    luau-compile "!OUT!" >nul 2>&1
+    if errorlevel 1 (
+        echo [FAILED] Luau syntax validation failed: !OUT!
+        set /a FAIL=1
+        shift
+        goto next
+    )
+    echo [CHECK] Luau syntax OK
+)
+
+echo [OK] output: !OUT!
 
 shift
 goto next

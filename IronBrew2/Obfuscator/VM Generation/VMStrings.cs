@@ -156,30 +156,58 @@ local function inflate(d, expected)
 	return Concat(res);
 end;
 
--- v4 Build-local outer grammar. The field positions are generated into this VM
+-- v5 Build-local outer grammar. The field positions are generated into this VM
 -- rather than carried by a generic format selector in the payload.
-if #ByteString < 41 then error('invalid protected payload', 0); end;
-local PayloadCiphertext = ByteString;
-local PayloadHead = Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__, __IB2_OUTER_HEAD_OFFSET__)
-         + Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__ + 1, __IB2_OUTER_HEAD_OFFSET__ + 1) * 256
-         + Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__ + 2, __IB2_OUTER_HEAD_OFFSET__ + 2) * 65536
-         + Byte(PayloadCiphertext, __IB2_OUTER_HEAD_OFFSET__ + 3, __IB2_OUTER_HEAD_OFFSET__ + 3) * 16777216;
-local PayloadTag = Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__, __IB2_OUTER_TAG_OFFSET__)
-         + Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__ + 1, __IB2_OUTER_TAG_OFFSET__ + 1) * 256
-         + Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__ + 2, __IB2_OUTER_TAG_OFFSET__ + 2) * 65536
-         + Byte(PayloadCiphertext, __IB2_OUTER_TAG_OFFSET__ + 3, __IB2_OUTER_TAG_OFFSET__ + 3) * 16777216;
-local PayloadFlags = Byte(PayloadCiphertext, __IB2_OUTER_FLAGS_OFFSET__, __IB2_OUTER_FLAGS_OFFSET__);
+if PayloadLength < 41 then error('invalid protected payload', 0); end;
+local function PayloadByteAt(Index)
+    if Index < 1 or Index > PayloadLength then error('invalid protected payload', 0); end;
+    local ZeroIndex = Index - 1;
+    local PayloadChunkIndex = (ZeroIndex - ZeroIndex % 2048) / 2048 + 1;
+    local PayloadChunkOffset = ZeroIndex % 2048 + 1;
+    local PayloadChunk = PayloadCiphertext[PayloadChunkIndex];
+    if PayloadChunk == nil then error('invalid protected payload', 0); end;
+    return Byte(PayloadChunk, PayloadChunkOffset, PayloadChunkOffset);
+end;
+local PayloadHead = PayloadByteAt(__IB2_OUTER_HEAD_OFFSET__)
+         + PayloadByteAt(__IB2_OUTER_HEAD_OFFSET__ + 1) * 256
+         + PayloadByteAt(__IB2_OUTER_HEAD_OFFSET__ + 2) * 65536
+         + PayloadByteAt(__IB2_OUTER_HEAD_OFFSET__ + 3) * 16777216;
+local PayloadTag = PayloadByteAt(__IB2_OUTER_TAG_OFFSET__)
+         + PayloadByteAt(__IB2_OUTER_TAG_OFFSET__ + 1) * 256
+         + PayloadByteAt(__IB2_OUTER_TAG_OFFSET__ + 2) * 65536
+         + PayloadByteAt(__IB2_OUTER_TAG_OFFSET__ + 3) * 16777216;
+local PayloadFlags = PayloadByteAt(__IB2_OUTER_FLAGS_OFFSET__);
 local PayloadFeatures = PayloadFlags % 16;
 local PayloadVersion = (PayloadFlags - PayloadFeatures) / 16;
-if PayloadVersion ~= 4 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
+if PayloadVersion ~= 5 or PayloadFeatures < 14 or PayloadFeatures > 15 then error('invalid protected payload', 0); end;
 __IB2_SEED__
 local OuterSeed = Xs;
 local PayloadAttestation = __IB2_PAYLOAD_ATTESTATION__;
 
-local PayloadHash = (BitXOR(Xs, __IB2_DOMAIN_INTEGRITY__) * 31 + PayloadFlags) % 4294967296;
-for PayloadIndex = 10, #PayloadCiphertext do
-    PayloadHash = (PayloadHash * 31 + Byte(PayloadCiphertext, PayloadIndex, PayloadIndex)) % 4294967296;
+-- v4's polynomial tag was directly reversible because every public byte was
+-- absorbed with multiplication by 31. v5 derives Xi separately from OuterSeed,
+-- uses two coupled lanes and emits only their final compression, so the outer
+-- tag no longer discloses the envelope stream seed via a backwards O(n) recurrence.
+local function PayloadRotate16(Value)
+    local PayloadLow = Value % 65536;
+    return (PayloadLow * 65536 + (Value - PayloadLow) / 65536) % 4294967296;
 end;
+local PayloadAuthA = (BitXOR(Xi, __IB2_DOMAIN_INTEGRITY__) + 2781082087 + PayloadFlags * 257) % 4294967296;
+local PayloadAuthB = (Xi + PayloadRotate16(__IB2_DOMAIN_INTEGRITY__) + 2135587861
+    + (PayloadLength - 9) * 17) % 4294967296;
+for PayloadIndex = 10, PayloadLength do
+    local PayloadByte = PayloadByteAt(PayloadIndex);
+    local PayloadMix = (PayloadByte + (PayloadIndex - 9) * 257 + PayloadFlags * 17) % 4294967296;
+    PayloadAuthA = (BitXOR(PayloadAuthA, PayloadMix) * 65599 + 2654435769) % 4294967296;
+    PayloadAuthB = ((PayloadAuthB + PayloadMix + (PayloadAuthA - PayloadAuthA % 65536) / 65536)
+        * 48271 + 1831565813) % 4294967296;
+    PayloadAuthA = BitXOR(PayloadAuthA, PayloadRotate16(PayloadAuthB)) % 4294967296;
+end;
+PayloadAuthA = (BitXOR(BitXOR(PayloadAuthA, PayloadAuthB), PayloadLength - 9)
+    * 65599 + __IB2_DOMAIN_INTEGRITY__) % 4294967296;
+PayloadAuthB = (BitXOR(BitXOR(PayloadAuthB, PayloadRotate16(PayloadAuthA)), PayloadFlags)
+    * 48271 + 3302136427) % 4294967296;
+local PayloadHash = BitXOR(PayloadAuthA, PayloadRotate16(PayloadAuthB)) % 4294967296;
 if PayloadHash ~= PayloadTag then error('invalid protected payload', 0); end;
 
 -- The outer XOR stream is consumed once to authenticate envelope framing. Record
@@ -190,8 +218,8 @@ local EnvelopeCipherState = Xs;
 local EnvelopePlainPos = 0;
 local EnvelopeHash = (BitXOR(OuterSeed, __IB2_DOMAIN_ENVELOPE_INTEGRITY__) * 31) % 4294967296;
 local function EnvelopeRead8()
-    if EnvelopeCipherPos > #PayloadCiphertext then error('invalid protected payload', 0); end;
-    local CipherByte = Byte(PayloadCiphertext, EnvelopeCipherPos, EnvelopeCipherPos);
+    if EnvelopeCipherPos > PayloadLength then error('invalid protected payload', 0); end;
+    local CipherByte = PayloadByteAt(EnvelopeCipherPos);
     local KeyByte = (EnvelopeCipherState - EnvelopeCipherState % 16777216) / 16777216;
     local PlainByte = BitXOR(CipherByte, KeyByte);
     EnvelopeCipherState = (EnvelopeCipherState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
@@ -215,7 +243,7 @@ or EnvelopeEntropyLength < 65536 or EnvelopeEntropyLength > 98304
 or EnvelopeDataCount < 1 or EnvelopeDataCount > 65535
 or EnvelopeEntropyCount < 8 or EnvelopeEntropyCount > 64
 or EnvelopeRecordCount ~= EnvelopeDataCount + EnvelopeEntropyCount
-or EnvelopeNonce == 0 or EnvelopeExpected ~= #PayloadCiphertext - 9 then error('invalid protected payload', 0); end;
+or EnvelopeNonce == 0 or EnvelopeExpected ~= PayloadLength - 9 then error('invalid protected payload', 0); end;
 
 local PayloadPageDescriptors = {};
 local EntropyDescriptors = {};
@@ -232,7 +260,7 @@ end;
 for EnvelopeIndex = 1, EnvelopeRecordCount do
     local EnvelopeKind, EnvelopeOrdinal, EnvelopeLength;
     __IB2_RECORD_FIELD_READS__
-    if EnvelopeLength < 1 or EnvelopeCipherPos + EnvelopeLength - 1 > #PayloadCiphertext then error('invalid protected payload', 0); end;
+    if EnvelopeLength < 1 or EnvelopeCipherPos + EnvelopeLength - 1 > PayloadLength then error('invalid protected payload', 0); end;
     local Descriptor = {EnvelopeCipherPos, EnvelopeLength, EnvelopeCipherState};
     if EnvelopeKind == __IB2_DATA_RECORD_KIND__ then
         if EnvelopeOrdinal < 1 or EnvelopeOrdinal > EnvelopeDataCount or PayloadPageDescriptors[EnvelopeOrdinal] ~= nil then error('invalid protected payload', 0); end;
@@ -247,7 +275,7 @@ for EnvelopeIndex = 1, EnvelopeRecordCount do
     end;
     for EnvelopeByteIndex = 1, EnvelopeLength do EnvelopeRead8(); end;
 end;
-if EnvelopeCipherPos ~= #PayloadCiphertext + 1 or EnvelopeDataLength ~= EnvelopeRealLength
+if EnvelopeCipherPos ~= PayloadLength + 1 or EnvelopeDataLength ~= EnvelopeRealLength
 or EnvelopeEntropySeenLength ~= EnvelopeEntropyLength or EnvelopeHash ~= EnvelopeTag then error('invalid protected payload', 0); end;
 
 -- Entropy is authenticated in logical order without retaining any entropy record.
@@ -262,7 +290,7 @@ for EnvelopeIndex = 1, EnvelopeEntropyCount do
     local DescriptorState = Descriptor[3];
     for DescriptorOffset = 0, Descriptor[2] - 1 do
         local KeyByte = (DescriptorState - DescriptorState % 16777216) / 16777216;
-        local PlainByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + DescriptorOffset, Descriptor[1] + DescriptorOffset), KeyByte);
+        local PlainByte = BitXOR(PayloadByteAt(Descriptor[1] + DescriptorOffset), KeyByte);
         EntropyHash = (EntropyHash * 31 + PlainByte) % 4294967296;
         DescriptorState = (DescriptorState * __IB2_STREAM_MULTIPLIER__ + __IB2_STREAM_INCREMENT__) % 4294967296;
     end;
@@ -286,7 +314,7 @@ for PageOrdinal = 1, EnvelopeDataCount do
         local OuterKey = (DescriptorState - DescriptorState % 16777216) / 16777216;
         local InnerKey = (EnvelopeMaskState - EnvelopeMaskState % 16777216) / 16777216;
         if PageByteIndex >= LengthOffset and PageByteIndex < LengthOffset + __IB2_PAGE_LENGTH_WIDTH__ then
-            local NestedByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + PageByteIndex, Descriptor[1] + PageByteIndex), OuterKey);
+            local NestedByte = BitXOR(PayloadByteAt(Descriptor[1] + PageByteIndex), OuterKey);
             RawLength = RawLength + BitXOR(NestedByte, InnerKey) * Multiplier;
             Multiplier = Multiplier * 256;
         end;
@@ -317,7 +345,7 @@ local function LoadPayloadPage()
     for PageByteIndex = 0, Descriptor[2] - 1 do
         local OuterKey = (DescriptorState - DescriptorState % 16777216) / 16777216;
         local InnerKey = (MaskState - MaskState % 16777216) / 16777216;
-        local NestedByte = BitXOR(Byte(PayloadCiphertext, Descriptor[1] + PageByteIndex, Descriptor[1] + PageByteIndex), OuterKey);
+        local NestedByte = BitXOR(PayloadByteAt(Descriptor[1] + PageByteIndex), OuterKey);
         local PlainByte = BitXOR(NestedByte, InnerKey);
         if PageByteIndex >= LengthOffset and PageByteIndex < LengthOffset + __IB2_PAGE_LENGTH_WIDTH__ then
             FramedLength = FramedLength + PlainByte * Multiplier;
@@ -376,13 +404,16 @@ end;
 
 -- Source abstraction: root reads bounded pages; child prototypes and opaque block
 -- or capsule slices use the same readers over a local string source.
-ByteString = nil;
+local ByteString = nil;
 local Pos = 1;
 local ActiveSourceLength = PayloadSourceLength;
 local SourceIsPaged = true;
 local ActivePrototypeHash = nil;
+local ActivePrototypeRight = nil;
+local ActivePrototypeCounter = 0;
+local PrototypeAbsorb;
 local function TrackPrototypeByte(Value)
-    if ActivePrototypeHash ~= nil then ActivePrototypeHash = (ActivePrototypeHash * 31 + Value) % 4294967296; end;
+    if ActivePrototypeHash ~= nil then PrototypeAbsorb(Value); end;
 end;
 local function SourceRead8()
     local Value;
@@ -527,20 +558,41 @@ end;
 
 local function ComputeConstantIntegrity(EncodedBody, Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3)
     local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
-    local Hash = (BitXOR(BitXOR(BitXOR(Keyed, __IB2_DOMAIN_CONSTANT_INTEGRITY__), EntryState), CurrentChunkState) * 31 + BlockStart) % 4294967296;
-    Hash = (Hash * 31 + Index) % 4294967296;
-    Hash = (Hash * 31 + #EncodedBody) % 4294967296;
-    for I = 1, #EncodedBody do Hash = (Hash * 31 + Byte(EncodedBody, I, I)) % 4294967296; end;
-    return Hash;
+    local Left = BitXOR(BitXOR(BitXOR(Keyed, __IB2_DOMAIN_CONSTANT_INTEGRITY__), EntryState), PayloadRotate16(CurrentChunkState)) % 4294967296;
+    local Right = BitXOR(BitXOR(BitXOR(CurrentChunkState, PayloadRotate16(Keyed)), (BlockStart * 257) % 4294967296), Index) % 4294967296;
+    local Counter = 1;
+    local function Absorb(Word)
+        local Mixed = (Word + Counter * 257) % 4294967296;
+        Left = (BitXOR(Left, Mixed) * 65599 + 2654435769) % 4294967296;
+        Right = ((Right + Mixed + (Left - Left % 65536) / 65536) * 48271 + 1831565813) % 4294967296;
+        Left = BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
+        Counter = Counter + 1;
+    end;
+    Absorb(BlockStart); Absorb(Index); Absorb(#EncodedBody);
+    for I = 1, #EncodedBody do Absorb(Byte(EncodedBody, I, I)); end;
+    Left = (BitXOR(BitXOR(Left, Right), #EncodedBody) * 65599 + __IB2_DOMAIN_CONSTANT_INTEGRITY__) % 4294967296;
+    Right = (BitXOR(BitXOR(Right, PayloadRotate16(Left)), Index) * 48271 + 3302136427) % 4294967296;
+    return BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
 end;
 
-local function InstructionDigest(Record, Index, K1, K2, K3)
-    local Hash = (BitXOR(__IB2_DOMAIN_INSTRUCTION_STATE__, Index) * 31 + K1) % 4294967296;
-    Hash = (Hash * 31 + K2) % 4294967296;
-    Hash = (Hash * 31 + K3) % 4294967296;
-    Hash = (Hash * 31 + #Record) % 4294967296;
-    for I = 1, #Record do Hash = (Hash * 31 + Byte(Record, I, I)) % 4294967296; end;
-    return Hash;
+local function InstructionDigest(Record, Index, K1, K2, K3, CurrentChunkState, EntryState)
+    local Domain = __IB2_DOMAIN_INSTRUCTION_STATE__;
+    local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
+    local Left = BitXOR(BitXOR(BitXOR(Keyed, Domain), Index), EntryState) % 4294967296;
+    local Right = BitXOR(BitXOR(BitXOR(CurrentChunkState, PayloadRotate16(Keyed)), (Index * 257) % 4294967296), PayloadRotate16(EntryState)) % 4294967296;
+    local Counter = 1;
+    local function Absorb(Word)
+        local Mixed = (Word + Counter * 257) % 4294967296;
+        Left = (BitXOR(Left, Mixed) * 65599 + 2654435769) % 4294967296;
+        Right = ((Right + Mixed + (Left - Left % 65536) / 65536) * 48271 + 1831565813) % 4294967296;
+        Left = BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
+        Counter = Counter + 1;
+    end;
+    Absorb(Index); Absorb(K1); Absorb(K2); Absorb(K3); Absorb(#Record);
+    for I = 1, #Record do Absorb(Byte(Record, I, I)); end;
+    Left = (BitXOR(BitXOR(Left, Right), #Record) * 65599 + Domain) % 4294967296;
+    Right = (BitXOR(BitXOR(Right, PayloadRotate16(Left)), Index) * 48271 + 3302136427) % 4294967296;
+    return BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
 end;
 
 local function BeginInstructionState(CurrentChunkState, EntryState, BlockStart, BlockTag, K1, K2, K3)
@@ -591,38 +643,57 @@ end;
 
 local function BeginPrototypeIntegrity(Length, K1, K2, K3)
     local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
-    local Hash = (BitXOR(Keyed, __IB2_DOMAIN_PROTOTYPE_INTEGRITY__) * 31 + Length) % 4294967296;
+    ActivePrototypeHash = BitXOR(BitXOR(Keyed, __IB2_DOMAIN_PROTOTYPE_INTEGRITY__), Length) % 4294967296;
+    ActivePrototypeRight = BitXOR(BitXOR(PayloadRotate16(Keyed), OuterSeed), (Length * 257) % 4294967296) % 4294967296;
+    ActivePrototypeCounter = 1;
+    PrototypeAbsorb = function(Word)
+        local Mixed = (Word + ActivePrototypeCounter * 257) % 4294967296;
+        ActivePrototypeHash = (BitXOR(ActivePrototypeHash, Mixed) * 65599 + 2654435769) % 4294967296;
+        ActivePrototypeRight = ((ActivePrototypeRight + Mixed + (ActivePrototypeHash - ActivePrototypeHash % 65536) / 65536) * 48271 + 1831565813) % 4294967296;
+        ActivePrototypeHash = BitXOR(ActivePrototypeHash, PayloadRotate16(ActivePrototypeRight)) % 4294967296;
+        ActivePrototypeCounter = ActivePrototypeCounter + 1;
+    end;
+    PrototypeAbsorb(Length);
     local Words = {K1, K2, K3};
     for WordIndex = 1, 3 do
         local Word = Words[WordIndex];
-        Hash = (Hash * 31 + Word % 256) % 4294967296;
-        Hash = (Hash * 31 + (Word - Word % 256) / 256) % 4294967296;
+        PrototypeAbsorb(Word % 256);
+        PrototypeAbsorb((Word - Word % 256) / 256);
     end;
-    ActivePrototypeHash = Hash;
+end;
+local function FinalizePrototypeIntegrity(Length, K1, K2, K3)
+    local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
+    local Left = (BitXOR(BitXOR(ActivePrototypeHash, ActivePrototypeRight), Length) * 65599 + __IB2_DOMAIN_PROTOTYPE_INTEGRITY__) % 4294967296;
+    local Right = (BitXOR(BitXOR(ActivePrototypeRight, PayloadRotate16(Left)), Keyed) * 48271 + 3302136427) % 4294967296;
+    return BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
 end;
 
 local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteToken, References, Verifier, SuccessorRecords, K1, K2, K3)
-    local Hash = (BitXOR(BitXOR(EntryState, __IB2_DOMAIN_BLOCK_INTEGRITY__), OuterSeed) * 31 + BlockStart) % 4294967296;
-    Hash = (Hash * 31 + Count) % 4294967296;
-    Hash = (Hash * 31 + K1) % 4294967296;
-    Hash = (Hash * 31 + K2) % 4294967296;
-    Hash = (Hash * 31 + K3) % 4294967296;
-    Hash = (Hash * 31 + RouteToken) % 4294967296;
-    Hash = (Hash * 31 + #References) % 4294967296;
-    for ReferenceIndex = 1, #References do
-        Hash = (Hash * 31 + References[ReferenceIndex]) % 4294967296;
+    local Domain = __IB2_DOMAIN_BLOCK_INTEGRITY__;
+    local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
+    local Left = BitXOR(BitXOR(BitXOR(EntryState, Domain), OuterSeed), PayloadRotate16(Keyed)) % 4294967296;
+    local Right = BitXOR(BitXOR(BitXOR(OuterSeed, PayloadRotate16(EntryState)), Keyed), (BlockStart * 257) % 4294967296) % 4294967296;
+    local Counter = 1;
+    local function Absorb(Word)
+        local Mixed = (Word + Counter * 257) % 4294967296;
+        Left = (BitXOR(Left, Mixed) * 65599 + 2654435769) % 4294967296;
+        Right = ((Right + Mixed + (Left - Left % 65536) / 65536) * 48271 + 1831565813) % 4294967296;
+        Left = BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
+        Counter = Counter + 1;
     end;
-    Hash = (Hash * 31 + Verifier) % 4294967296;
-    Hash = (Hash * 31 + #SuccessorRecords) % 4294967296;
+    local HeaderWords = {BlockStart, Count, K1, K2, K3, RouteToken, #References};
+    for HeaderIndex = 1, #HeaderWords do Absorb(HeaderWords[HeaderIndex]); end;
+    for ReferenceIndex = 1, #References do Absorb(References[ReferenceIndex]); end;
+    Absorb(Verifier); Absorb(#SuccessorRecords);
     for SuccessorIndex = 1, #SuccessorRecords do
         local SuccessorRecord = SuccessorRecords[SuccessorIndex];
-        Hash = (Hash * 31 + SuccessorRecord[1]) % 4294967296;
-        Hash = (Hash * 31 + SuccessorRecord[2]) % 4294967296;
-        Hash = (Hash * 31 + SuccessorRecord[3]) % 4294967296;
+        Absorb(SuccessorRecord[1]); Absorb(SuccessorRecord[2]); Absorb(SuccessorRecord[3]);
     end;
-    Hash = (Hash * 31 + #Body) % 4294967296;
-    for I = 1, #Body do Hash = (Hash * 31 + Byte(Body, I, I)) % 4294967296; end;
-    return Hash;
+    Absorb(#Body);
+    for I = 1, #Body do Absorb(Byte(Body, I, I)); end;
+    Left = (BitXOR(BitXOR(Left, Right), #Body) * 65599 + Domain) % 4294967296;
+    Right = (BitXOR(BitXOR(BitXOR(Right, PayloadRotate16(Left)), BlockStart), Count) * 48271 + 3302136427) % 4294967296;
+    return BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
 end;
 
 local gInt = gBits32;
@@ -681,20 +752,42 @@ local function DeriveCodeDataPermutation(InstructionCount, ConstantCount, StateV
     return Values;
 end;
 
+local function NewPrototypeRecord(Count, K1, K2, K3, Salt)
+    local Layout = DerivePermutation(
+        Count, K1, K2, K3,
+        (__IB2_DOMAIN_SCHEMA_PERMUTATION__ + Salt * 257) % 4294967296);
+    local Storage = {};
+    local Proxy = {};
+    Setmetatable(Proxy,
+    {
+        __index = function(_, Key)
+            local Slot = Layout[Key];
+            if Slot == nil then return nil; end;
+            return RawGet(Storage, Slot + 1);
+        end,
+        __newindex = function(_, Key, Value)
+            local Slot = Layout[Key];
+            if Slot == nil then error('invalid protected payload', 0); end;
+            RawSet(Storage, Slot + 1, Value);
+        end
+    });
+    return Proxy;
+end;
+
 local function Deserialize()
     local PrototypeLength = ActiveSourceLength;
     ActivePrototypeHash = nil;
     local Instrs = {};
     local Functions = {};
 		local Lines = {};
-    local Chunk = {};
-    Chunk[1] = Instrs;
-    Chunk[2] = Functions;
-    Chunk[4] = Lines;
     local K1 = gBits16();
     local K2 = gBits16();
     local K3 = gBits16();
     local PrototypeTag = gBits32();
+    local Chunk = NewPrototypeRecord(16, K1, K2, K3, PrototypeLength);
+    Chunk[1] = Instrs;
+    Chunk[2] = Functions;
+    Chunk[4] = Lines;
     BeginPrototypeIntegrity(PrototypeLength, K1, K2, K3);
     Chunk[5], Chunk[6], Chunk[7] = K1, K2, K3;
     local OpcodeBank = DerivePermutation(__IB2_OPCODE_COUNT__, K1, K2, K3, __IB2_DOMAIN_OPCODE_PERMUTATION__);
@@ -755,8 +848,10 @@ local function Wrap(Chunk, Upvalues, Env)
 				while true do
 					__IB2_GUARD_CHECK__
 					InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
-			Inst		= GetInstruction(Chunk, InstrPoint, Flow);
-			Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
+			Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);
+			if Enum == nil then
+				Enum = OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];
+			end;";
 
 		public static string VMP2_R = @"
 local function Wrap(Chunk, Upvalues, Env)
@@ -802,8 +897,10 @@ local function Wrap(Chunk, Upvalues, Env)
 				repeat
 					__IB2_GUARD_CHECK__
 					InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
-			Inst		= GetInstruction(Chunk, InstrPoint, Flow);
-			Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
+			Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);
+			if Enum == nil then
+				Enum = OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];
+			end;";
 
 		public static string VMP3 = @"
 			InstrPoint	= InstrPoint + 1;
@@ -812,7 +909,7 @@ local function Wrap(Chunk, Upvalues, Env)
     end;
 end;	
 local Root = Deserialize();
-ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext, PayloadByteAt, PayloadLength = nil, nil, nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
@@ -823,7 +920,7 @@ end)()(...);
     end;
 end;	
 local Root = Deserialize();
-ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext, PayloadByteAt, PayloadLength = nil, nil, nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
@@ -873,8 +970,10 @@ local function Wrap(Chunk, Upvalues, Env)
 			while true do
 				__IB2_GUARD_CHECK__
 				InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
-				Inst		= GetInstruction(Chunk, InstrPoint, Flow);
-				Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
+				Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);
+				if Enum == nil then
+					Enum = OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];
+				end;";
 		
 		public static string VMP2_LI_R = @"
 local function Wrap(Chunk, Upvalues, Env)
@@ -922,8 +1021,10 @@ local function Wrap(Chunk, Upvalues, Env)
 			repeat
 				__IB2_GUARD_CHECK__
 				InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
-				Inst		= GetInstruction(Chunk, InstrPoint, Flow);
-				Enum		= OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];";
+				Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);
+				if Enum == nil then
+					Enum = OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];
+				end;";
 		
 		public static string VMP3_LI = @"
 				InstrPoint	= InstrPoint + 1;
@@ -941,7 +1042,7 @@ local function Wrap(Chunk, Upvalues, Env)
 	end;
 end;	
 local Root = Deserialize();
-ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext, PayloadByteAt, PayloadLength = nil, nil, nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
@@ -961,7 +1062,7 @@ end)()(...);
 	end;
 end;	
 local Root = Deserialize();
-ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext = nil, nil, nil, nil;
+ByteString, PayloadPage, PayloadPageDescriptors, PayloadCiphertext, PayloadByteAt, PayloadLength = nil, nil, nil, nil, nil, nil;
 return Wrap(Root, {}, GetFEnv());
 end)()(...);
 ";
