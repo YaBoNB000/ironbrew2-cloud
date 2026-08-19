@@ -10,7 +10,7 @@
 - [~] M3：已完成 4 套 prototype-key-derived instruction-column decoder family（XOR、reverse/add、nibble/XOR、reverse/rotate/add），同一构建内父子 prototype 可使用不同模式；prototype-local Chunk/Block ABI 仍待实施。
 - [~] M4：已将单 instruction pending overlay 扩展为 header/tail 分离、两阶段 synthetic materializer 和两次 PC replay；serializer 初始 record 仍可由完整静态模拟器重组，opcode/A/B/C/constant 独立 materialization 尚待实施。
 - [~] M5：已增加 6 种 register write lowering、RawGet/RawSet stack/global access 变体并保留 continuation fragments/短 fusion；完整 handler fragment sharing 与 IR-native fusion 仍待实施。
-- [~] M6：constant capsule 与完整 prototype-slice tag 已从 `hash*31+byte` 改为 keyed two-lane cross-coupled authenticator；block manifest tag 与 instruction digest 仍待迁移，tag 宽度目前仍为 32-bit。
+- [~] M6：constant capsule、完整 prototype-slice 与 block manifest tag 已从 `hash*31+byte` 改为 keyed two-lane cross-coupled authenticator；instruction digest 仍待迁移，tag 宽度目前仍为 32-bit。
 
 攻击基线与阶段验收见 [`docs/static-attack-baseline.md`](docs/static-attack-baseline.md)。该测试当前预期攻击成功；后续每个 milestone 必须先更新攻击器以适应公开 runtime，再以恢复率下降作为验收，而不是把 parser 失效误报成防护成功。
 

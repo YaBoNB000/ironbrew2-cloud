@@ -658,27 +658,31 @@ local function FinalizePrototypeIntegrity(Length, K1, K2, K3)
 end;
 
 local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteToken, References, Verifier, SuccessorRecords, K1, K2, K3)
-    local Hash = (BitXOR(BitXOR(EntryState, __IB2_DOMAIN_BLOCK_INTEGRITY__), OuterSeed) * 31 + BlockStart) % 4294967296;
-    Hash = (Hash * 31 + Count) % 4294967296;
-    Hash = (Hash * 31 + K1) % 4294967296;
-    Hash = (Hash * 31 + K2) % 4294967296;
-    Hash = (Hash * 31 + K3) % 4294967296;
-    Hash = (Hash * 31 + RouteToken) % 4294967296;
-    Hash = (Hash * 31 + #References) % 4294967296;
-    for ReferenceIndex = 1, #References do
-        Hash = (Hash * 31 + References[ReferenceIndex]) % 4294967296;
+    local Domain = __IB2_DOMAIN_BLOCK_INTEGRITY__;
+    local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
+    local Left = BitXOR(BitXOR(BitXOR(EntryState, Domain), OuterSeed), PayloadRotate16(Keyed)) % 4294967296;
+    local Right = BitXOR(BitXOR(BitXOR(OuterSeed, PayloadRotate16(EntryState)), Keyed), (BlockStart * 257) % 4294967296) % 4294967296;
+    local Counter = 1;
+    local function Absorb(Word)
+        local Mixed = (Word + Counter * 257) % 4294967296;
+        Left = (BitXOR(Left, Mixed) * 65599 + 2654435769) % 4294967296;
+        Right = ((Right + Mixed + (Left - Left % 65536) / 65536) * 48271 + 1831565813) % 4294967296;
+        Left = BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
+        Counter = Counter + 1;
     end;
-    Hash = (Hash * 31 + Verifier) % 4294967296;
-    Hash = (Hash * 31 + #SuccessorRecords) % 4294967296;
+    local HeaderWords = {BlockStart, Count, K1, K2, K3, RouteToken, #References};
+    for HeaderIndex = 1, #HeaderWords do Absorb(HeaderWords[HeaderIndex]); end;
+    for ReferenceIndex = 1, #References do Absorb(References[ReferenceIndex]); end;
+    Absorb(Verifier); Absorb(#SuccessorRecords);
     for SuccessorIndex = 1, #SuccessorRecords do
         local SuccessorRecord = SuccessorRecords[SuccessorIndex];
-        Hash = (Hash * 31 + SuccessorRecord[1]) % 4294967296;
-        Hash = (Hash * 31 + SuccessorRecord[2]) % 4294967296;
-        Hash = (Hash * 31 + SuccessorRecord[3]) % 4294967296;
+        Absorb(SuccessorRecord[1]); Absorb(SuccessorRecord[2]); Absorb(SuccessorRecord[3]);
     end;
-    Hash = (Hash * 31 + #Body) % 4294967296;
-    for I = 1, #Body do Hash = (Hash * 31 + Byte(Body, I, I)) % 4294967296; end;
-    return Hash;
+    Absorb(#Body);
+    for I = 1, #Body do Absorb(Byte(Body, I, I)); end;
+    Left = (BitXOR(BitXOR(Left, Right), #Body) * 65599 + Domain) % 4294967296;
+    Right = (BitXOR(BitXOR(BitXOR(Right, PayloadRotate16(Left)), BlockStart), Count) * 48271 + 3302136427) % 4294967296;
+    return BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
 end;
 
 local gInt = gBits32;

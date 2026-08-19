@@ -149,8 +149,9 @@ def extract_build_domains(source: str) -> BuildDomains:
     )
     block_integrity = _one(
         source,
-        rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)\s*,\s*{ident}\s*\)"
-        rf"\s*\*\s*31\s*\+\s*{ident}\s*\)\s*%\s*4294967296",
+        rf"local\s+{ident}\s*=\s*(\d+)\s*;\s*local\s+{ident}\s*=\s*\(\s*{ident}\s*\*\s*65537"
+        rf"\s*\+\s*{ident}\s*\*\s*257\s*\+\s*{ident}\s*\)\s*%\s*4294967296\s*;\s*"
+        rf"local\s+{ident}\s*=\s*{ident}\(",
         "block integrity domain",
     )
 

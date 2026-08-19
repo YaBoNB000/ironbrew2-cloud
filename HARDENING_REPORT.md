@@ -32,7 +32,7 @@
 >
 > 更新（2026-08-19，内部 MAC 第一批）：constant capsule tag 已替换为 keyed
 > two-lane cross-coupled authenticator，移除该边界的 polynomial `hash*31+byte`。
-> 完整 prototype-slice tag 随后也完成同一 two-lane keyed 迁移；block manifest 与
+> 完整 prototype-slice 与 block manifest tag 随后也完成同一 two-lane keyed 迁移；
 > instruction digest 仍使用旧算法，后续继续迁移。
 
 日期：2026-08-15  

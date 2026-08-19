@@ -1032,20 +1032,40 @@ def recover_entry_state(verifier: int, block_start: int, prototype: Prototype) -
 
 
 def block_integrity(data: bytes | bytearray, prototype: Prototype, block: Block) -> int:
-    value = hash_word(block.entry_state ^ BLOCK_INTEGRITY_DOMAIN ^ prototype.binding, block.start_pc)
-    for word in (block.count, prototype.k1, prototype.k2, prototype.k3, block.route_token, len(block.references)):
-        value = hash_word(value, word)
+    domain = BLOCK_INTEGRITY_DOMAIN
+    keyed = (prototype.k1 * 65537 + prototype.k2 * 257 + prototype.k3) & MASK32
+    left = block.entry_state ^ domain ^ prototype.binding ^ rotate16(keyed)
+    right = prototype.binding ^ rotate16(block.entry_state) ^ keyed ^ (block.start_pc * 257 & MASK32)
+    counter = 1
+
+    def absorb(word: int) -> None:
+        nonlocal left, right, counter
+        mixed = (word + counter * 257) & MASK32
+        left = ((left ^ mixed) * 65599 + 0x9E3779B9) & MASK32
+        right = ((right + mixed + (left >> 16)) * 48271 + 0x6D2B79F5) & MASK32
+        left = (left ^ rotate16(right)) & MASK32
+        counter += 1
+
+    for word in (
+        block.start_pc, block.count, prototype.k1, prototype.k2, prototype.k3,
+        block.route_token, len(block.references),
+    ):
+        absorb(word)
     for index in block.references:
-        value = hash_word(value, index)
-    value = hash_word(value, block.verifier)
-    value = hash_word(value, len(block.successors))
+        absorb(index)
+    absorb(block.verifier)
+    absorb(len(block.successors))
     for destination, wrapped_state, wrapped_chunk_state in block.successors:
-        value = hash_word(value, destination)
-        value = hash_word(value, wrapped_state)
-        value = hash_word(value, wrapped_chunk_state)
+        absorb(destination)
+        absorb(wrapped_state)
+        absorb(wrapped_chunk_state)
     encoded_body = bytes(data[block.body_start:block.body_end])
-    value = hash_word(value, len(encoded_body))
-    return hash_bytes(value, encoded_body)
+    absorb(len(encoded_body))
+    for value in encoded_body:
+        absorb(value)
+    left = ((left ^ right ^ len(encoded_body)) * 65599 + domain) & MASK32
+    right = ((right ^ rotate16(left) ^ block.start_pc ^ block.count) * 48271 + 0xC4D29A6B) & MASK32
+    return (left ^ rotate16(right)) & MASK32
 
 
 def validate_capsule(data: bytes, prototype: Prototype, capsule: Capsule) -> None:

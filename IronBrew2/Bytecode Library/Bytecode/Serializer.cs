@@ -452,25 +452,39 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			uint routeToken, IReadOnlyList<int> constantReferences, uint verifier,
 			IReadOnlyList<ChunkSuccessor> successors, ushort k1, ushort k2, ushort k3, uint binding)
 		{
-			uint hash = HashWord(entryState ^ _context.Domains.BlockIntegrityDomain ^ binding, (uint)start);
-			hash = HashWord(hash, (uint)count);
-			hash = HashWord(hash, k1);
-			hash = HashWord(hash, k2);
-			hash = HashWord(hash, k3);
-			hash = HashWord(hash, routeToken);
-			hash = HashWord(hash, (uint)constantReferences.Count);
-			foreach (int constantIndex in constantReferences)
-				hash = HashWord(hash, (uint)constantIndex);
-			hash = HashWord(hash, verifier);
-			hash = HashWord(hash, (uint)successors.Count);
+			uint domain = _context.Domains.BlockIntegrityDomain;
+			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
+			uint left = entryState ^ domain ^ binding ^ Rotate16(keyed);
+			uint right = binding ^ Rotate16(entryState) ^ keyed ^ unchecked((uint)start * 257u);
+			uint counter = 1;
+			void Absorb(uint word)
+			{
+				uint mixed = unchecked(word + counter * 257u);
+				left = unchecked((left ^ mixed) * 65599u + 0x9E3779B9u);
+				right = unchecked((right + mixed + (left >> 16)) * 48271u + 0x6D2B79F5u);
+				left ^= Rotate16(right);
+				counter++;
+			}
+			foreach (uint word in new[]
+			         {
+				         (uint)start, (uint)count, k1, k2, k3, routeToken,
+				         (uint)constantReferences.Count
+			         })
+				Absorb(word);
+			foreach (int constantIndex in constantReferences) Absorb((uint)constantIndex);
+			Absorb(verifier);
+			Absorb((uint)successors.Count);
 			foreach (ChunkSuccessor successor in successors)
 			{
-				hash = HashWord(hash, (uint)successor.Destination);
-				hash = HashWord(hash, successor.WrappedEntryState);
-				hash = HashWord(hash, successor.WrappedChunkState);
+				Absorb((uint)successor.Destination);
+				Absorb(successor.WrappedEntryState);
+				Absorb(successor.WrappedChunkState);
 			}
-			hash = HashWord(hash, (uint)body.Length);
-			return HashBytes(hash, body);
+			Absorb((uint)body.Length);
+			foreach (byte value in body) Absorb(value);
+			left = unchecked((left ^ right ^ (uint)body.Length) * 65599u + domain);
+			right = unchecked((right ^ Rotate16(left) ^ (uint)start ^ (uint)count) * 48271u + 0xC4D29A6Bu);
+			return left ^ Rotate16(right);
 		}
 
 		private uint ComputePrototypeIntegrity(byte[] body, ushort k1, ushort k2, ushort k3)
