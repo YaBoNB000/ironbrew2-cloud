@@ -37,11 +37,11 @@ namespace IronBrew2.Obfuscator
             PayloadBinding = _profile.DerivePayloadBinding(Salt, AttestationToken);
 
             SeedDeriveLua = $@"
-local SeedText = ToString(PayloadHead) .. Char(124) .. ToString(GuardAttestation);
-local GuardKeyA = {_profile.BinderInitial};
-local GuardKeyB = BitXOR({_profile.BinderInitial}, 2781082087) % 4294967296;
-local GuardKeyC = BitXOR({_profile.BinderFinalXor}, 1831565813) % 4294967296;
-local GuardKeyD = BitXOR(BitXOR(PayloadHead, GuardAttestation), 2654435769) % 4294967296;
+local SeedText = ToString(PayloadHead) .. Char(124) .. ToString(GuardEvidenceA) .. Char(124) .. ToString(GuardEvidenceB) .. Char(124) .. ToString(GuardEvidenceC) .. Char(124) .. ToString(GuardEvidenceD);
+local GuardKeyA = BitXOR({_profile.BinderInitial}, GuardEvidenceA) % 4294967296;
+local GuardKeyB = BitXOR(BitXOR({_profile.BinderInitial}, 2781082087), GuardEvidenceB) % 4294967296;
+local GuardKeyC = BitXOR(BitXOR({_profile.BinderFinalXor}, 1831565813), GuardEvidenceC) % 4294967296;
+local GuardKeyD = BitXOR(BitXOR(PayloadHead, GuardEvidenceD), 2654435769) % 4294967296;
 for SeedIndex = 1, #SeedText do
     local SeedByte = Byte(SeedText, SeedIndex);
     GuardKeyA = (GuardKeyA * {_profile.BinderMultiplier} + SeedByte + {_profile.BinderIncrement}) % 4294967296;

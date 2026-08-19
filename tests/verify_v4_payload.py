@@ -454,14 +454,25 @@ def outer_integrity(encrypted: bytes, integrity_key: int, flags: int) -> int:
     return (left ^ rotate16(right)) & MASK32
 
 
+def evidence_words(attestation: int) -> tuple[int, int, int, int]:
+    return (
+        (attestation * 65599 + 0x9E3779B9) & MASK32,
+        (attestation * 48271 + 0x6D2B79F5) & MASK32,
+        ((attestation ^ 0xA5C3F1E7) * 131071 + 0x7F4A7C15) & MASK32,
+        ((attestation ^ 0xC4D29A6B) * 524287 + 0xC2B2AE35) & MASK32,
+    )
+
+
 def binder_words(head: int, attestation: int) -> tuple[int, int, int, int]:
+    evidence = evidence_words(attestation)
     words = [
-        BINDER_INITIAL,
-        BINDER_INITIAL ^ 0xA5C3F1E7,
-        BINDER_FINAL_XOR ^ 0x6D2B79F5,
-        head ^ attestation ^ 0x9E3779B9,
+        BINDER_INITIAL ^ evidence[0],
+        BINDER_INITIAL ^ 0xA5C3F1E7 ^ evidence[1],
+        BINDER_FINAL_XOR ^ 0x6D2B79F5 ^ evidence[2],
+        head ^ evidence[3] ^ 0x9E3779B9,
     ]
-    for index, item in enumerate(f"{head}|{attestation}".encode("ascii"), start=1):
+    transcript = f"{head}|{'|'.join(map(str, evidence))}"
+    for index, item in enumerate(transcript.encode("ascii"), start=1):
         words[0] = (words[0] * BINDER_MULTIPLIER + item + BINDER_INCREMENT) & MASK32
         words[1] = (
             words[1] * (BINDER_MULTIPLIER + 2)
@@ -508,7 +519,7 @@ def _attestation_candidates(source: str) -> set[int]:
     offsets = {
         int(value)
         for value in re.findall(
-            rf"if\s+not\s+{ident}\s+then\s+{ident}\s*=\s*\(\s*{ident}\s*\+\s*(\d+)\s*\)"
+            rf"if\s+not\s+{ident}\s+then\s+(?:local\s+)?{ident}\s*=\s*\(\s*{ident}\s*\+\s*(\d+)\s*\)"
             rf"\s*%\s*4294967296\s*;",
             source,
             re.S,

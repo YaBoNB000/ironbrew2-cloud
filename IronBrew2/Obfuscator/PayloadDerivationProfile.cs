@@ -34,16 +34,28 @@ namespace IronBrew2.Obfuscator
 			StreamIncrement = ((domains.EntropyDigestDomain ^ domains.PayloadFormatDomain) & 0x3FFFFFFFu) | 1u;
 		}
 
+		public uint[] DeriveEvidenceWords(uint attestationToken)
+		{
+			return new[]
+			{
+				unchecked(attestationToken * 65599u + 0x9E3779B9u),
+				unchecked(attestationToken * 48271u + 0x6D2B79F5u),
+				unchecked((attestationToken ^ 0xA5C3F1E7u) * 131071u + 0x7F4A7C15u),
+				unchecked((attestationToken ^ 0xC4D29A6Bu) * 524287u + 0xC2B2AE35u)
+			};
+		}
+
 		private uint[] DeriveBindingWords(uint salt, uint attestationToken)
 		{
+			uint[] evidence = DeriveEvidenceWords(attestationToken);
 			uint[] words =
 			{
-				BinderInitial,
-				BinderInitial ^ 0xA5C3F1E7u,
-				BinderFinalXor ^ 0x6D2B79F5u,
-				salt ^ attestationToken ^ 0x9E3779B9u
+				BinderInitial ^ evidence[0],
+				BinderInitial ^ 0xA5C3F1E7u ^ evidence[1],
+				BinderFinalXor ^ 0x6D2B79F5u ^ evidence[2],
+				salt ^ evidence[3] ^ 0x9E3779B9u
 			};
-			string transcript = salt.ToString() + "|" + attestationToken.ToString();
+			string transcript = salt.ToString() + "|" + string.Join("|", evidence);
 			uint index = 1;
 			foreach (char value in transcript)
 			{

@@ -44,8 +44,8 @@ if "ComputeIntegrity(encrypted, _context.OuterIntegrityKey, flags)" not in seria
     raise SystemExit("serializer does not separate the outer-auth key from XorSeed")
 if "DeriveBindingWords" not in derivation or "DeriveOuterIntegrityKey" not in derivation or "DerivePayloadBinding" not in derivation:
     raise SystemExit("outer-auth and payload keys do not use the four-word binding state")
-if "__IB2_ATTESTATION_TOKEN__" in anti_dump or "GuardAttestation ~= " in anti_dump:
-    raise SystemExit("guard restored a shipped final-token literal/equality oracle")
+if "__IB2_ATTESTATION_TOKEN__" in anti_dump or "GuardAttestation" in anti_dump:
+    raise SystemExit("guard restored a shipped/final compatibility scalar")
 
 if "PayloadVersion ~= 5" not in vm:
     raise SystemExit("generated runtime does not require the v5 payload")
@@ -85,11 +85,11 @@ verifier_module.BINDER_INITIAL = 0x11223344
 verifier_module.BINDER_FINAL_XOR = 0x55667788
 verifier_module.BINDER_MULTIPLIER = 65521
 verifier_module.BINDER_INCREMENT = 32749
-if verifier_module.binder_seed(123456789, 987654321) != 0x32497E7B:
+if verifier_module.binder_seed(123456789, 987654321) != 0xA6E2839F:
     raise SystemExit("four-word environment stream-seed derivation vector changed")
-if verifier_module.binder_integrity_key(123456789, 987654321) != 0x5CCF5788:
+if verifier_module.binder_integrity_key(123456789, 987654321) != 0x5AC2E11E:
     raise SystemExit("four-word outer-integrity-key derivation vector changed")
-if verifier_module.binder_payload_binding(123456789, 987654321) != 0x5F4E68EC:
+if verifier_module.binder_payload_binding(123456789, 987654321) != 0x290E3B08:
     raise SystemExit("four-word payload-state binding vector changed")
 
 print("PASS v5 outer tag has no direct polynomial stream-seed inverse")
