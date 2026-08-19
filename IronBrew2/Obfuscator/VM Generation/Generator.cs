@@ -981,7 +981,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"EntropyHash","EnvelopeByteIndex","EnvelopeState","EnvelopeBody","EnvelopeBodyIndex","EnvelopeKey",
 				"PayloadCiphertext","PayloadAttestation","EnvelopeCipherPos","EnvelopeCipherState","EnvelopePlainPos","EnvelopeRead8","PayloadPageDescriptors","EntropyDescriptors",
 				"DescriptorState","DescriptorOffset","EnvelopeMaskState","PayloadSourceLength","PageOrdinal","PayloadPageOrdinal","PayloadPage","PayloadPagePosition","LoadPayloadPage",
-				"SourceRead8","SourceReadBytes","ActiveSourceLength","SourceIsPaged","ActivePrototypeHash","TrackPrototypeByte","FramedLength","EncodedParts","EncodedPage",
+				"SourceRead8","SourceReadBytes","ActiveSourceLength","SourceIsPaged","ActivePrototypeHash","ActivePrototypeRight","ActivePrototypeCounter","PrototypeAbsorb","FinalizePrototypeIntegrity","TrackPrototypeByte","FramedLength","EncodedParts","EncodedPage",
 				"PageByteIndex","FramingIndex","MaskState","InnerKey","OuterKey","NestedByte","PlainByte","RawLength","Multiplier","SavedSourceLength","SavedSourceMode",
 				"CipherByte","KeyByte","EnvelopeReadWidth","Width","FieldIndex","LengthOffset","EncodedIndex","Left","Right","Counter","Word","Mixed","Absorb","PipelineState","PipelineIndex","TransformedByte","EncodedPartIndex",
 				"ChunkState","InitialChunkKey","ChunkChainKey","SourceChunkState","SourceEntryState","CurrentChunkState","WrappedChunkState","ChunkSuccessors",
@@ -1850,8 +1850,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				vm += T(@"    end;
 	end;
 
-	if Pos ~= PrototypeLength + 1 or Chunk[3] == nil or ActivePrototypeHash ~= PrototypeTag then error('invalid protected payload', 0); end;
-	ActivePrototypeHash = nil;
+	if Pos ~= PrototypeLength + 1 or Chunk[3] == nil
+	or FinalizePrototypeIntegrity(PrototypeLength, K1, K2, K3) ~= PrototypeTag then error('invalid protected payload', 0); end;
+	ActivePrototypeHash, ActivePrototypeRight, PrototypeAbsorb = nil, nil, nil;
 	if InitialRouteToken ~= 0 then
 	    if RouteCount ~= BlockCount or Dispatcher[InitialRouteToken] ~= 1 then error('invalid protected payload', 0); end;
 	    Chunk[13], Chunk[14] = Dispatcher, InitialRouteToken;

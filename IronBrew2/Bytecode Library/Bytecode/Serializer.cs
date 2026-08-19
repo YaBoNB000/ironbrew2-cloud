@@ -476,14 +476,27 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private uint ComputePrototypeIntegrity(byte[] body, ushort k1, ushort k2, ushort k3)
 		{
 			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
-			uint hash = HashWord(keyed ^ _context.Domains.PrototypeIntegrityDomain, (uint)body.Length);
+			uint domain = _context.Domains.PrototypeIntegrityDomain;
+			uint left = keyed ^ domain ^ (uint)body.Length;
+			uint right = Rotate16(keyed) ^ _context.XorSeed ^ unchecked((uint)body.Length * 257u);
+			uint counter = 1;
+			void Absorb(uint word)
+			{
+				uint mixed = unchecked(word + counter * 257u);
+				left = unchecked((left ^ mixed) * 65599u + 0x9E3779B9u);
+				right = unchecked((right + mixed + (left >> 16)) * 48271u + 0x6D2B79F5u);
+				left ^= Rotate16(right);
+				counter++;
+			}
+			Absorb((uint)body.Length);
 			for (int index = 0; index < body.Length; index++)
 			{
-				// Bytes 6..9 contain this prototype's own tag.
 				if (index >= 6 && index < 10) continue;
-				hash = HashWord(hash, body[index]);
+				Absorb(body[index]);
 			}
-			return hash;
+			left = unchecked((left ^ right ^ (uint)body.Length) * 65599u + domain);
+			right = unchecked((right ^ Rotate16(left) ^ keyed) * 48271u + 0xC4D29A6Bu);
+			return left ^ Rotate16(right);
 		}
 
 		private void ShuffleBlocks(List<ControlFlowBlock> blocks)

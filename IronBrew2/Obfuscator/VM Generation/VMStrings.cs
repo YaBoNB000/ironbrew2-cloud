@@ -409,8 +409,11 @@ local Pos = 1;
 local ActiveSourceLength = PayloadSourceLength;
 local SourceIsPaged = true;
 local ActivePrototypeHash = nil;
+local ActivePrototypeRight = nil;
+local ActivePrototypeCounter = 0;
+local PrototypeAbsorb;
 local function TrackPrototypeByte(Value)
-    if ActivePrototypeHash ~= nil then ActivePrototypeHash = (ActivePrototypeHash * 31 + Value) % 4294967296; end;
+    if ActivePrototypeHash ~= nil then PrototypeAbsorb(Value); end;
 end;
 local function SourceRead8()
     local Value;
@@ -629,14 +632,29 @@ end;
 
 local function BeginPrototypeIntegrity(Length, K1, K2, K3)
     local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
-    local Hash = (BitXOR(Keyed, __IB2_DOMAIN_PROTOTYPE_INTEGRITY__) * 31 + Length) % 4294967296;
+    ActivePrototypeHash = BitXOR(BitXOR(Keyed, __IB2_DOMAIN_PROTOTYPE_INTEGRITY__), Length) % 4294967296;
+    ActivePrototypeRight = BitXOR(BitXOR(PayloadRotate16(Keyed), OuterSeed), (Length * 257) % 4294967296) % 4294967296;
+    ActivePrototypeCounter = 1;
+    PrototypeAbsorb = function(Word)
+        local Mixed = (Word + ActivePrototypeCounter * 257) % 4294967296;
+        ActivePrototypeHash = (BitXOR(ActivePrototypeHash, Mixed) * 65599 + 2654435769) % 4294967296;
+        ActivePrototypeRight = ((ActivePrototypeRight + Mixed + (ActivePrototypeHash - ActivePrototypeHash % 65536) / 65536) * 48271 + 1831565813) % 4294967296;
+        ActivePrototypeHash = BitXOR(ActivePrototypeHash, PayloadRotate16(ActivePrototypeRight)) % 4294967296;
+        ActivePrototypeCounter = ActivePrototypeCounter + 1;
+    end;
+    PrototypeAbsorb(Length);
     local Words = {K1, K2, K3};
     for WordIndex = 1, 3 do
         local Word = Words[WordIndex];
-        Hash = (Hash * 31 + Word % 256) % 4294967296;
-        Hash = (Hash * 31 + (Word - Word % 256) / 256) % 4294967296;
+        PrototypeAbsorb(Word % 256);
+        PrototypeAbsorb((Word - Word % 256) / 256);
     end;
-    ActivePrototypeHash = Hash;
+end;
+local function FinalizePrototypeIntegrity(Length, K1, K2, K3)
+    local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
+    local Left = (BitXOR(BitXOR(ActivePrototypeHash, ActivePrototypeRight), Length) * 65599 + __IB2_DOMAIN_PROTOTYPE_INTEGRITY__) % 4294967296;
+    local Right = (BitXOR(BitXOR(ActivePrototypeRight, PayloadRotate16(Left)), Keyed) * 48271 + 3302136427) % 4294967296;
+    return BitXOR(Left, PayloadRotate16(Right)) % 4294967296;
 end;
 
 local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteToken, References, Verifier, SuccessorRecords, K1, K2, K3)

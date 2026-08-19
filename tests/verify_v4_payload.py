@@ -931,11 +931,26 @@ def instruction_state_seal(
 
 def prototype_integrity(data: bytes | bytearray, prototype: Prototype) -> int:
     keyed = (prototype.k1 * 65537 + prototype.k2 * 257 + prototype.k3) & MASK32
-    value = hash_word(keyed ^ PROTOTYPE_INTEGRITY_DOMAIN, prototype.end - prototype.start)
+    length = prototype.end - prototype.start
+    left = keyed ^ PROTOTYPE_INTEGRITY_DOMAIN ^ length
+    right = rotate16(keyed) ^ prototype.binding ^ (length * 257 & MASK32)
+    counter = 1
+
+    def absorb(word: int) -> None:
+        nonlocal left, right, counter
+        mixed = (word + counter * 257) & MASK32
+        left = ((left ^ mixed) * 65599 + 0x9E3779B9) & MASK32
+        right = ((right + mixed + (left >> 16)) * 48271 + 0x6D2B79F5) & MASK32
+        left = (left ^ rotate16(right)) & MASK32
+        counter += 1
+
+    absorb(length)
     for relative, byte in enumerate(data[prototype.start:prototype.end]):
         if not 6 <= relative < 10:
-            value = hash_word(value, byte)
-    return value
+            absorb(byte)
+    left = ((left ^ right ^ length) * 65599 + PROTOTYPE_INTEGRITY_DOMAIN) & MASK32
+    right = ((right ^ rotate16(left) ^ keyed) * 48271 + 0xC4D29A6B) & MASK32
+    return (left ^ rotate16(right)) & MASK32
 
 
 def flow_key(entry_state: int, from_pc: int, to_pc: int, prototype: Prototype) -> int:
