@@ -68,9 +68,12 @@ def instrument(vm_path: Path, payload_path: Path) -> str:
         fail("could not recover GetInstruction")
     fetch_decl = fetch_declarations[-1]
     fetch_params = [value.strip() for value in fetch_decl.group(2).split(",")]
-    if len(fetch_params) != 3:
-        fail("GetInstruction no longer has Chunk/Index/Flow inputs")
-    fetch_end = re.search(rf"return\s+({IDENT})\s*;\s*end\s*;", code[cache_assignment.end():])
+    if len(fetch_params) != 4:
+        fail("GetInstruction no longer has Chunk/Index/Flow/materializer inputs")
+    fetch_end = re.search(
+        rf"return\s+({IDENT})(?:\s*,\s*{IDENT})?\s*;\s*end\s*;",
+        code[cache_assignment.end():],
+    )
     if not fetch_end:
         fail("could not recover GetInstruction return")
     fetch_end_position = cache_assignment.end() + fetch_end.end()

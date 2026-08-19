@@ -1,5 +1,20 @@
 # IronBrew2 加固实施报告
 
+> 更新（2026-08-19）：当前实现已升级到 v5 outer authenticator。下文的 v4
+> 章节保留为该轮实施历史；v5 删除了可从 polynomial outer tag 逐字节逆推
+> environment-derived stream seed 的 O(n) 反演关系；outer integrity key 也改为独立
+> transcript 派生，不再复用 envelope stream seed，并新增静态回归测试。
+>
+> 更新（2026-08-19，runtime materializer 第一阶段）：每个顶层取指会先把已认证的
+> 真实 instruction 放入 prototype-keyed、invocation-local Flow overlay，分派四种由
+> prototype keys 选择的 synthetic materializer handler 之一，回退 PC/Flow 后在同一
+> PC replay 时才交付真实 instruction。CLOSURE/SuperOperator 的内部取指保持直接路径。
+>
+> 更新（2026-08-19，静态攻击 M0）：新增 `tests/static_attack_baseline.py`，只读取
+> 最终 Lua 并量化当前静态恢复链。现阶段预期攻击成功：可恢复 carrier、binding、
+> 完整 body、prototype/block、常量 capsule、`"print"`/`"idk"` 和 canonical opcode IDs。
+> 该结果作为后续 M1–M5 的攻击回归基线，不作为当前防护能力声明。
+
 日期：2026-08-15  
 本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）
 

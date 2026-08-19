@@ -2,6 +2,17 @@
 
 > 目标不是复制 Luraph 私有实现，而是吸收已观察到的架构特征：多层数据恢复、按原型变化、状态相关 opcode、常量延迟恢复、VM 多态和完整性耦合。
 
+## 2026-08-19 静态攻击路线（进行中）
+
+- [x] M0：建立只接收最终 Lua 的攻击基线，恢复 carrier、binding keys、完整 body、prototype/block、常量 capsule 和 canonical opcode IDs；当前 `test.lua` 的 `"print"`/`"idk"` 可完整恢复。
+- [ ] M1：取消单一 `GuardAttestation`/全局 seed，改为多字 challenge state 和 page/prototype/block/constant/opcode 独立 key。
+- [ ] M2：流式 carrier/Base91/page，运行时不再形成完整 encoded payload、ByteString 或解密 body。
+- [ ] M3：4–8 套 prototype-local decoder family 和 prototype-local Chunk/Block/instruction ABI。
+- [ ] M4：把当前单 instruction materializer 扩展为 opcode/A/B/C/constant 多阶段 overlay 与多次 replay，使初始 record 不包含完整最终 IR。
+- [ ] M5：handler fragment、真正的 semantic lowering 变体和 IR-native fusion，降低明文 handler def-use 分类的稳定性。
+
+攻击基线与阶段验收见 [`docs/static-attack-baseline.md`](docs/static-attack-baseline.md)。该测试当前预期攻击成功；后续每个 milestone 必须先更新攻击器以适应公开 runtime，再以恢复率下降作为验收，而不是把 parser 失效误报成防护成功。
+
 ## 基线问题
 
 当前版本的主要薄弱点：
