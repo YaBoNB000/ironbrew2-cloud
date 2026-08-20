@@ -37,7 +37,12 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
             index_name, mode = map(re.escape, params)
             direct = re.search(rf"return\s+({ACCESS})\s*\[\s*{index_name}\s*\]\s*;", body)
             raw = re.search(rf"return\s+({IDENT})\s*\(\s*({ACCESS})\s*,\s*{index_name}\s*\)\s*;", body)
-            if direct and raw and direct.group(1) == raw.group(2):
+            raw_fallback = re.search(
+                rf"local\s+{IDENT}\s*=\s*({IDENT})\s*\(\s*({ACCESS})\s*,\s*{index_name}\s*\)\s*;",
+                body,
+            )
+            raw_storage = raw.group(2) if raw else raw_fallback.group(2) if raw_fallback else None
+            if direct and raw_storage and direct.group(1) == raw_storage:
                 reads.append((name, direct.group(1)))
             if len(re.findall(rf"then\s+return\s+(?:not\s+|[-#])?{re.escape(params[1])}\s*;", body)) >= 3:
                 unary = (name, body)

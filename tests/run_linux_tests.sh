@@ -144,7 +144,7 @@ echo "PASS v5 prototype, attested chunk-chain, block-manifest, record framing/co
 # reproduces all six real-executor compatibility failures removed from the gate:
 # hidden random constants/upvalues, no observable interim setupvalue mutation,
 # wrong callable inactive results and a wrong activated-proto result.
-for mode in trusted no-alias compat-representations callable-proto wrong-callable-proto removed-root-contracts; do
+for mode in trusted no-alias compat-representations proxy-builtins callable-proto wrong-callable-proto removed-root-contracts; do
     run_executor_mode "$mode" "$WORK/fixed.lua" > "$WORK/executor-$mode.out"
     cmp "$WORK/baseline.out" "$WORK/executor-$mode.out"
 done

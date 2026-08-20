@@ -922,7 +922,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			// ==== P1: 模板标识符随机化(每次混淆生成不同的 VM 结构名)====
 			string[] identKeys = {
 				"ByteString","InstrPoint","InternalError","GetFEnv","Setmetatable","Getmetatable","RawGet","RawSet","RawEqual","Next","ToNumber","ToString","ConstCount","Deserialize",
-				"DisabledGlobalFunction","DisabledGlobalEnvironment","DisabledEnvironmentOK","DisabledEnvironmentCandidate","DisabledGlobalTargets","DisableGlobalTarget","DisabledGlobalIndex","DisabledGlobalCandidate","DisabledPrintKey","DisabledErrorKey","DisabledWarnKey","DisabledGetGenVKey","DisabledRootKey","DisabledGetGenV","DisabledGetGenVOK",
+				"DisabledGlobalFunction","DisabledGlobalEnvironment","DisabledEnvironmentOK","DisabledEnvironmentCandidate","DisabledEnvironmentRead","DisabledEnvironmentValue","DisabledIndexedOK","DisabledIndexedValue","DisabledGlobalTargets","DisableGlobalTarget","DisabledGlobalIndex","DisabledGlobalCandidate","DisabledPrintKey","DisabledErrorKey","DisabledWarnKey","DisabledGetGenVKey","DisabledRootKey","DisabledGetGenV","DisabledGetGenVOK",
 				"PayloadParts","ConsumePayloadPart","PayloadChunks","PayloadLength","EmitPayloadByte","PayloadByteAt","PayloadChunk","PayloadChunkIndex","PayloadChunkOffset",
 				"Wrap","Upvalues","NewProto","NewPrototypeRecord","Layout","Storage","Proxy","Key","Slot","Indexes","Concat","Insert","LDExp","Select","Unpack",
 				"BitXOR","gBits32","gBits8","gBits16","gFloat","gSizet","gString","gInt","Byte","Char","Sub",
@@ -976,7 +976,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardPersistent","GuardProtoConstants","GuardProtoConstantsOK","GuardProtosValid","GuardReject","GuardRejectA","GuardRejectB","GuardRejectC","GuardRejectD","GuardRepeatEnvironment","GuardRepeatOK","GuardReportOnly","GuardSawInactiveProto","GuardSeparated",
 				"GuardThreadMarker","GuardThreadOld","GuardCanaryOK","GuardCapabilityRestoreOK","GuardThreadRestoreOK","GuardWrappedUpvalues","GuardWrappedUpvaluesOK",
 				"GuardPrimitiveIndex","GuardPrimitives",
-				"PrimitiveEnvironmentReader","PrimitiveEnvironment","PrimitiveRawGet","PrimitiveString","PrimitiveTable","PrimitiveMath","PrimitiveDebug","PrimitiveGlobalUnpack","PrimitiveTableUnpack","PrimitiveBootstrapChar",
+				"PrimitiveEnvironmentReader","PrimitiveEnvironment","PrimitiveEnvironmentLookup","PrimitiveMemberLookup","PrimitiveValue","PrimitiveRawGet","PrimitiveString","PrimitiveTable","PrimitiveMath","PrimitiveDebug","PrimitiveGlobalUnpack","PrimitiveTableUnpack","PrimitiveBootstrapChar",
 				"PrimitiveKeyBytes","PrimitiveKeyMeta","PrimitiveKeyCache","PrimitiveDecode","PrimitiveToken","PrimitiveRecord","PrimitiveText","PrimitiveIndex","PrimitiveLookup","PrimitiveRoot","PrimitiveMember","PrimitiveParent",
 				"PayloadRejectA","PayloadRejectB","PayloadRejectC","PayloadRejectD",
 				"PayloadRejectVoidA","PayloadRejectVoidB","PayloadRejectVoidC","PayloadRejectVoidD",
@@ -1596,7 +1596,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				        .Append(" then return Stk[HandlerFragmentIndex];end;return RawGet(Stk,HandlerFragmentIndex);end;");
 				fragment.Append("local function HandlerReadEnvironment(HandlerFragmentIndex,HandlerFragmentMode)")
 				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0))
-				        .Append(" then return Env[HandlerFragmentIndex];end;return RawGet(Env,HandlerFragmentIndex);end;");
+				        .Append(" then return Env[HandlerFragmentIndex];end;local HandlerFragmentValue=RawGet(Env,HandlerFragmentIndex);")
+				        .Append("if HandlerFragmentValue~=nil then return HandlerFragmentValue;end;return Env[HandlerFragmentIndex];end;");
 				fragment.Append("local function HandlerWriteStack(HandlerFragmentIndex,HandlerFragmentValue,HandlerFragmentMode)")
 				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0))
 				        .Append(" then Stk[HandlerFragmentIndex]=HandlerFragmentValue;else RawSet(Stk,HandlerFragmentIndex,HandlerFragmentValue);end;")
@@ -1788,22 +1789,24 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				int bootstrapTopology = r.Next(3);
 				if (bootstrapTopology == 0)
 				{
-					prelude.Append("local PrimitiveEnvironmentReader=getfenv or function()return _G end;local PrimitiveEnvironment=PrimitiveEnvironmentReader();");
+					prelude.Append("local PrimitiveEnvironmentReader=getfenv or function()return _G end;local PrimitiveEnvironment=(PrimitiveEnvironmentReader and PrimitiveEnvironmentReader())or _G;");
 					prelude.Append("local PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];");
-					prelude.Append("local PrimitiveString=PrimitiveRawGet(PrimitiveEnvironment," + BootstrapLiteral("string") + ");");
-					prelude.Append("local PrimitiveBootstrapChar=PrimitiveRawGet(PrimitiveString," + BootstrapLiteral("char") + ");");
+					prelude.Append("local PrimitiveString=PrimitiveEnvironment[" + BootstrapLiteral("string") + "];");
+					prelude.Append("local PrimitiveBootstrapChar=PrimitiveString[" + BootstrapLiteral("char") + "];");
 				}
 				else if (bootstrapTopology == 1)
 				{
-					prelude.Append("local PrimitiveEnvironment;local PrimitiveEnvironmentReader=getfenv;if PrimitiveEnvironmentReader then PrimitiveEnvironment=PrimitiveEnvironmentReader()else PrimitiveEnvironment=_G end;");
-					prelude.Append("local PrimitiveRawGet,PrimitiveString,PrimitiveBootstrapChar;");
-					prelude.Append("PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];PrimitiveString=PrimitiveRawGet(PrimitiveEnvironment," + BootstrapLiteral("string") + ");PrimitiveBootstrapChar=PrimitiveRawGet(PrimitiveString," + BootstrapLiteral("char") + ");");
+					prelude.Append("local PrimitiveEnvironmentReader=getfenv;local PrimitiveEnvironment=(PrimitiveEnvironmentReader and PrimitiveEnvironmentReader())or _G;");
+					prelude.Append("PrimitiveEnvironmentReader=PrimitiveEnvironmentReader or function()return PrimitiveEnvironment end;local PrimitiveRawGet,PrimitiveString,PrimitiveBootstrapChar;");
+					prelude.Append("PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];PrimitiveString=PrimitiveEnvironment[" + BootstrapLiteral("string") + "];PrimitiveBootstrapChar=PrimitiveString[" + BootstrapLiteral("char") + "];");
 				}
 				else
 				{
 					prelude.Append("local PrimitiveEnvironmentReader=getfenv;local PrimitiveEnvironment=(PrimitiveEnvironmentReader and PrimitiveEnvironmentReader())or _G;PrimitiveEnvironmentReader=PrimitiveEnvironmentReader or function()return PrimitiveEnvironment end;");
-					prelude.Append("local PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];local PrimitiveString=PrimitiveRawGet(PrimitiveEnvironment," + BootstrapLiteral("string") + ");local PrimitiveBootstrapChar=PrimitiveRawGet(PrimitiveString," + BootstrapLiteral("char") + ");");
+					prelude.Append("local PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];local PrimitiveString=PrimitiveEnvironment[" + BootstrapLiteral("string") + "];local PrimitiveBootstrapChar=PrimitiveString[" + BootstrapLiteral("char") + "];");
 				}
+				prelude.Append("local function PrimitiveEnvironmentLookup(PrimitiveToken)local PrimitiveValue=PrimitiveRawGet(PrimitiveEnvironment,PrimitiveToken);if PrimitiveValue~=nil then return PrimitiveValue end;return PrimitiveEnvironment[PrimitiveToken]end;");
+				prelude.Append("local function PrimitiveMemberLookup(PrimitiveParent,PrimitiveToken)if PrimitiveParent==nil then return nil end;local PrimitiveValue=PrimitiveRawGet(PrimitiveParent,PrimitiveToken);if PrimitiveValue~=nil then return PrimitiveValue end;return PrimitiveParent[PrimitiveToken]end;");
 
 				if (vaultTopology == 0)
 				{
@@ -1829,18 +1832,18 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				{
 					if (resolverTopology == 0) return "PrimitiveLookup(" + tokens[label] + ")";
 					if (resolverTopology == 1) return "PrimitiveRoot(" + tokens[label] + ")";
-					return "PrimitiveRawGet(PrimitiveEnvironment,PrimitiveDecode(" + tokens[label] + "))";
+					return "PrimitiveEnvironmentLookup(PrimitiveDecode(" + tokens[label] + "))";
 				}
 				string MemberLookup(string parent, string label)
 				{
 					if (resolverTopology == 0) return "PrimitiveLookup(" + tokens[label] + "," + parent + ")";
 					if (resolverTopology == 1) return "PrimitiveMember(" + parent + "," + tokens[label] + ")";
-					return "PrimitiveRawGet(" + parent + ",PrimitiveDecode(" + tokens[label] + "))";
+					return "PrimitiveMemberLookup(" + parent + ",PrimitiveDecode(" + tokens[label] + "))";
 				}
 				if (resolverTopology == 0)
-					prelude.Append("local function PrimitiveLookup(PrimitiveToken,PrimitiveParent)return PrimitiveRawGet(PrimitiveParent or PrimitiveEnvironment,PrimitiveDecode(PrimitiveToken))end;");
+					prelude.Append("local function PrimitiveLookup(PrimitiveToken,PrimitiveParent)if PrimitiveParent then return PrimitiveMemberLookup(PrimitiveParent,PrimitiveDecode(PrimitiveToken))end;return PrimitiveEnvironmentLookup(PrimitiveDecode(PrimitiveToken))end;");
 				else if (resolverTopology == 1)
-					prelude.Append("local function PrimitiveRoot(PrimitiveToken)return PrimitiveRawGet(PrimitiveEnvironment,PrimitiveDecode(PrimitiveToken))end;local function PrimitiveMember(PrimitiveParent,PrimitiveToken)return PrimitiveRawGet(PrimitiveParent,PrimitiveDecode(PrimitiveToken))end;");
+					prelude.Append("local function PrimitiveRoot(PrimitiveToken)return PrimitiveEnvironmentLookup(PrimitiveDecode(PrimitiveToken))end;local function PrimitiveMember(PrimitiveParent,PrimitiveToken)return PrimitiveMemberLookup(PrimitiveParent,PrimitiveDecode(PrimitiveToken))end;");
 
 				var libraryAssignments = new List<KeyValuePair<string, string>>
 				{
@@ -2868,6 +2871,16 @@ if DisabledEnvironmentOK and Type(DisabledEnvironmentCandidate) == 'table' then
     DisabledGlobalEnvironment = DisabledEnvironmentCandidate;
 end;
 local DisabledGlobalTargets = {};
+local function DisabledEnvironmentRead(DisabledEnvironmentCandidate, DisabledErrorKey)
+    if Type(DisabledEnvironmentCandidate) ~= 'table' then return nil; end;
+    local DisabledEnvironmentValue = RawGet(DisabledEnvironmentCandidate, DisabledErrorKey);
+    if DisabledEnvironmentValue ~= nil then return DisabledEnvironmentValue; end;
+    local DisabledIndexedOK, DisabledIndexedValue = PCall(function()
+        return DisabledEnvironmentCandidate[DisabledErrorKey];
+    end);
+    if DisabledIndexedOK then return DisabledIndexedValue; end;
+    return nil;
+end;
 local DisabledPrintKey = Char(112) .. Char(114) .. Char(105) .. Char(110) .. Char(116);
 local DisabledErrorKey = Char(101) .. Char(114) .. Char(114) .. Char(111) .. Char(114);
 local DisabledWarnKey = Char(119) .. Char(97) .. Char(114) .. Char(110);
@@ -2883,12 +2896,12 @@ local function DisableGlobalTarget(DisabledGlobalCandidate)
     RawSet(DisabledGlobalCandidate, DisabledErrorKey, DisabledGlobalFunction);
     RawSet(DisabledGlobalCandidate, DisabledWarnKey, DisabledGlobalFunction);
 end;
-local DisabledGetGenV = RawGet(DisabledGlobalEnvironment, DisabledGetGenVKey);
+local DisabledGetGenV = DisabledEnvironmentRead(DisabledGlobalEnvironment, DisabledGetGenVKey);
 if Type(DisabledGetGenV) == 'function' then
     local DisabledGetGenVOK, DisabledGlobalCandidate = PCall(DisabledGetGenV);
     if DisabledGetGenVOK then DisableGlobalTarget(DisabledGlobalCandidate); end;
 end;
-DisableGlobalTarget(RawGet(DisabledGlobalEnvironment, DisabledRootKey));
+DisableGlobalTarget(DisabledEnvironmentRead(DisabledGlobalEnvironment, DisabledRootKey));
 DisableGlobalTarget(DisabledGlobalEnvironment);
 return Wrap(Root, {}, DisabledGlobalEnvironment);";
 			finalRuntime = finalRuntime.Replace(rootInvocation, disableGlobalRuntime);

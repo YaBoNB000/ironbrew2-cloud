@@ -74,13 +74,20 @@ def verify(vm_path: Path, final_path: Path | None, late_nil_output: Path | None 
     )
     if not fallback:
         raise ValueError("late GetFEnv nil/table fallback wiring was not found")
+    if not re.search(
+        rf"local\s+function\s+{IDENT}\s*\(\s*{IDENT}\s*,\s*{IDENT}\s*\)"
+        rf".*?{IDENT}\s*\(\s*{IDENT}\s*,\s*{IDENT}\s*\).*?return\s+{IDENT}\s*\[\s*{IDENT}\s*\]",
+        code,
+        re.S,
+    ):
+        raise ValueError("proxy-backed final environment lookup fallback was not found")
 
     combined_raw = source + "\n" + (final_path.read_text("latin1") if final_path else "")
     if re.search(r"['\"](?:print|error|warn)['\"]", combined_raw):
         raise ValueError("a plaintext disabled-global key leaked")
     final_code = _code_only(final_path.read_text("latin1")) if final_path else ""
     leaked = re.search(
-        r"\bDisabled(?:Global(?:Function|Environment|Targets|Index|Candidate)|Environment(?:OK|Candidate)|PrintKey|ErrorKey|WarnKey|GetGenV(?:Key|OK)?|RootKey)|DisableGlobalTarget\b",
+        r"\bDisabled(?:Global(?:Function|Environment|Targets|Index|Candidate)|Environment(?:OK|Candidate|Read|Value)|Indexed(?:OK|Value)|PrintKey|ErrorKey|WarnKey|GetGenV(?:Key|OK)?|RootKey)|DisableGlobalTarget\b",
         code + "\n" + final_code,
     )
     if leaked:

@@ -304,7 +304,6 @@ local GuardUnpack = PrimitiveGlobalUnpack;
 local GuardTableUnpack = PrimitiveTableUnpack;
 local GuardGetFEnvGlobal;
 __IB2_KEY_VAULT__
-GuardGetFEnvGlobal = RawGet(PrimitiveEnvironment, __KEY_GETFENV__);
 
 local GuardEnvOK, GuardEnvironment = PCall(GetFEnv);
 if not GuardEnvOK or Type(GuardEnvironment) ~= 'table' then GuardEnvironment = nil; end;
@@ -318,6 +317,7 @@ local function GuardEnvironmentRead(GuardReadEnvironment, GuardReadKey)
     if GuardReadOK then return GuardIndexedValue; end;
     return nil;
 end;
+GuardGetFEnvGlobal = GuardEnvironmentRead(PrimitiveEnvironment, __KEY_GETFENV__);
 local GuardGetGenV = GuardEnvironmentRead(GuardEnvironment, __KEY_GETGENV__);
 local GuardCapOK, GuardCapabilityEnvironment = false, nil;
 if Type(GuardGetGenV) == 'function' then
@@ -427,29 +427,29 @@ local function GuardClassifies(GuardFunction, GuardExpectedC)
 end;
 
 local function GuardCurrentIdentity()
-    if RawGet(PrimitiveEnvironment, __KEY_STRING_TABLE__) ~= GuardString
-        or RawGet(PrimitiveEnvironment, __KEY_TABLE_TABLE__) ~= GuardTable
-        or RawGet(PrimitiveEnvironment, __KEY_MATH_TABLE__) ~= GuardMath
-        or RawGet(PrimitiveEnvironment, __KEY_DEBUG_TABLE__) ~= GuardDebug
-        or RawGet(PrimitiveEnvironment, __KEY_PCALL__) ~= PCall
-        or RawGet(PrimitiveEnvironment, __KEY_TYPE__) ~= Type
-        or RawGet(PrimitiveEnvironment, __KEY_RAWGET__) ~= RawGet
-        or RawGet(PrimitiveEnvironment, __KEY_RAWSET__) ~= RawSet
-        or RawGet(PrimitiveEnvironment, __KEY_NEXT__) ~= Next
-        or RawGet(PrimitiveEnvironment, __KEY_GETMETATABLE__) ~= Getmetatable
-        or RawGet(PrimitiveEnvironment, __KEY_SETMETATABLE__) ~= Setmetatable
-        or RawGet(PrimitiveEnvironment, __KEY_RAWEQUAL__) ~= RawEqual
-        or RawGet(PrimitiveEnvironment, __KEY_TOSTRING__) ~= ToString
-        or RawGet(PrimitiveEnvironment, __KEY_SELECT__) ~= Select
-        or RawGet(PrimitiveEnvironment, __KEY_TONUMBER__) ~= ToNumber
-        or RawGet(PrimitiveEnvironment, __KEY_GETFENV__) ~= GuardGetFEnvGlobal
+    if GuardEnvironmentRead(PrimitiveEnvironment, __KEY_STRING_TABLE__) ~= GuardString
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_TABLE_TABLE__) ~= GuardTable
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_MATH_TABLE__) ~= GuardMath
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_DEBUG_TABLE__) ~= GuardDebug
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_PCALL__) ~= PCall
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_TYPE__) ~= Type
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_RAWGET__) ~= RawGet
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_RAWSET__) ~= RawSet
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_NEXT__) ~= Next
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_GETMETATABLE__) ~= Getmetatable
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_SETMETATABLE__) ~= Setmetatable
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_RAWEQUAL__) ~= RawEqual
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_TOSTRING__) ~= ToString
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_SELECT__) ~= Select
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_TONUMBER__) ~= ToNumber
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_GETFENV__) ~= GuardGetFEnvGlobal
         or RawGet(GuardString, __KEY_BYTE__) ~= Byte
         or RawGet(GuardString, __KEY_CHAR__) ~= Char
         or RawGet(GuardString, __KEY_SUB__) ~= Sub
         or RawGet(GuardTable, __KEY_CONCAT__) ~= Concat
         or RawGet(GuardTable, __KEY_INSERT__) ~= Insert
         or RawGet(GuardMath, __KEY_LDEXP__) ~= LDExp
-        or RawGet(PrimitiveEnvironment, __KEY_UNPACK__) ~= GuardUnpack
+        or GuardEnvironmentRead(PrimitiveEnvironment, __KEY_UNPACK__) ~= GuardUnpack
         or RawGet(GuardTable, __KEY_UNPACK__) ~= GuardTableUnpack
         or (GuardUnpack or GuardTableUnpack) ~= Unpack then
         return false;

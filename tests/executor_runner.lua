@@ -4,6 +4,7 @@
 local mode = assert(arg[1], "mode required")
 local path = assert(arg[2], "obfuscated script required")
 
+local native_getfenv = getfenv
 local native_getinfo = assert(debug and debug.getinfo)
 local native_getupvalue = assert(debug and debug.getupvalue)
 local native_setupvalue = assert(debug and debug.setupvalue)
@@ -232,10 +233,18 @@ elseif mode == "missing-debug" then
 elseif mode == "trusted" or mode == "no-alias" or mode == "compat-representations"
     or mode == "polluted-genv" or mode == "invalid-load" or mode == "callable-proto"
     or mode == "c-debug-leak" or mode == "c-upvalue-leak" or mode == "wrong-callable-proto"
-    or mode == "removed-root-contracts" or mode == "canary-error" or mode == "trusted-global-disable" then
+    or mode == "removed-root-contracts" or mode == "canary-error" or mode == "trusted-global-disable"
+    or mode == "proxy-builtins" then
     -- Behavior for these modes is installed above before the generated chunk.
 else
     error("unknown executor harness mode: " .. tostring(mode))
+end
+
+if mode == "proxy-builtins" then
+    -- Model executors whose thread environment exposes Lua builtins only through
+    -- __index. RawGet(threadEnv, "string"/"pcall") consequently returns nil.
+    local proxy_environment = setmetatable({}, {__index = _G})
+    getfenv = function() return proxy_environment end
 end
 
 if mode == "compat-representations" then

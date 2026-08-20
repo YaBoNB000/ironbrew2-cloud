@@ -52,7 +52,7 @@
 
 本轮没有复制或声称复刻 Luraph 的私有实现。实际采用的是可独立实现的通用架构思路：分层恢复、按 prototype 变化、位置相关的指令编码、常量二次编码、完整性耦合和 VM 生成多态。
 
-底层语义与 Lua 5.1 bytecode 前端继续保持稳定；本轮运行时防护优先面向 Luau/Roblox。Mutation、源码字符串解密闭包及其他激进 API hook 仍保持关闭；按明确配置仅在成功路径永久把 thread/_G/getgenv 的 print/error/warn 设为同一 no-op。 最终 `GetFEnv` 采用受保护调用并在 nil/非 table 时回退到启动期捕获的 `PrimitiveEnvironment`，避免 executor 调用层级差异导致 `RawGet(nil, ...)`。SuperOperator 已替换为带安全边界的 IR-native physical fusion。
+底层语义与 Lua 5.1 bytecode 前端继续保持稳定；本轮运行时防护优先面向 Luau/Roblox。Mutation、源码字符串解密闭包及其他激进 API hook 仍保持关闭；按明确配置仅在成功路径永久把 thread/_G/getgenv 的 print/error/warn 设为同一 no-op。 最终 `GetFEnv` 采用受保护调用并在 nil/非 table 时回退到启动期捕获的 `PrimitiveEnvironment`，避免 executor 调用层级差异导致 `RawGet(nil, ...)`。 Primitive bootstrap 与 handler Env 读取同时采用 raw-first/indexed-fallback，兼容标准库仅由 thread environment `__index` 提供的执行器，并在 member parent 为 nil 时返回 nil 而不是调用 `RawGet(nil, key)`。SuperOperator 已替换为带安全边界的 IR-native physical fusion。
 
 ## 2. 已完成的源码改动
 
