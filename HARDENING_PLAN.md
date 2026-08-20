@@ -65,6 +65,7 @@
 - [x] SETTABLE key/value 分离 materialization：4 种 RK 组合映射到 build-random operation token；target/key/value 分别获取、key/value 顺序随机、最终统一 commit。
 - [x] safe fresh-table write-order randomization：只对 NEWTABLE 后、同 target、不同 constant key、无 CFG back-reference 的连续 SETTABLE 组做物理 shuffle；其他写入保持原顺序。
 - [x] table setter trampoline：shared commit 再经独立 4-token dialect 路由到 4 个一次赋值的等价 leaf shapes；write-mode token 与 setter token 分离。
+- [x] fresh-table temporary decoy：安全 constructor-group SETTABLE 用 descriptor bit 标记；写入前以 table-object key 临时插入 decoy，真实 commit 后经同一 setter trampoline 删除，且禁止参与 IR fusion。
 - [x] 主循环、closure upvalue 伪指令和可选 superoperator 的直接取指统一经过 `GetInstruction`；`SetList C==0` data word 仍按 Lua 5.1 skip 语义处理。
 
 当前验收状态：字段 schema、常量 tag 和 opcode bank 均由各 prototype 的 K1/K2/K3 加独立 domain 派生，通用解析器不能只恢复一次全局 schema/opcode 表后解析所有 prototype。handler 会按安全顶层 statement 边界选择 raw、`do` scope、恒真 guard 或 prefix/suffix 嵌套模板；dispatch 的双 handler leaf 也会在 `>`、`==`、`~=` 和嵌套 guard 形式间变化。prototype、basic block 和 block-local constant capsule 三层延迟恢复均已启用；默认 AntiDump 模式下共享 instruction table 保持为空，明文常量与指令只存在于当前 invocation 的单块解码/执行窗口。

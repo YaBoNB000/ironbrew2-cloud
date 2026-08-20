@@ -31,7 +31,11 @@ def verify(generated: Path, generated_vm: Path | None) -> None:
 
     descriptors = [descriptor for _, proto in _prototypes(info.root)
                    for block in proto.blocks for descriptor in block.descriptors]
-    if sum(descriptor >= 64 and descriptor & 1 == 0 for descriptor in descriptors) != len(fused):
+    fused_descriptors = sum(
+        ((descriptor - 128 if descriptor >= 128 else descriptor) >= 64) and descriptor & 1 == 0
+        for descriptor in descriptors
+    )
+    if fused_descriptors != len(fused):
         raise ValueError("fusion descriptor flag/count does not match physical fused records")
 
     root = Path(__file__).resolve().parents[1]

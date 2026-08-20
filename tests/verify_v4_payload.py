@@ -779,12 +779,16 @@ def validate_instruction_record(
     if not columns[0]:
         raise ValueError("instruction descriptor page is empty")
     descriptor = columns[0][0] ^ (block_field_mask(block.entry_state, pc, 7, prototype) & 0xFF)
+    wire_descriptor = descriptor
     fused_count = 0
     if descriptor & 1:
         if descriptor != 1 or len(columns[0]) != 1:
             raise ValueError("invalid data-word instruction descriptor")
         expected = {0: 1, 1: 0, 2: 0, 3: 4, 4: 0}
     else:
+        fresh_table_write = descriptor >= 128
+        if fresh_table_write:
+            descriptor -= 128
         if descriptor >= 128:
             raise ValueError("invalid high bits in instruction descriptor")
         fused = descriptor >= 64
@@ -812,7 +816,7 @@ def validate_instruction_record(
     actual = {role: len(value) for role, value in columns.items()}
     if actual != expected:
         raise ValueError(f"instruction record field lengths mismatch: {actual} != {expected}")
-    return descriptor, fused_count, tuple(order), spans
+    return wire_descriptor, fused_count, tuple(order), spans
 
 
 def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) -> None:

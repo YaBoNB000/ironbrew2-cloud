@@ -18,8 +18,8 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     source = vm_path.read_text("latin1")
     code = _code_only(source)
 
-    # Recover nine private overlay slots: PC, opcode/A/B/C, replay stage, the
-    # lazy constant-field map/resolver and an IR-fusion operand bundle. Neither lazy
+    # Recover ten private overlay slots: PC, opcode/A/B/C, replay stage, the
+    # lazy constant-field map/resolver, IR-fusion operands and fresh-table flag. Neither lazy
     # constant object may be dropped before all four replay passes complete.
     slots = re.search(
         rf"local\s+({IDENT})\s*=\s*32\s*\+\s*\(\(.*?\)\s*%\s*104729\s*\)\s*;\s*"
@@ -30,13 +30,14 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
         rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*523645\s*;\s*"
         rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*628374\s*;\s*"
         rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*733103\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*837832\s*;",
+        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*837832\s*;\s*"
+        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*942561\s*;",
         code,
         re.S,
     )
     if not slots:
         raise ValueError("prototype-derived field/lazy-constant materializer slots were not found")
-    index_slot, opcode_slot, a_slot, b_slot, c_slot, stage_slot, constant_slot, resolver_slot, fused_slot = slots.groups()
+    index_slot, opcode_slot, a_slot, b_slot, c_slot, stage_slot, constant_slot, resolver_slot, fused_slot, fresh_slot = slots.groups()
 
     pending = re.search(
         rf"if\s+({IDENT})\s+and\s+({IDENT})\s+and\s+\2\[{re.escape(index_slot)}\]\s*==\s*({IDENT})\s+then"
@@ -44,8 +45,8 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
         rf".*?\2\[{re.escape(index_slot)}\]\s*,\s*\2\[{re.escape(opcode_slot)}\]\s*,\s*\2\[{re.escape(a_slot)}\]\s*,\s*"
         rf"\2\[{re.escape(b_slot)}\]\s*,\s*\2\[{re.escape(c_slot)}\]\s*,\s*\2\[{re.escape(stage_slot)}\]\s*,\s*"
         rf"\2\[{re.escape(constant_slot)}\]\s*,\s*\2\[{re.escape(resolver_slot)}\]\s*,\s*"
-        rf"\2\[{re.escape(fused_slot)}\]\s*=\s*"
-        rf"nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*;"
+        rf"\2\[{re.escape(fused_slot)}\]\s*,\s*\2\[{re.escape(fresh_slot)}\]\s*=\s*"
+        rf"nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*;"
         rf".*?return\s+({IDENT})\s*;",
         code,
         re.S,
@@ -98,7 +99,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     # production output. Comments are removed before this identifier check.
     final_code = _code_only(final_path.read_text("latin1")) if final_path else ""
     leaked = re.search(
-        r"\b(?:AllowMaterializer|SelectMaterializerEnum|BindInstructionOperands|Instruction(?:Fields|ConstantFields|ConstantResolver|DecodedFields|DecodedValues|RemainingConstants|FieldKey|ConstantIndex)|Materialize(?:IndexSlot|OpcodeSlot|ASlot|BSlot|CSlot|StageSlot|ConstantFieldsSlot|ConstantResolverSlot|FusedSlot|Stage|Mode|Enum|Target|Delta)|Materialized(?:Instruction|Fields|ConstantFields|ConstantResolver))\b",
+        r"\b(?:AllowMaterializer|SelectMaterializerEnum|BindInstructionOperands|Instruction(?:Fields|ConstantFields|ConstantResolver|DecodedFields|DecodedValues|RemainingConstants|FieldKey|ConstantIndex)|Materialize(?:IndexSlot|OpcodeSlot|ASlot|BSlot|CSlot|StageSlot|ConstantFieldsSlot|ConstantResolverSlot|FusedSlot|FreshTableSlot|Stage|Mode|Enum|Target|Delta)|Materialized(?:Instruction|Fields|ConstantFields|ConstantResolver))\b",
         code + "\n" + final_code,
     )
     if leaked:
@@ -106,7 +107,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
 
     print(
         "PASS invocation-local materializer replay: "
-        f"overlay-slots=derived, stages=4, fields=opcode/A/B/C+lazy-constants+fused-operands, modes=4, opcode-leaves={opcode_ids}"
+        f"overlay-slots=derived, stages=4, fields=opcode/A/B/C+lazy-constants+fused-operands+fresh-table, modes=4, opcode-leaves={opcode_ids}"
     )
 
 

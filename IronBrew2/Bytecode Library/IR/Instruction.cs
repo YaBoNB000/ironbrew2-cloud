@@ -23,6 +23,7 @@ namespace IronBrew2.Bytecode_Library.IR
 		public int Data;
 		public int PC;
 		public int Line;
+		public bool FreshTableWrite;
 
 		public CustomInstructionData CustomData;
 
@@ -39,6 +40,7 @@ namespace IronBrew2.Bytecode_Library.IR
 			Data = other.Data;
 			PC = other.PC;
 			Line = other.Line;
+			FreshTableWrite = other.FreshTableWrite;
 		}
 
 		public Instruction(Chunk chunk, Opcode code, params object[] refOperands)

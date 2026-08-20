@@ -461,6 +461,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				}
 				if (writes.Count < 3)
 					continue;
+				foreach (Instruction write in writes) write.FreshTableWrite = true;
 				Instruction[] shuffled = writes.ToArray();
 				shuffled.Shuffle(random);
 				if (shuffled.SequenceEqual(writes))
@@ -505,7 +506,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			for (int index = 0; index < chunk.Instructions.Count; index++)
 			{
 				Instruction instruction = chunk.Instructions[index];
-				if (instruction.InstructionType == InstructionType.Data)
+				if (instruction.InstructionType == InstructionType.Data || instruction.FreshTableWrite)
 					Mark(index);
 
 				switch (instruction.OpCode)
@@ -1001,7 +1002,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
 				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
-				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched","HandlerReadStack","HandlerReadEnvironment","HandlerWriteStack","HandlerTableWrite","HandlerTableAcquireKey","HandlerTableAcquireValue","HandlerTableCommit","HandlerTableCommitA","HandlerTableCommitB","HandlerTableCommitC","HandlerTableCommitD","HandlerTableCommitMode","HandlerTableSlot","HandlerTableResult","HandlerTableTarget","HandlerTableKey","HandlerTableValue","HandlerTableMode","HandlerBinary","HandlerUnary","HandlerPc","HandlerFragmentIndex","HandlerFragmentValue","HandlerFragmentMode","HandlerFragmentLeft","HandlerFragmentRight","HandlerFragmentCurrent","HandlerFragmentTarget",
+				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched","HandlerReadStack","HandlerReadEnvironment","HandlerWriteStack","HandlerTableWrite","HandlerTableAcquireKey","HandlerTableAcquireValue","HandlerTableCommit","HandlerTableCommitA","HandlerTableCommitB","HandlerTableCommitC","HandlerTableCommitD","HandlerTableCommitMode","HandlerTableSlot","HandlerTableResult","HandlerTableFresh","HandlerTableDecoyKey","HandlerTableDecoyValue","HandlerTableTarget","HandlerTableKey","HandlerTableValue","HandlerTableMode","HandlerBinary","HandlerUnary","HandlerPc","HandlerFragmentIndex","HandlerFragmentValue","HandlerFragmentMode","HandlerFragmentLeft","HandlerFragmentRight","HandlerFragmentCurrent","HandlerFragmentTarget",
 				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetInfo","GuardInfo","GuardInspector",
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardEnvironmentRead","GuardGetGenV",
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
@@ -1014,8 +1015,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
 				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
 				"GuardBehaviorKey","GuardFirstKey","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential",
-				"AllowMaterializer","MaterializeIndexSlot","MaterializeOpcodeSlot","MaterializeASlot","MaterializeBSlot","MaterializeCSlot","MaterializeStageSlot","MaterializeConstantFieldsSlot","MaterializeConstantResolverSlot","MaterializeFusedSlot","MaterializeStage","MaterializeMode","MaterializeEnum","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction","MaterializedFields","MaterializedConstantFields","MaterializedConstantResolver",
-				"BindInstructionOperands","InstructionFields","InstructionConstantFields","InstructionConstantResolver","InstructionDecodedFields","InstructionDecodedValues","InstructionRemainingConstants","InstructionFieldKey","InstructionConstantIndex","FusedOperands","FusedValues","FusedWritten","FusedStack","FusedKey","FusedValue","FusedInstructionFields","FusedConstantFields","FusedInstruction","FusedDescriptor","FusedCount","FusedIndex","FusedType","FusedMask","FusedInstructionConstants","IsFused",
+				"AllowMaterializer","MaterializeIndexSlot","MaterializeOpcodeSlot","MaterializeASlot","MaterializeBSlot","MaterializeCSlot","MaterializeStageSlot","MaterializeConstantFieldsSlot","MaterializeConstantResolverSlot","MaterializeFusedSlot","MaterializeFreshTableSlot","MaterializeStage","MaterializeMode","MaterializeEnum","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction","MaterializedFields","MaterializedConstantFields","MaterializedConstantResolver",
+				"BindInstructionOperands","InstructionFields","InstructionConstantFields","InstructionConstantResolver","InstructionDecodedFields","InstructionDecodedValues","InstructionRemainingConstants","InstructionFieldKey","InstructionConstantIndex","FusedOperands","FusedValues","FusedWritten","FusedStack","FusedKey","FusedValue","FusedInstructionFields","FusedConstantFields","FusedInstruction","FusedDescriptor","FusedCount","FusedIndex","FusedType","FusedMask","FusedInstructionConstants","IsFused","IsFreshTableWrite",
 				"GuardEvidenceFold","GuardEvidenceA","GuardEvidenceB","GuardEvidenceC","GuardEvidenceD","GuardCompatibility","GuardAttested","GuardKeyA","GuardKeyB","GuardKeyC","GuardKeyD","GuardPayloadBinding","BinderRotate16","SeedByte","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
 				"GuardClassOK1","GuardClassOK2","GuardClassOK3","GuardClassOK4","GuardCompileOK","GuardConstantProbe","GuardConstants","GuardConstantsOK",
 				"GuardCurrentEnvOK","GuardCurrentEnvironment","GuardCurrentIdentity","GuardExpected","GuardGame","GuardGetConstants","GuardGetProto","GuardGetProtos",
@@ -1693,7 +1694,10 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				fragment.Append("else error('invalid protected payload',0);end;end;");
 				fragment.Append("local function HandlerTableWrite(HandlerTableMode,InstructionFields)")
 				        .Append("local HandlerTableTarget=HandlerReadStack(InstructionFields[2],").Append(ScrambleNumber(r.Next(2))).Append(");")
-				        .Append("local HandlerTableKey,HandlerTableValue,HandlerTableCommitMode;");
+				        .Append("local HandlerTableKey,HandlerTableValue,HandlerTableCommitMode;local HandlerTableFresh=InstructionFields[6];")
+				        .Append("local HandlerTableDecoyKey,HandlerTableDecoyValue;if HandlerTableFresh then HandlerTableDecoyKey={};HandlerTableDecoyValue=")
+				        .Append(ScrambleUInt(NewFragmentToken())).Append(";HandlerTableCommit(").Append(ScrambleUInt(_context.TableCommitTokens[r.Next(4)]))
+				        .Append(",HandlerTableTarget,HandlerTableDecoyKey,HandlerTableDecoyValue);end;");
 				for (int index = 0; index < _context.TableWriteTokens.Length; index++)
 				{
 					fragment.Append(index == 0 ? "if " : "elseif ").Append("HandlerTableMode==")
@@ -1704,7 +1708,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 						fragment.Append("HandlerTableKey=HandlerTableAcquireKey(HandlerTableMode,InstructionFields);HandlerTableValue=HandlerTableAcquireValue(HandlerTableMode,InstructionFields);");
 					fragment.Append("HandlerTableCommitMode=").Append(ScrambleUInt(tableCommitRoute[index])).Append(";");
 				}
-				fragment.Append("else error('invalid protected payload',0);end;return HandlerTableCommit(HandlerTableCommitMode,HandlerTableTarget,HandlerTableKey,HandlerTableValue);end;");
+				fragment.Append("else error('invalid protected payload',0);end;local HandlerTableResult=HandlerTableCommit(HandlerTableCommitMode,HandlerTableTarget,HandlerTableKey,HandlerTableValue);if HandlerTableFresh then HandlerTableCommit(HandlerTableCommitMode,HandlerTableTarget,HandlerTableDecoyKey,nil);end;return HandlerTableResult;end;");
 
 				fragment.Append("local function HandlerBinary(HandlerFragmentMode,HandlerFragmentLeft,HandlerFragmentRight)");
 				var binaryOrder = binaryOperators.OrderBy(_ => r.Next()).ToArray();
@@ -2399,7 +2403,8 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     end;
 
     local Descriptor = BitXOR(ColumnRead8(1), BlockFieldKey(EntryState, TargetIndex, 7, K1, K2, K3) % 256);
-    if Descriptor >= 128 then error('invalid protected payload', 0); end;
+    local IsFreshTableWrite = Descriptor >= 128;
+    if IsFreshTableWrite then Descriptor = Descriptor - 128; end;
     local IsFused = Descriptor >= 64;
     if IsFused then Descriptor = Descriptor - 64; end;
     local Inst;
@@ -2462,6 +2467,10 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
         Inst = {nil, nil, nil, nil};
     else
         error('invalid protected payload', 0);
+    end;
+    if IsFreshTableWrite then
+        if not Inst or gBit(Descriptor, 1, 1) ~= 0 then error('invalid protected payload', 0); end;
+        Inst[6] = true;
     end;
     for Role = 1, 5 do
         if type(Columns[Role]) ~= 'string' or ColumnPositions[Role] ~= #Columns[Role] + 1 then error('invalid protected payload', 0); end;
@@ -2546,6 +2555,7 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     local MaterializeConstantFieldsSlot = MaterializeIndexSlot + 628374;
     local MaterializeConstantResolverSlot = MaterializeIndexSlot + 733103;
     local MaterializeFusedSlot = MaterializeIndexSlot + 837832;
+    local MaterializeFreshTableSlot = MaterializeIndexSlot + 942561;
     local FlowCache = Flow[4];
     if AllowMaterializer and FlowCache and FlowCache[MaterializeIndexSlot] == Index then
         local MaterializeStage = FlowCache[MaterializeStageSlot];
@@ -2562,7 +2572,7 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         local MaterializedFields = {
             FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
             FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot],
-            FlowCache[MaterializeFusedSlot]
+            FlowCache[MaterializeFusedSlot], FlowCache[MaterializeFreshTableSlot]
         };
         local MaterializedConstantFields = FlowCache[MaterializeConstantFieldsSlot];
         local MaterializedConstantResolver = FlowCache[MaterializeConstantResolverSlot];
@@ -2571,8 +2581,8 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         FlowCache[MaterializeIndexSlot], FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
             FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot], FlowCache[MaterializeStageSlot],
             FlowCache[MaterializeConstantFieldsSlot], FlowCache[MaterializeConstantResolverSlot],
-            FlowCache[MaterializeFusedSlot] =
-            nil, nil, nil, nil, nil, nil, nil, nil, nil;
+            FlowCache[MaterializeFusedSlot], FlowCache[MaterializeFreshTableSlot] =
+            nil, nil, nil, nil, nil, nil, nil, nil, nil, nil;
         return MaterializedInstruction;
     end;
 
@@ -2646,6 +2656,7 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         FlowCache[MaterializeConstantFieldsSlot] = InstructionConstantFields;
         FlowCache[MaterializeConstantResolverSlot] = InstructionConstantResolver;
         FlowCache[MaterializeFusedSlot] = Inst[5];
+        FlowCache[MaterializeFreshTableSlot] = Inst[6];
         Inst = {};
         MaterializeEnum = SelectMaterializerEnum(Chunk, 0);
     else

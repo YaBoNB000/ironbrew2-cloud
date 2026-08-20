@@ -824,7 +824,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				int constantMask = (int)instruction.ConstantMask;
 				List<Instruction> fusedInstructions = instruction.CustomData?.FusedInstructions;
 				bool isFused = fusedInstructions is {Count: > 1};
-				descriptors.Add((byte)(((type << 1) | (constantMask << 3) | (isFused ? 64 : 0)) ^ descriptorMask));
+				descriptors.Add((byte)(((type << 1) | (constantMask << 3) | (isFused ? 64 : 0)
+					| (instruction.FreshTableWrite ? 128 : 0)) ^ descriptorMask));
 
 				ushort storedOpcode = (ushort)((ushort)opcode ^ OpcodeMask(pc, k1, k2, k3) ^
 				                               BlockFieldMask(entryState, pc, 0, k1, k2, k3) ^

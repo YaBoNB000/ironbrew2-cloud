@@ -42,16 +42,22 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     if len(commit_tokens) != 4 or len(set(commit_tokens)) < 3:
         raise ValueError(f"setter trampoline tokens are not build-random: {commit_tokens}")
 
-    writer = re.search(
-        rf"local\s+function\s+({IDENT})\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*\)"
-        rf"(?P<body>.*?)return\s+{re.escape(commit_name)}\s*\(.*?\)\s*;\s*end\s*;",
-        code[commit.end():],
-        re.S,
-    )
+    tail = code[commit.end():]
+    declarations = list(re.finditer(
+        rf"local\s+function\s+({IDENT})\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*\)",
+        tail,
+    ))
+    writer = None
+    body = ""
+    for index, declaration in enumerate(declarations):
+        end = declarations[index + 1].start() if index + 1 < len(declarations) else len(tail)
+        candidate_body = tail[declaration.end():end]
+        if len(re.findall(rf"\b{re.escape(commit_name)}\s*\(", candidate_body)) >= 2:
+            writer, body = declaration, candidate_body
+            break
     if not writer:
         raise ValueError("tokenized table writer was not found after its setter trampoline")
     writer_name, mode_name, fields_name = writer.group(1, 2, 3)
-    body = writer.group("body")
 
     acquisitions = re.findall(
         rf"({IDENT})\s*\(\s*{re.escape(mode_name)}\s*,\s*{re.escape(fields_name)}\s*\)",
