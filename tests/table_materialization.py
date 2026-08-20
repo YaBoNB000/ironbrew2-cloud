@@ -18,14 +18,29 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     source = vm_path.read_text("latin1")
     code = _code_only(source)
 
-    commit = re.search(
-        rf"local\s+function\s+({IDENT})\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)\s*"
-        rf"\2\s*\[\s*\3\s*\]\s*=\s*\4\s*;\s*return\s+\4\s*;\s*end\s*;",
+    dispatchers = []
+    for match in re.finditer(
+        rf"local\s+function\s+({IDENT})\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)"
+        rf"(?P<body>.*?)end\s*;",
         code,
-    )
-    if not commit:
-        raise ValueError("shared table commit fragment was not found")
+        re.S,
+    ):
+        leaves = re.findall(
+            rf"return\s+({IDENT})\s*\(\s*{re.escape(match.group(3))}\s*,\s*{re.escape(match.group(4))}\s*,\s*{re.escape(match.group(5))}\s*\)",
+            match.group("body"),
+        )
+        if len(leaves) == 4 and len(set(leaves)) == 4:
+            dispatchers.append((match, leaves))
+    if len(dispatchers) != 1:
+        raise ValueError(f"expected one four-way setter trampoline, found {len(dispatchers)}")
+    commit, commit_leaves = dispatchers[0]
     commit_name = commit.group(1)
+    commit_tokens = re.findall(
+        rf"(?:if|elseif)\s+{re.escape(commit.group(2))}\s*==\s*(\([^;]+?\))\s+then",
+        commit.group("body"),
+    )
+    if len(commit_tokens) != 4 or len(set(commit_tokens)) < 3:
+        raise ValueError(f"setter trampoline tokens are not build-random: {commit_tokens}")
 
     writer = re.search(
         rf"local\s+function\s+({IDENT})\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*\)"
@@ -34,7 +49,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
         re.S,
     )
     if not writer:
-        raise ValueError("tokenized table writer was not found after its commit fragment")
+        raise ValueError("tokenized table writer was not found after its setter trampoline")
     writer_name, mode_name, fields_name = writer.group(1, 2, 3)
     body = writer.group("body")
 
@@ -59,12 +74,12 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     context_source = (root / "IronBrew2/Obfuscator/ObfuscationContext.cs").read_text()
     if opcode_source.count("HandlerTableWrite(") != 4:
         raise ValueError("not all SETTABLE opcode variants use the shared writer")
-    if "TableWriteTokens" not in context_source:
-        raise ValueError("build context does not carry table-write operation tokens")
+    if "TableWriteTokens" not in context_source or "TableCommitTokens" not in context_source:
+        raise ValueError("build context does not carry table-write/setter operation tokens")
 
     final_code = _code_only(final_path.read_text("latin1")) if final_path else ""
     leaked = re.search(
-        r"\bHandlerTable(?:Write|AcquireKey|AcquireValue|Commit|Target|Key|Value|Mode)\b",
+        r"\bHandlerTable(?:Write|AcquireKey|AcquireValue|Commit[A-D]?|CommitMode|Slot|Result|Target|Key|Value|Mode)\b",
         code + "\n" + final_code,
     )
     if leaked:
@@ -72,7 +87,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
 
     print(
         "PASS table key/value materialization: "
-        f"writer-calls={call_count}, mode-tokens=4, acquisition-fragments=2, commit-fragment=1"
+        f"writer-calls={call_count}, mode-tokens=4, acquisition-fragments=2, setter-leaves=4, setter-tokens=4"
     )
 
 
