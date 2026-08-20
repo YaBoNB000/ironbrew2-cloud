@@ -256,4 +256,6 @@ for index = 1, 160 do
     checksum = (checksum + value) % 1000003
     if index == 160 then text = part end
 end
-print('phase4-runtime:' .. checksum .. ':' .. text)
+local test_output = 'phase4-runtime:' .. checksum .. ':' .. text
+print(test_output)
+return {__ib2_test_output = test_output}

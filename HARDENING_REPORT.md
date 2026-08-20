@@ -1,5 +1,50 @@
 # IronBrew2 加固实施报告
 
+> 更新（2026-08-19）：当前实现已升级到 v5 outer authenticator。下文的 v4
+> 章节保留为该轮实施历史；v5 删除了可从 polynomial outer tag 逐字节逆推
+> environment-derived stream seed 的 O(n) 反演关系；outer integrity key 也改为独立
+> transcript 派生，不再复用 envelope stream seed，并新增静态回归测试。
+>
+> 更新（2026-08-19，runtime materializer 第一阶段）：每个顶层取指会先把已认证的
+> 真实 instruction 放入 prototype-keyed、invocation-local Flow overlay，分派四种由
+> prototype keys 选择的 synthetic materializer handler 之一，回退 PC/Flow 后在同一
+> PC replay 时才交付真实 instruction。CLOSURE/SuperOperator 的内部取指保持直接路径。
+>
+> 更新（2026-08-19，静态攻击 M0）：新增 `tests/static_attack_baseline.py`，只读取
+> 最终 Lua 并量化当前静态恢复链。现阶段预期攻击成功：可恢复 carrier、binding、
+> 完整 body、prototype/block、常量 capsule、`"print"`/`"idk"` 和 canonical opcode IDs。
+> 该结果作为后续 M1–M5 的攻击回归基线，不作为当前防护能力声明。
+>
+> 更新（2026-08-19，M2/M3/M4/M5 第一批）：Base91 carrier 改为递归增量消费，
+> decoded ciphertext 以 2 KiB chunks 保存并通过 accessor 读取；instruction columns
+> 增加四套 prototype-local decoder family；materializer overlay 拆成 header/tail 并
+> 经过两阶段 replay；handler 写回增加六种 lowering，并随机混用 RawGet/RawSet。
+> 最终文件攻击器已同步适配，仍可恢复完整常量与 canonical opcode，说明这些改动
+> 提高工作量但尚未打断静态闭环。
+>
+> 更新（2026-08-19，M1 第一批）：环境绑定 KDF 改为四个并行 32-bit words，
+> envelope seed、outer-integrity key 与 payload/chunk/instruction state binding 使用
+> 不同 fold；payload state 不再直接等于 `GuardAttestation`。最终 token literal 和
+> 集中式 equality 与 `GuardAttestation` 变量已删除；局部 compatibility value 只用于
+> 立即生成 `GuardEvidenceA..D`，随后清零。Guard seal 使用不可反推四字内容的 fold，
+> payload KDF 直接消费四字 evidence。最终文件攻击器仍可模拟公开 transcript/offset
+> 并恢复全部 words，因此这是客户端成本放大而非秘密。
+>
+> 更新（2026-08-19，内部 MAC 第一批）：constant capsule tag 已替换为 keyed
+> two-lane cross-coupled authenticator，移除该边界的 polynomial `hash*31+byte`。
+> 完整 prototype-slice、block manifest 与 instruction record digest 随后也完成
+> two-lane keyed 迁移；Payload 内部主要认证边界已不再使用 polynomial
+> `hash*31+byte`。当前 wire tag 仍压缩为 32-bit。
+>
+> 更新（2026-08-19，prototype-local runtime ABI）：Chunk/Block 构造器改为
+> prototype-local proxy；现有 build-wide slot permutation 作为逻辑 ABI，proxy 再将
+> 访问映射到 K1/K2/K3 与 prototype/block metadata 派生的独立 storage layout。
+> 父子 prototypes 及同 prototype 的不同 blocks 不再共享一套实际数字槽位。
+>
+> 更新（2026-08-19，字段级 materializer）：Flow overlay 从 header/tail 两组扩展为
+> opcode/A/B/C 独立槽位；顶层 instruction 必须经过四个 synthetic materializer
+> stage 和四次同-PC replay 才会组装为 handler input。constant capsule 会继续保持 opaque，直到真实 handler 第一次读取对应 operand 字段。
+
 日期：2026-08-15  
 本轮 executor-only 扩展基线：`main` / `07cf9d3`（block-local columnar IR）
 
@@ -7,7 +52,7 @@
 
 本轮没有复制或声称复刻 Luraph 的私有实现。实际采用的是可独立实现的通用架构思路：分层恢复、按 prototype 变化、位置相关的指令编码、常量二次编码、完整性耦合和 VM 生成多态。
 
-底层语义与 Lua 5.1 bytecode 前端继续保持稳定；本轮运行时防护优先面向 Luau/Roblox。仓库中已知不稳定的 Mutation、SuperOperator、源码字符串解密闭包及会污染全局环境的激进 API hook 没有在固定配置中重新启用。
+底层语义与 Lua 5.1 bytecode 前端继续保持稳定；本轮运行时防护优先面向 Luau/Roblox。Mutation、源码字符串解密闭包及其他激进 API hook 仍保持关闭；按明确配置仅在成功路径永久把 thread/_G/getgenv 的 print/error/warn 设为同一 no-op。 最终 `GetFEnv` 采用受保护调用并在 nil/非 table 时回退到启动期捕获的 `PrimitiveEnvironment`，避免 executor 调用层级差异导致 `RawGet(nil, ...)`。SuperOperator 已替换为带安全边界的 IR-native physical fusion。
 
 ## 2. 已完成的源码改动
 
@@ -108,7 +153,7 @@
 - runtime 拒绝物理 page 越界、重复/缺失角色、descriptor 高位、非 `1` 的 data-word descriptor，以及任一逻辑列未精确耗尽；column permutation、page/cursor/reader 等局部标识符继续参与每次构建的名称随机化。
 - Python v4 verifier 与 C#/Lua 使用对称派生和 mask 公式，递归验证每个 block 的非 identity role map、五页 framing、descriptor 与预期列长度。测试还会在重算 block/prototype/outer 全部认证后分别破坏 page framing 和 descriptor-driven consumption，两种样本仍必须由 VM 拒绝。
 
-该层提高依赖稳定 row schema 的静态批量解析和 AI 模式匹配成本，但运行时最终仍会重建 canonical instruction；它不是 IR-native superoperator，也不宣称阻止对 `DecodeInstructionBlock` 或 handler 的动态采集。
+该层提高依赖稳定 row schema 的静态批量解析和 AI 模式匹配成本，但运行时最终仍会重建 canonical instruction；后续 M5 已加入 IR-native superoperator；本层仍不宣称阻止对 `DecodeInstructionBlock` 或 handler 的动态采集。
 
 ### 2.9 运行时槽位 ABI 随机化
 
@@ -173,7 +218,8 @@ CLI、Windows 拖放脚本和 GitHub Actions 均取消强度档位，统一使�
 | DEFLATE | 开 |
 | AntiDump（hard-AND executor attestation / sticky non-returning O(1) sink / invocation-local 指令缓存） | 开 |
 | EnvironmentLock（attestation token → payload/flow binding） | 开 |
-| Mutation / SuperOperator / 源码字符串转换 | 关 |
+| Mutation / 源码字符串转换 | 关 |
+| bounded IR-native SuperOperator（combined descriptor / physical lowering） | 开 |
 | AggressiveDefense / Noise | 关 |
 
 CLI 只接受 `<input.lua>` 和可选的 `--line-info`；旧 `--strength` 与旧覆盖开关会作为未知参数拒绝。`ObfuscationSettings` 构造器默认值也已同步启用 AntiDump + EnvironmentLock，避免非 CLI 调用回退到普通 Lua 可执行路径。
@@ -226,7 +272,7 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | guard 启动、root 反序列化后、首块进入前与 jittered dispatch 四阶段调用 | 通过 |
 | attestation-derived outer seed、flow/integrity/route binding 的静态递归恢复 | 通过 |
 | 新增 guard 局部名随机化，最终输出无稳定 `Guard*` 标识符 | 通过 |
-| executor global/capability provider 不被修改 | 通过 |
+| thread / `_G` / `getgenv()` 的 `print`、`error`、`warn` 永久同一 no-op；其他 provider 不修改 | 通过 |
 | block body、完整 manifest、初始 state、dispatcher state、缺失 edge、wrapped edge state 的反序列化后篡改 | 通过，均拒绝 |
 | 分支/循环/递归/table constructor 与块级常量引用 | 通过 |
 | `SETLIST C==0` 后继 data word（测试侧 patch Lua 5.1 chunk） | 通过 |
@@ -234,7 +280,7 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 | for/while/repeat/branch/recursion | 通过 |
 | vararg 与多返回值 | 通过 |
 | table 与全局调用 | 通过 |
-| nested line-info 错误定位 | 通过，包含原始 line 4 |
+| payload `error()` 抑制；VM 私有 line-info runtime fault 定位 | 通过，payload error 为 no-op，私有错误路径包含原始 line 3 |
 | signed 32-bit `bit.bxor` 模拟 | 通过 |
 | payload 单字符篡改 | 通过，解密前拒绝 |
 | 生成源码字符串字面量扫描 | 通过 |
@@ -274,9 +320,9 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 4. CFG state 是客户端执行一致性与反静态批量恢复机制，不是不可伪造的 CFI 信任根。修改 VM、跳过 verifier，或在每个临时块进入 handler 前主动收集，仍可绕过本地保护。
 5. 当前每个 block 使用一个固定 entry state；多前驱通过不同 wrapped edge 恢复同一目标状态。尚未实现按 predecessor 产生多版本 block 或动态 state merge。
 6. 自动 dispatcher 已按 prototype 启用，但它复用随机物理 block 和 VM route token，不是把原 Lua 指令复制成多版本 block；客户端仍可在 route 解析后观测真实 PC。
-7. Mutation/SuperOperator 没有被本轮宣告为稳定；IR-native superoperator 及更大差分语料仍是后续工作，固定配置继续关闭它们。
+7. Mutation 仍关闭；IR-native superoperator 已启用并覆盖 CFG、CLOSURE/CLOSE、SETLIST/data word 与 variable-return 安全边界，10-build/CI 随机语义矩阵验证 physical lowering。
 8. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持；“Luau/Roblox 优先”目前仅指 capability-gated 运行时防护。
 9. 活动合法调试 hook 会进入无限静默 sink。准入是 hard-AND，因此缺失某项 inspector 或行为差异的真实执行器也会被拒绝；本实现不承诺覆盖所有定制执行器或零误报。恶意宿主若一致伪造 closure/debug/provenance/host 全部契约，客户端无法从根本上区分。
 10. CI 已覆盖 Linux 完整语义回归和 Linux/Windows/macOS Release publish；自动测试已验证 64–96 KiB 随机区及 basE91 前的载荷范围，但尚未在 Windows/macOS 上运行 Lua 语义套件，也尚未完成大程序下 envelope 解码时间、峰值内存和最终文本体积基准。
 
-后续工作按 `HARDENING_PLAN.md` 的剩余候选继续：IR-native superoperator、Luau 原生前端，以及性能、内存和体积基准。
+后续非性能候选主要是 Luau 原生前端与更强的 block-local dialect。体积/性能优化按当前需求不实施。

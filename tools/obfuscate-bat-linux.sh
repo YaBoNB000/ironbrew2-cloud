@@ -82,6 +82,36 @@ for input in "$@"; do
         failed=1
         continue
     fi
+
+    luac_bin="${LUAC_BIN:-$(command -v luac5.1 || command -v luac || true)}"
+    if [[ -z "$luac_bin" ]] || ! "$luac_bin" -v 2>&1 | grep -q 'Lua 5\.1'; then
+        printf '[FAILED] native Lua 5.1 luac is required for syntax validation.\n' >&2
+        failed=1
+        continue
+    fi
+    if ! "$luac_bin" -p "$output"; then
+        printf '[FAILED] Lua 5.1 syntax validation failed: %s\n' "$output" >&2
+        failed=1
+        continue
+    fi
+    printf '%s\n' '[CHECK] Lua 5.1 syntax OK'
+
+    luau_bin="${LUAU_COMPILE_BIN:-$(command -v luau-compile || true)}"
+    if [[ -z "$luau_bin" ]]; then
+        if [[ -n "${IB2_REQUIRE_LUAU_VALIDATION:-}" ]]; then
+            printf '%s\n' '[FAILED] luau-compile not found while Luau validation is required.' >&2
+            failed=1
+            continue
+        fi
+        printf '%s\n' '[WARN] luau-compile not found; skipped Luau syntax validation.'
+    elif ! "$luau_bin" "$output" >/dev/null; then
+        printf '[FAILED] Luau syntax validation failed: %s\n' "$output" >&2
+        failed=1
+        continue
+    else
+        printf '%s\n' '[CHECK] Luau syntax OK'
+    fi
+
     printf '[OK] output: %s\n' "$output"
 done
 
