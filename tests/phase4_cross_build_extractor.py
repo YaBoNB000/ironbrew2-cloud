@@ -35,11 +35,13 @@ def frozen_payload_recognized(source: str, domains, layout) -> tuple[bool, str]:
         if offset != 9:
             raise ValueError("outer-width")
         flags = values["flags"]
-        if flags >> 4 != 4 or flags & 0x0F not in (14, 15):
+        if flags >> 4 != 5 or flags & 0x0F not in (14, 15):
             raise ValueError("version/features")
         encrypted = raw[offset:]
-        seed = payload.recover_outer_seed(values["integrity"], flags, encrypted)
-        integrity = payload.hash_bytes(((seed ^ payload.INTEGRITY_DOMAIN) * 31 + flags) & MASK32, encrypted)
+        _attestation, seed, integrity_key = payload.recover_attestation_binding(
+            source, values["head"], flags, encrypted, values["integrity"], layout
+        )
+        integrity = payload.outer_integrity(encrypted, integrity_key, flags)
         if seed == 0 or integrity != values["integrity"]:
             raise ValueError("outer-authentication")
         envelope = payload.payload_stream_xor(encrypted, seed)

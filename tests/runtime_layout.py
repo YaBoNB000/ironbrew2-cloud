@@ -101,34 +101,34 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     domains = extract_build_domains(source)
     source = _code_only(source)
 
-    # Deserialize begins with three local storage tables and the Chunk table,
-    # followed by keyed assignments for Instructions, Functions and Lines.
+    # Deserialize reads prototype keys before creating a prototype-local proxy.
+    # The proxy transparently maps the build-wide numeric ABI used by generated
+    # code into a second K1/K2/K3-derived storage permutation.
     init = _expect(
         rf"local\s+({IDENT})\s*=\s*\{{\}};\s*"
         rf"local\s+({IDENT})\s*=\s*\{{\}};\s*"
         rf"local\s+({IDENT})\s*=\s*\{{\}};\s*"
-        rf"local\s+({IDENT})\s*=\s*\{{\}};\s*"
-        rf"\4\[(\d+)\]\s*=\s*\1;\s*"
-        rf"\4\[(\d+)\]\s*=\s*\2;\s*"
-        rf"\4\[(\d+)\]\s*=\s*\3;",
-        source,
-        "could not recover keyed Chunk initialization",
-    )
-    instrs, functions, lines, chunk = init.group(1, 2, 3, 4)
-    chunk_map: dict[int, int] = {1: int(init.group(5)), 2: int(init.group(6)), 4: int(init.group(7))}
-
-    # Prototype keys are the first three 16-bit reads after initialization.
-    key_match = _expect(
         rf"local\s+({IDENT})\s*=\s*({IDENT})\(\);\s*"
-        rf"local\s+({IDENT})\s*=\s*\2\(\);\s*"
-        rf"local\s+({IDENT})\s*=\s*\2\(\);.*?"
+        rf"local\s+({IDENT})\s*=\s*\5\(\);\s*"
+        rf"local\s+({IDENT})\s*=\s*\5\(\);\s*"
+        rf"local\s+{IDENT}\s*=\s*{IDENT}\(\);\s*"
+        rf"local\s+({IDENT})\s*=\s*{IDENT}\(\s*16\s*,\s*\4\s*,\s*\6\s*,\s*\7\s*,[^;]+\);\s*"
+        rf"\8\[(\d+)\]\s*=\s*\1;\s*"
+        rf"\8\[(\d+)\]\s*=\s*\2;\s*"
+        rf"\8\[(\d+)\]\s*=\s*\3;",
+        source,
+        "could not recover prototype-local Chunk initialization",
+    )
+    instrs, functions, lines = init.group(1, 2, 3)
+    k1, k2, k3, chunk = init.group(4, 6, 7, 8)
+    chunk_map: dict[int, int] = {1: int(init.group(9)), 2: int(init.group(10)), 4: int(init.group(11))}
+    key_match = _expect(
         rf"{re.escape(chunk)}\[(\d+)\]\s*,\s*{re.escape(chunk)}\[(\d+)\]\s*,\s*{re.escape(chunk)}\[(\d+)\]"
-        rf"\s*=\s*\1\s*,\s*\3\s*,\s*\4;",
+        rf"\s*=\s*{re.escape(k1)}\s*,\s*{re.escape(k2)}\s*,\s*{re.escape(k3)};",
         source[init.end():],
         "could not recover Chunk key slots",
-        re.S,
     )
-    chunk_map.update({5: int(key_match.group(5)), 6: int(key_match.group(6)), 7: int(key_match.group(7))})
+    chunk_map.update({5: int(key_match.group(1)), 6: int(key_match.group(2)), 7: int(key_match.group(3))})
 
     # The opcode bank assignment is tied to this build's recovered derivation domain.
     opcode = _expect(
@@ -191,13 +191,15 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         raise ValueError("could not infer the remaining Chunk parameter slot")
     chunk_map[3] = remaining_new.pop()
 
-    # Block is built by ten explicit keyed assignments in semantic order.
+    # Block is a prototype-local proxy followed by ten build-ABI assignments in
+    # semantic order. The proxy applies a second K1/K2/K3-derived permutation.
     block_match = _expect(
-        rf"local\s+({IDENT})\s*=\s*\{{\}};\s*"
+        rf"local\s+({IDENT})\s*=\s*{IDENT}\(\s*10\s*,[^;]+\);\s*"
         + "".join(rf"\1\[(\d+)\]\s*=\s*[^;]+;\s*" for _ in range(10))
         + rf"{re.escape(blocks)}\s*\[[^\]]+\]\s*=\s*\1;",
         source,
-        "could not recover keyed Block constructor",
+        "could not recover prototype-local Block constructor",
+        re.S,
     )
     block_name = block_match.group(1)
     block_map_slots = {index: int(block_match.group(index + 1)) for index in range(1, 11)}
@@ -804,6 +806,7 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
             "FlowAccessor": flow_accessor,
             "FlowCache": flow_cache_name,
             "Wrap": wrap_name,
+            "Root": root_name,
             "DispatchState": dispatch_state,
             "DispatchLane": dispatch_lane,
             **aliases,

@@ -71,7 +71,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			_stream.Read(bytes, 0, size);
 
 			if (factorEndianness && (_bigEndian == BitConverter.IsLittleEndian)) //if factor in endianness AND endianness differs between the two versions
-				bytes = bytes.Reverse().ToArray();	
+				Array.Reverse(bytes);
 			
 			return bytes;
 		}

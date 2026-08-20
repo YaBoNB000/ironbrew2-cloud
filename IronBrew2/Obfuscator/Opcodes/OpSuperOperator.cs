@@ -35,13 +35,20 @@ namespace IronBrew2.Obfuscator.Opcodes
 
 		public override string GetObfuscated(ObfuscationContext context)
 		{
-			string s = "";
+			string s = "local FusedOperands=Inst[5];" +
+				"local FusedValues,FusedWritten={},{};" +
+				"local FusedStack=Setmetatable({},{" +
+				"__index=function(_,FusedKey)local FusedValue=RawGet(Stk,FusedKey);" +
+				"if FusedWritten[FusedKey] and RawEqual(FusedValue,FusedValues[FusedKey]) then return FusedValues[FusedKey];end;" +
+				"FusedWritten[FusedKey],FusedValues[FusedKey]=true,FusedValue;return FusedValue;end," +
+				"__newindex=function(_,FusedKey,FusedValue)FusedWritten[FusedKey],FusedValues[FusedKey]=true,FusedValue;" +
+				"RawSet(Stk,FusedKey,FusedValue);end});";
 			List<string> locals = new List<string>();
 			
 			for (var index = 0; index < SubOpcodes.Length; index++)
 			{
 				var subOpcode = SubOpcodes[index];
-				string s2 = subOpcode.GetObfuscated(context);
+				string s2 = Regex.Replace(subOpcode.GetObfuscated(context), @"\bStk\b", "FusedStack");
 				
 				Regex reg = new Regex("local(.*?)[;=]");
 				foreach (Match m in reg.Matches(s2))
@@ -59,7 +66,7 @@ namespace IronBrew2.Obfuscator.Opcodes
 				s += s2;
 
 				if (index + 1 < SubOpcodes.Length)
-					s += "InstrPoint = InstrPoint + 1;Inst = GetInstruction(Chunk, InstrPoint, Flow);";
+					s += "Inst=FusedOperands[" + (index + 1) + "];";
 			}
 
 			foreach (string l in locals)

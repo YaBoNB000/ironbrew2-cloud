@@ -54,8 +54,7 @@ def extract_build_domains(source: str) -> BuildDomains:
     integrity = _one(
         source,
         rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)"
-        rf"\s*\*\s*31\s*\+\s*{ident}\s*\)\s*%\s*4294967296\s*;\s*"
-        rf"for\s+{ident}\s*=\s*10\s*,\s*#{ident}",
+        rf"\s*\+\s*2781082087\s*\+\s*{ident}\s*\*\s*257\s*\)\s*%\s*4294967296",
         "payload integrity domain",
     )
     envelope_integrity = _one(
@@ -125,8 +124,8 @@ def extract_build_domains(source: str) -> BuildDomains:
     )
     instruction_state = _one(
         source,
-        rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*(\d+)\s*,\s*{ident}\s*\)\s*\*\s*31\s*\+\s*{ident}\s*\)"
-        rf"\s*%\s*4294967296\s*;\s*{ident}\s*=\s*\(\s*{ident}\s*\*\s*31\s*\+\s*{ident}",
+        rf"local\s+function\s+{ident}\s*\(\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*\)"
+        rf"\s*local\s+{ident}\s*=\s*(\d+)\s*;\s*local\s+{ident}\s*=\s*\(\s*{ident}\s*\*\s*65537",
         "instruction-state domain",
     )
     opcode_state = _one(
@@ -137,21 +136,21 @@ def extract_build_domains(source: str) -> BuildDomains:
     )
     constant_integrity = _one(
         source,
-        rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)\s*,\s*{ident}\s*\)\s*,\s*{ident}\s*\)"
-        rf"\s*\*\s*31\s*\+\s*{ident}\s*\)\s*%\s*4294967296\s*;\s*{ident}\s*=\s*\(\s*{ident}\s*\*\s*31\s*\+\s*{ident}\s*\)"
-        rf"\s*%\s*4294967296\s*;\s*{ident}\s*=\s*\(\s*{ident}\s*\*\s*31\s*\+\s*#{ident}",
+        rf"local\s+{ident}\s*=\s*{ident}\(\s*{ident}\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)\s*,\s*{ident}\s*\)\s*,\s*{ident}\(\s*{ident}\s*\)\s*\)"
+        rf"\s*%\s*4294967296\s*;.*?local\s+function\s+{ident}\s*\(\s*{ident}\s*\).*?"
+        rf"\*\s*65599\s*\+\s*2654435769",
         "constant integrity domain",
     )
     prototype_integrity = _one(
         source,
-        rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)\s*\*\s*31"
-        rf"\s*\+\s*{ident}\s*\)\s*%\s*4294967296\s*;\s*local\s+{ident}\s*=\s*\{{\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*\}}",
+        rf"{ident}\s*=\s*{ident}\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)\s*,\s*{ident}\s*\)"
+        rf"\s*%\s*4294967296\s*;\s*{ident}\s*=\s*{ident}\(",
         "prototype integrity domain",
     )
     block_integrity = _one(
         source,
-        rf"local\s+{ident}\s*=\s*\(\s*{ident}\(\s*{ident}\(\s*{ident}\s*,\s*(\d+)\s*\)\s*,\s*{ident}\s*\)"
-        rf"\s*\*\s*31\s*\+\s*{ident}\s*\)\s*%\s*4294967296",
+        rf"local\s+function\s+{ident}\s*\(\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*,\s*{ident}\s*\)"
+        rf"\s*local\s+{ident}\s*=\s*(\d+)\s*;\s*local\s+{ident}\s*=\s*\(\s*{ident}\s*\*\s*65537",
         "block integrity domain",
     )
 
