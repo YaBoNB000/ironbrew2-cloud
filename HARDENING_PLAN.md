@@ -8,8 +8,8 @@
 - [x] M1：最终 token literal、集中式 equality 与长生命周期 `GuardAttestation` 已删除；行为 transcript 仅在局部作用域经 Build-local offset 形成一次性 compatibility value，立即扩展为 `GuardEvidenceA..D` 后清零。payload KDF 再结合 salt 将四字 evidence 折叠为独立 envelope seed、outer-integrity key 与 `GuardPayloadBinding`；chunk/instruction/opcode/flow state 只使用后者。全部逻辑仍在客户端，静态模拟器仍可重算 evidence。
 - [~] M2：已完成递归增量 Base91 segment 消费、禁止大型 segment 直接拼接，并将 decoded ciphertext 改为 2 KiB chunks + chunk-aware byte accessor；尚未做到 page 消费后立即释放全部早期 ciphertext chunks。
 - [x] M3：已完成 4 套 prototype-key-derived instruction-column decoder family（XOR、reverse/add、nibble/XOR、reverse/rotate/add）；Chunk 与 Block 现在都是 prototype-local proxy，build-wide ABI 之下再叠加 K1/K2/K3、prototype length 或 block start/verifier 派生的独立 storage permutation。同一构建内父子 prototype 与不同 blocks 不再共享单一实际槽位布局。
-- [~] M4：invocation-local overlay 已拆为独立 opcode/A/B/C 槽位，并经过四阶段 synthetic materializer 与四次 PC replay 后才组装 handler instruction；serializer 初始 record 仍可由完整静态模拟器重组，constant 按使用点 materialization 与 wire-level 字段拆分仍待实施。
-- [~] M5：已增加 6 种 register write lowering、RawGet/RawSet stack/global access 变体并保留 continuation fragments/短 fusion；完整 handler fragment sharing 与 IR-native fusion 仍待实施。
+- [x] M4：invocation-local overlay 已拆为独立 opcode/A/B/C、lazy constant metadata 与 fused operand 槽位；四阶段 synthetic materializer/四次 PC replay 后才建立 operand proxy，constant capsule 仅在实际 handler 字段读取时恢复，并用显式 decoded flag 正确缓存 nil。
+- [x] M5：6 种 register write lowering、RawGet/RawSet stack/global access、共享 operand/operation/writeback/PC fragments 与 IR-native physical fusion 已完成；fusion 使用 combined descriptor 与跨成员 register proxy/dataflow，且不再逐成员调用 `GetInstruction`。
 - [x] M6：constant capsule、完整 prototype-slice、block manifest 与 instruction record digest 已全部从 `hash*31+byte` 迁移为 keyed two-lane cross-coupled authenticator；各层分别绑定 prototype keys、entry/chunk state、PC/manifest metadata。wire tag 目前仍压缩为 32-bit，本阶段完成算法迁移，后续可独立扩展 tag 宽度。
 
 攻击基线与阶段验收见 [`docs/static-attack-baseline.md`](docs/static-attack-baseline.md)。该测试当前预期攻击成功；后续每个 milestone 必须先更新攻击器以适应公开 runtime，再以恢复率下降作为验收，而不是把 parser 失效误报成防护成功。
@@ -72,9 +72,9 @@
 - [x] 每条合法 edge 包装目标块状态；每次 closure invocation 使用独立 `Flow`，块内只允许顺序取指，跨块只允许已认证的目标块入口。
 - [x] 正确建模循环、自环、多前驱、comparison/Test/TForLoop companion JMP、`FORPREP` 优化、`LOADBOOL` skip、`SETLIST C==0` data word、Closure 伪指令和终止路径。
 - [x] 每个 opaque block 从 body 解码前以入口状态、块范围、prototype keys 和 body 内容做完整性认证；AntiDump 模式下重入会再次认证。
-- [ ] superoperator 基于 IR 生成并做语义验证，不用 handler 源码正则作为主实现。
+- [x] superoperator 在 IR instruction sequence 上规划并由 serializer 物理降为单一 record；supplemental member operands/constants 使用 combined descriptor，handler 不再拼接逐 PC 取指。
 
-当前验收：v4 指令不能只按 PC 独立解码；缺失 edge、被修改的初始/边状态、dispatcher state、错误目标入口、block body 或完整 block manifest 篡改都会以 `invalid protected payload` 拒绝。CFG 结构测试覆盖循环/自环、comparison companion、FORPREP/FORLOOP、skip-next、data word 和 24 条分页；运行测试覆盖无 marker 自动命中、单块及畸形 prototype 安全回退、递归 invocation、跨块 Closure 伪指令与合法多分支执行。自动 dispatcher flattening 已完成，IR-native superoperator 仍是后续独立项目。
+当前验收：v4 指令不能只按 PC 独立解码；缺失 edge、被修改的初始/边状态、dispatcher state、错误目标入口、block body 或完整 block manifest 篡改都会以 `invalid protected payload` 拒绝。CFG 结构测试覆盖循环/自环、comparison companion、FORPREP/FORLOOP、skip-next、data word 和 24 条分页；运行测试覆盖无 marker 自动命中、单块及畸形 prototype 安全回退、递归 invocation、跨块 Closure 伪指令与合法多分支执行。自动 dispatcher flattening 与 IR-native superoperator 均已完成；随机矩阵会比较 physical/logical instruction 数并验证语义。
 
 ### Phase 3.25：认证且状态耦合的高熵 envelope（已完成）
 
@@ -107,7 +107,7 @@
 - [x] parser 严格拒绝 page 越界、重复/缺失角色、非法 descriptor、dummy descriptor 异常及任一列未精确耗尽；新增 helper/page/cursor 标识符全部进入 build-local 名称随机化。
 - [x] 静态 verifier 递归验证所有 block 的排列、framing、descriptor 与精确列长度；重算所有认证后破坏 column framing 或 descriptor consumption 的样本仍由 VM 拒绝。
 
-当前验收：同一 prototype 内各 block 按独立 entry state 派生列角色，稳定 row schema 解析器不再适用；运行语义仍由 canonical handler 执行。IR-native superoperator、完整 block-local opcode dialect 与受限 self-modifying IR 不并入本阶段。
+当前验收：同一 prototype 内各 block 按独立 entry state 派生列角色，稳定 row schema 解析器不再适用；运行语义仍由 canonical handler 执行。IR-native superoperator 已在后续 M5 完成；完整 block-local opcode dialect 与受限 self-modifying IR 不并入本阶段。
 
 ### Phase 3.5：strict executor-only 反调试与防 dump（已完成）
 

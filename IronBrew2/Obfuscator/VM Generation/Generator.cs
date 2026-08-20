@@ -457,8 +457,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				switch (instruction.OpCode)
 				{
 					case Opcode.Closure:
+					case Opcode.Close:
 						Mark(index);
-						if (instruction.RefOperands.Length > 0 && instruction.RefOperands[0] is Chunk child)
+						if (instruction.OpCode == Opcode.Closure && instruction.RefOperands.Length > 0 && instruction.RefOperands[0] is Chunk child)
 							for (int binding = 1; binding <= child.UpvalueCount; binding++) Mark(index + binding);
 						break;
 					case Opcode.Eq:
@@ -483,6 +484,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 						Mark(index + 1);
 						Mark(index + instruction.B + 1);
 						break;
+					case Opcode.Call:
+					case Opcode.PushStack:
+					case Opcode.VarArg when instruction.B == 0:
 					case Opcode.Return:
 					case Opcode.TailCall:
 						Mark(index);
@@ -583,10 +587,11 @@ namespace IronBrew2.Obfuscator.VM_Generation
 						for (int j = 0; j < targetCount; j++)
 						{
 							skip[c + j] = true;
-							chunk.Instructions[c + j].CustomData.WrittenOpcode = new OpSuperOperator {VIndex = 0};
+							chunk.Instructions[c + j].CustomData.FusionContinuation = j != 0;
 						}
 
 						chunk.Instructions[c].CustomData.WrittenOpcode = op;
+						chunk.Instructions[c].CustomData.FusedInstructions = taken;
 
 						used = true;
 						break;
@@ -868,7 +873,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			
 			if (settings.SuperOperators)
 			{
-				// Short fusions deliberately stay inside straight-line regions. The barrier
+				// IR-native fusions deliberately stay inside straight-line regions. The barrier
 				// map excludes every control-flow edge, CLOSURE binding word and SETLIST
 				// data word, while the small cap prevents giant recognizable handlers.
 				int folded = 0;
@@ -890,7 +895,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				}
 				string lengthProfile = string.Join(",", shortOperators.GroupBy(op => op.SubOpcodes.Length)
 					.OrderBy(group => group.Key).Select(group => group.Key + ":" + group.Count()));
-				Console.WriteLine("Created " + shortOperators.Count + " short super operators; folded " + folded
+				Console.WriteLine("Created " + shortOperators.Count + " IR-native super operators; folded " + folded
 					+ " sequences; lengths " + lengthProfile + "; structure " + structureSignature.ToString("x8") + ".");
 			}
 
@@ -950,8 +955,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
 				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
 				"GuardBehaviorKey","GuardFirstKey","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential",
-				"AllowMaterializer","MaterializeIndexSlot","MaterializeOpcodeSlot","MaterializeASlot","MaterializeBSlot","MaterializeCSlot","MaterializeStageSlot","MaterializeConstantFieldsSlot","MaterializeConstantResolverSlot","MaterializeStage","MaterializeMode","MaterializeEnum","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction","MaterializedFields","MaterializedConstantFields","MaterializedConstantResolver",
-				"BindInstructionOperands","InstructionFields","InstructionConstantFields","InstructionConstantResolver","InstructionDecodedFields","InstructionDecodedValues","InstructionRemainingConstants","InstructionFieldKey","InstructionConstantIndex",
+				"AllowMaterializer","MaterializeIndexSlot","MaterializeOpcodeSlot","MaterializeASlot","MaterializeBSlot","MaterializeCSlot","MaterializeStageSlot","MaterializeConstantFieldsSlot","MaterializeConstantResolverSlot","MaterializeFusedSlot","MaterializeStage","MaterializeMode","MaterializeEnum","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction","MaterializedFields","MaterializedConstantFields","MaterializedConstantResolver",
+				"BindInstructionOperands","InstructionFields","InstructionConstantFields","InstructionConstantResolver","InstructionDecodedFields","InstructionDecodedValues","InstructionRemainingConstants","InstructionFieldKey","InstructionConstantIndex","FusedOperands","FusedValues","FusedWritten","FusedStack","FusedKey","FusedValue","FusedInstructionFields","FusedConstantFields","FusedInstruction","FusedDescriptor","FusedCount","FusedIndex","FusedType","FusedMask","FusedInstructionConstants","IsFused",
 				"GuardEvidenceFold","GuardEvidenceA","GuardEvidenceB","GuardEvidenceC","GuardEvidenceD","GuardCompatibility","GuardAttested","GuardKeyA","GuardKeyB","GuardKeyC","GuardKeyD","GuardPayloadBinding","BinderRotate16","SeedByte","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
 				"GuardClassOK1","GuardClassOK2","GuardClassOK3","GuardClassOK4","GuardCompileOK","GuardConstantProbe","GuardConstants","GuardConstantsOK",
 				"GuardCurrentEnvOK","GuardCurrentEnvironment","GuardCurrentIdentity","GuardExpected","GuardGame","GuardGetConstants","GuardGetProto","GuardGetProtos",
@@ -2252,7 +2257,9 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     end;
 
     local Descriptor = BitXOR(ColumnRead8(1), BlockFieldKey(EntryState, TargetIndex, 7, K1, K2, K3) % 256);
-    if Descriptor >= 64 then error('invalid protected payload', 0); end;
+    if Descriptor >= 128 then error('invalid protected payload', 0); end;
+    local IsFused = Descriptor >= 64;
+    if IsFused then Descriptor = Descriptor - 64; end;
     local Inst;
     local InstructionConstantFields = {};
     if (gBit(Descriptor, 1, 1) == 0) then
@@ -2281,6 +2288,34 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
         if gBit(Mask, 1, 1) == 1 then InstructionConstantFields[OP_A] = Inst[OP_A]; end;
         if gBit(Mask, 2, 2) == 1 then InstructionConstantFields[OP_B] = Inst[OP_B]; end;
         if gBit(Mask, 3, 3) == 1 then InstructionConstantFields[OP_C] = Inst[OP_C]; end;
+
+        if IsFused then
+            local FusedCount = ColumnRead8(1);
+            if FusedCount < 1 or FusedCount > 5 then error('invalid protected payload', 0); end;
+            local FusedInstructionFields, FusedConstantFields = {}, {};
+            for FusedIndex = 1, FusedCount do
+                local FusedDescriptor = ColumnRead8(1);
+                if FusedDescriptor >= 64 or gBit(FusedDescriptor, 1, 1) ~= 0 then error('invalid protected payload', 0); end;
+                local FusedType = gBit(FusedDescriptor, 2, 3);
+                local FusedMask = gBit(FusedDescriptor, 4, 6);
+                local FusedInstruction = {nil, ColumnRead16(3), nil, nil};
+                if FusedType == 0 then
+                    FusedInstruction[OP_B], FusedInstruction[OP_C] = ColumnRead16(4), ColumnRead16(5);
+                elseif FusedType == 1 then
+                    FusedInstruction[OP_B] = ColumnRead32(4);
+                elseif FusedType == 2 then
+                    FusedInstruction[OP_B] = ColumnRead32(4) - (2 ^ 16);
+                elseif FusedType == 3 then
+                    FusedInstruction[OP_B], FusedInstruction[OP_C] = ColumnRead32(4) - (2 ^ 16), ColumnRead16(5);
+                end;
+                local FusedInstructionConstants = {};
+                if gBit(FusedMask, 1, 1) == 1 then FusedInstructionConstants[OP_A] = FusedInstruction[OP_A]; end;
+                if gBit(FusedMask, 2, 2) == 1 then FusedInstructionConstants[OP_B] = FusedInstruction[OP_B]; end;
+                if gBit(FusedMask, 3, 3) == 1 then FusedInstructionConstants[OP_C] = FusedInstruction[OP_C]; end;
+                FusedInstructionFields[FusedIndex], FusedConstantFields[FusedIndex] = FusedInstruction, FusedInstructionConstants;
+            end;
+            Inst[5], InstructionConstantFields[5] = FusedInstructionFields, FusedConstantFields;
+        end;
     elseif Descriptor == 1 then
         Inst = {nil, nil, nil, nil};
     else
@@ -2304,6 +2339,17 @@ end;
 -- material as soon as every constant operand used by this invocation is read.
 local function BindInstructionOperands(InstructionFields, InstructionConstantFields, InstructionConstantResolver)
     if not InstructionConstantFields then return InstructionFields; end;
+    local FusedInstructionFields = InstructionFields[5];
+    local FusedConstantFields = InstructionConstantFields[5];
+    if FusedInstructionFields then
+        if type(FusedConstantFields) ~= 'table' or #FusedInstructionFields ~= #FusedConstantFields then error('invalid protected payload', 0); end;
+        InstructionConstantFields[5] = nil;
+        for FusedIndex = 1, #FusedInstructionFields do
+            FusedInstructionFields[FusedIndex] = BindInstructionOperands(
+                FusedInstructionFields[FusedIndex], FusedConstantFields[FusedIndex], InstructionConstantResolver);
+        end;
+    end;
+    if next(InstructionConstantFields) == nil then return InstructionFields; end;
     local InstructionDecodedFields, InstructionDecodedValues = {}, {};
     local InstructionRemainingConstants = 0;
     for InstructionFieldKey in pairs(InstructionConstantFields) do
@@ -2357,6 +2403,7 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     local MaterializeStageSlot = MaterializeIndexSlot + 523645;
     local MaterializeConstantFieldsSlot = MaterializeIndexSlot + 628374;
     local MaterializeConstantResolverSlot = MaterializeIndexSlot + 733103;
+    local MaterializeFusedSlot = MaterializeIndexSlot + 837832;
     local FlowCache = Flow[4];
     if AllowMaterializer and FlowCache and FlowCache[MaterializeIndexSlot] == Index then
         local MaterializeStage = FlowCache[MaterializeStageSlot];
@@ -2372,7 +2419,8 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         end;
         local MaterializedFields = {
             FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
-            FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot]
+            FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot],
+            FlowCache[MaterializeFusedSlot]
         };
         local MaterializedConstantFields = FlowCache[MaterializeConstantFieldsSlot];
         local MaterializedConstantResolver = FlowCache[MaterializeConstantResolverSlot];
@@ -2380,8 +2428,9 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
             MaterializedFields, MaterializedConstantFields, MaterializedConstantResolver);
         FlowCache[MaterializeIndexSlot], FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
             FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot], FlowCache[MaterializeStageSlot],
-            FlowCache[MaterializeConstantFieldsSlot], FlowCache[MaterializeConstantResolverSlot] =
-            nil, nil, nil, nil, nil, nil, nil, nil;
+            FlowCache[MaterializeConstantFieldsSlot], FlowCache[MaterializeConstantResolverSlot],
+            FlowCache[MaterializeFusedSlot] =
+            nil, nil, nil, nil, nil, nil, nil, nil, nil;
         return MaterializedInstruction;
     end;
 
@@ -2454,6 +2503,7 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         FlowCache[MaterializeStageSlot] = 1;
         FlowCache[MaterializeConstantFieldsSlot] = InstructionConstantFields;
         FlowCache[MaterializeConstantResolverSlot] = InstructionConstantResolver;
+        FlowCache[MaterializeFusedSlot] = Inst[5];
         Inst = {};
         MaterializeEnum = SelectMaterializerEnum(Chunk, 0);
     else

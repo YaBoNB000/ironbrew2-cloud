@@ -792,7 +792,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 				int type = (int)instruction.InstructionType;
 				int constantMask = (int)instruction.ConstantMask;
-				descriptors.Add((byte)(((type << 1) | (constantMask << 3)) ^ descriptorMask));
+				List<Instruction> fusedInstructions = instruction.CustomData?.FusedInstructions;
+				bool isFused = fusedInstructions is {Count: > 1};
+				descriptors.Add((byte)(((type << 1) | (constantMask << 3) | (isFused ? 64 : 0)) ^ descriptorMask));
 
 				ushort storedOpcode = (ushort)((ushort)opcode ^ OpcodeMask(pc, k1, k2, k3) ^
 				                               BlockFieldMask(entryState, pc, 0, k1, k2, k3) ^
@@ -828,9 +830,62 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 						WriteUInt32(operandsB, unchecked((uint)b) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
 						break;
 				}
+
+				if (isFused)
+				{
+					if (fusedInstructions.Count > 6 || !ReferenceEquals(fusedInstructions[0], instruction))
+						throw new InvalidOperationException("Invalid IR fusion descriptor.");
+					descriptors.Add((byte)(fusedInstructions.Count - 1));
+					foreach (Instruction member in fusedInstructions.Skip(1))
+					{
+						int memberType = (int)member.InstructionType;
+						int memberMask = (int)member.ConstantMask;
+						if (member.InstructionType == InstructionType.Data || memberType > 3 || memberMask > 7)
+							throw new InvalidOperationException("Unsafe IR fusion member.");
+						descriptors.Add((byte)((memberType << 1) | (memberMask << 3)));
+						WriteUInt16(operandsA, unchecked((ushort)member.A));
+						switch (member.InstructionType)
+						{
+							case InstructionType.ABC:
+								WriteUInt16(operandsB, unchecked((ushort)member.B));
+								WriteUInt16(operandsC, unchecked((ushort)member.C));
+								break;
+							case InstructionType.ABx:
+								WriteUInt32(operandsB, unchecked((uint)member.B));
+								break;
+							case InstructionType.AsBx:
+								WriteUInt32(operandsB, unchecked((uint)(member.B + (1 << 16))));
+								break;
+							case InstructionType.AsBxC:
+								WriteUInt32(operandsB, unchecked((uint)(member.B + (1 << 16))));
+								WriteUInt16(operandsC, unchecked((ushort)member.C));
+								break;
+						}
+					}
+				}
 			}
 
+			// Mutate supplemental IR nodes while the original instruction map is
+			// still available, then physically lower every safe sequence to its head.
 			chunk.UpdateMappings();
+			foreach (Instruction head in chunk.Instructions.Where(value => value.CustomData?.FusedInstructions is {Count: > 1}))
+				foreach (Instruction member in head.CustomData.FusedInstructions.Skip(1))
+				{
+					member.UpdateRegisters();
+					member.CustomData?.Opcode?.Mutate(member);
+				}
+			var loweredInstructions = new List<Instruction>(chunk.Instructions.Count);
+			for (int index = 0; index < chunk.Instructions.Count; index++)
+			{
+				Instruction instruction = chunk.Instructions[index];
+				if (instruction.CustomData?.FusionContinuation == true)
+					continue;
+				loweredInstructions.Add(instruction);
+			}
+			chunk.Instructions = loweredInstructions;
+			chunk.UpdateMappings();
+			foreach (Instruction instruction in chunk.Instructions) instruction.UpdateRegisters();
+			foreach (Instruction instruction in chunk.Instructions) instruction.CustomData?.Opcode?.Mutate(instruction);
 			DispatcherFlatteningDecision flattening = _settings.ControlFlow
 				? DispatcherFlatteningPlanner.Apply(chunk)
 				: null;
@@ -879,14 +934,6 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 					blockRoutes.Add(block, route);
 				}
 			}
-
-			// Preserve the original linear mutation order. Several comparison/test
-			// opcodes consume the following JMP's still-relative B operand while
-			// mutating, even though blocks are emitted in randomized order below.
-			foreach (Instruction instruction in chunk.Instructions)
-				instruction.UpdateRegisters();
-			foreach (Instruction instruction in chunk.Instructions)
-				instruction.CustomData?.Opcode?.Mutate(instruction);
 
 			ShuffleBlocks(instructionBlocks);
 
@@ -1012,9 +1059,13 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							for (int offset = 0; offset < count; offset++)
 							{
 								Instruction instruction = chunk.Instructions[start + offset];
-								if ((instruction.ConstantMask & InstructionConstantMask.RA) != 0) referenceSet.Add(instruction.A);
-								if ((instruction.ConstantMask & InstructionConstantMask.RB) != 0) referenceSet.Add(instruction.B);
-								if ((instruction.ConstantMask & InstructionConstantMask.RC) != 0) referenceSet.Add(instruction.C);
+								IEnumerable<Instruction> referencedInstructions = instruction.CustomData?.FusedInstructions ?? (IEnumerable<Instruction>)new[] {instruction};
+								foreach (Instruction referenced in referencedInstructions)
+								{
+									if ((referenced.ConstantMask & InstructionConstantMask.RA) != 0) referenceSet.Add(referenced.A);
+									if ((referenced.ConstantMask & InstructionConstantMask.RB) != 0) referenceSet.Add(referenced.B);
+									if ((referenced.ConstantMask & InstructionConstantMask.RC) != 0) referenceSet.Add(referenced.C);
+								}
 							}
 							List<int> constantReferences = referenceSet.OrderBy(value => value).ToList();
 							foreach (int constantIndex in constantReferences)

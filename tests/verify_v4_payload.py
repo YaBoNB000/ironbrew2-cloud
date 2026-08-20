@@ -165,6 +165,7 @@ class Block:
     record_column_orders: list[tuple[int, ...]] = field(default_factory=list)
     record_column_spans: list[dict[int, tuple[int, int, int]]] = field(default_factory=list)
     descriptors: list[int] = field(default_factory=list)
+    fused_counts: list[int] = field(default_factory=list)
     capsules: dict[int, Capsule] = field(default_factory=dict)
     final_instruction_state: int = 0
     final_instruction_seal: int = 0
@@ -730,7 +731,7 @@ def decode_prototype_column(
 def validate_instruction_record(
     record: bytes, prototype: Prototype, block: Block, offset: int,
     record_start: int, record_end: int,
-) -> tuple[int, tuple[int, ...], dict[int, tuple[int, int, int]]]:
+) -> tuple[int, int, tuple[int, ...], dict[int, tuple[int, int, int]]]:
     order = derive_block_permutation(
         5, block.entry_state, prototype.k1, prototype.k2, prototype.k3, BLOCK_COLUMN_DOMAIN
     )
@@ -752,26 +753,43 @@ def validate_instruction_record(
         role: decode_prototype_column(value, prototype, block, role, pc)
         for role, value in columns.items()
     }
-    if len(columns[0]) != 1:
-        raise ValueError("instruction descriptor page is not scalar")
+    if not columns[0]:
+        raise ValueError("instruction descriptor page is empty")
     descriptor = columns[0][0] ^ (block_field_mask(block.entry_state, pc, 7, prototype) & 0xFF)
+    fused_count = 0
     if descriptor & 1:
-        if descriptor != 1:
+        if descriptor != 1 or len(columns[0]) != 1:
             raise ValueError("invalid data-word instruction descriptor")
         expected = {0: 1, 1: 0, 2: 0, 3: 4, 4: 0}
     else:
-        if descriptor >= 64:
+        if descriptor >= 128:
             raise ValueError("invalid high bits in instruction descriptor")
-        instruction_type = (descriptor >> 1) & 3
+        fused = descriptor >= 64
+        base_descriptor = descriptor - 64 if fused else descriptor
+        instruction_type = (base_descriptor >> 1) & 3
         expected = {
             0: 1, 1: 2, 2: 2,
             3: 2 if instruction_type == 0 else 4,
             4: 2 if instruction_type in (0, 3) else 0,
         }
+        if fused:
+            if len(columns[0]) < 3:
+                raise ValueError("IR fusion descriptor is incomplete")
+            fused_count = columns[0][1]
+            if fused_count < 1 or fused_count > 5 or len(columns[0]) != fused_count + 2:
+                raise ValueError("IR fusion member count/framing mismatch")
+            expected[0] += fused_count + 1
+            for member_descriptor in columns[0][2:]:
+                if member_descriptor >= 64 or member_descriptor & 1:
+                    raise ValueError("invalid IR fusion member descriptor")
+                member_type = (member_descriptor >> 1) & 3
+                expected[2] += 2
+                expected[3] += 2 if member_type == 0 else 4
+                expected[4] += 2 if member_type in (0, 3) else 0
     actual = {role: len(value) for role, value in columns.items()}
     if actual != expected:
         raise ValueError(f"instruction record field lengths mismatch: {actual} != {expected}")
-    return descriptor, tuple(order), spans
+    return descriptor, fused_count, tuple(order), spans
 
 
 def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) -> None:
@@ -805,15 +823,17 @@ def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) ->
         source_chunk_state, block.entry_state, block.start_pc, block.tag, prototype
     )
     descriptors: list[int] = []
+    fused_counts: list[int] = []
     orders: list[tuple[int, ...]] = []
     column_spans: list[dict[int, tuple[int, int, int]]] = []
     for offset in range(block.count):
         record = fragments[offset]
         _, record_start, record_end = spans[offset]
-        descriptor, column_order, record_spans = validate_instruction_record(
+        descriptor, fused_count, column_order, record_spans = validate_instruction_record(
             record, prototype, block, offset, record_start, record_end
         )
         descriptors.append(descriptor)
+        fused_counts.append(fused_count)
         orders.append(column_order)
         column_spans.append(record_spans)
         digest = instruction_digest(
@@ -844,6 +864,7 @@ def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) ->
     block.record_column_orders = orders
     block.record_column_spans = column_spans
     block.descriptors = descriptors
+    block.fused_counts = fused_counts
     block.capsules = capsules
     block.final_instruction_state = instruction_state
     block.final_instruction_seal = instruction_state_seal(
@@ -1694,7 +1715,7 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
     # word without removing its opcode/operand bytes. The role map and framing
     # remain valid, but exact per-column consumption must reject the leftovers.
     normal_offset = next(
-        (offset for offset, descriptor in enumerate(entry_block.descriptors) if descriptor & 1 == 0),
+        (offset for offset, descriptor in enumerate(entry_block.descriptors) if descriptor & 1 == 0 and descriptor < 64),
         None,
     )
     if normal_offset is None:
@@ -1768,15 +1789,25 @@ def count_instruction_records(prototype: Prototype) -> int:
     )
 
 
+def collect_fused_counts(prototype: Prototype) -> list[int]:
+    return [count for block in prototype.blocks for count in block.fused_counts] + [
+        count for child in prototype.children for count in collect_fused_counts(child)
+    ]
+
+
 def describe(info: PayloadInfo) -> str:
     fragment_orders = collect_fragment_orders(info.root)
     if len(fragment_orders) != count_blocks(info.root) or any(not order for order in fragment_orders):
         raise ValueError("code/data fragment validation did not cover every block")
+    fused_counts = collect_fused_counts(info.root)
+    physical_instructions = count_instruction_records(info.root)
+    logical_instructions = physical_instructions + sum(fused_counts)
     return (
         f"PASS authenticated v5 payload: features={info.flags & 15}, "
         f"prototypes={count_prototypes(info.root)}, blocks={count_blocks(info.root)}, "
         f"fragment_layouts={len(set(fragment_orders))}, capsules={count_capsules(info.root)}, entropy={info.entropy_length} bytes, "
-        f"instruction_records={count_instruction_records(info.root)}, pages={info.data_count}, max_page={max(info.page_lengths)}, "
+        f"instruction_records={physical_instructions}, logical_instructions={logical_instructions}, "
+        f"fused_records={sum(count > 0 for count in fused_counts)}, pages={info.data_count}, max_page={max(info.page_lengths)}, "
         f"chunk_chain=attested, instruction_chain=sealed, "
         f"records={len(info.records)}, H={info.shannon_entropy:.4f} bits/byte, "
         f"entropy_sha256={hashlib.sha256(info.entropy).hexdigest()}"

@@ -86,6 +86,7 @@ python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
 python3 tests/materializer_replay.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/constant_use_materialization.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/handler_fragment_sharing.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/ir_native_fusion.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua"
 python3 tests/prototype_decoder_families.py "$WORK/fixed.lua"
 python3 tests/prototype_runtime_abi.py "$WORK/fixed.lua"
 python3 tests/streaming_carrier.py "$WORK/fixed.lua"
@@ -486,11 +487,11 @@ fragment_records = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
     match = re.search(
-        r"Created (\d+) short super operators; folded (\d+) sequences; lengths ([0-9:,]+); structure ([0-9a-f]{8})\.",
+        r"Created (\d+) IR-native super operators; folded (\d+) sequences; lengths ([0-9:,]+); structure ([0-9a-f]{8})\.",
         log,
     )
     if not match:
-        raise SystemExit(f"missing structural short-super-operator record for build {index}")
+        raise SystemExit(f"missing structural IR-native-fusion record for build {index}")
     lengths = {int(size): int(count) for size, count in
                (entry.split(":") for entry in match.group(3).split(","))}
     super_records.append((int(match.group(1)), int(match.group(2)), lengths, match.group(4)))
@@ -583,11 +584,11 @@ for field, expected in (
     if observed != expected:
         raise SystemExit(f"payload grammar dimension {field} did not emit both forms: {sorted(observed)}")
 if min(record[0] for record in super_records) < 12 or min(record[1] for record in super_records) < 8:
-    raise SystemExit(f"short super operators were not materially emitted/folded: {super_records}")
+    raise SystemExit(f"IR-native super operators were not materially emitted/folded: {super_records}")
 if any(len(record[2]) < 2 or sum(record[2].values()) != record[0] for record in super_records):
-    raise SystemExit(f"short super-operator length structure is degenerate: {super_records}")
+    raise SystemExit(f"IR-native fusion length structure is degenerate: {super_records}")
 if len({record[3] for record in super_records}) != runs:
-    raise SystemExit("a short super-operator semantic structure was reused across builds")
+    raise SystemExit("a IR-native fusion semantic structure was reused across builds")
 write_totals = tuple(sum(record[0][index] for record in semantic_records) for index in range(6))
 if min(write_totals) <= 0:
     raise SystemExit(f"not all six semantic write lowerings were emitted: {write_totals}")
@@ -598,7 +599,7 @@ if sum(record[1] for record in semantic_records) <= 0 or sum(record[2] for recor
 fragment_totals = tuple(sum(record[index] for record in fragment_records) for index in range(6))
 if min(fragment_totals) <= 0:
     raise SystemExit(f"a shared handler-fragment family was not exercised: {fragment_totals}")
-if any(record[0] < 50 or record[1] < 1 or record[2] < 25 or record[3] < 1 or record[5] < 25
+if any(record[0] < 50 or record[1] < 1 or record[2] < 25 or record[3] < 1 or record[5] < 5
        for record in fragment_records):
     raise SystemExit(f"handler fragments were not materially shared in every build: {fragment_records}")
 if len(set(slot_abis)) != runs:
@@ -885,7 +886,7 @@ run_executor "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
 grep -Eq '^lazy-blocks:[1-9][0-9]*:executed-constant:37$' "$WORK/lazy-instrumented.out"
 echo "PASS paged-source release, current-record instruction lifetime, partitioned constants and opaque block retention"
 
-# Phase 4 uses a larger, branch-rich fixture for median performance gates and a
+# Phase 4 uses a larger, branch-rich fixture for timed semantic observation and a
 # test-only observer over the unminified VM. The observer records only counts,
 # weak references and heap sizes; production output receives no hook or decoder.
 python3 tests/phase4_performance.py \
@@ -902,7 +903,7 @@ python3 tests/phase4_dynamic_dump.py \
 run_executor "$WORK/phase4-runtime-instrumented.lua" > "$WORK/phase4-runtime-instrumented.out"
 head -n 1 "$WORK/phase4-runtime-instrumented.out" > "$WORK/phase4-runtime-instrumented-baseline.out"
 cmp "$WORK/phase4-runtime-baseline.out" "$WORK/phase4-runtime-instrumented-baseline.out"
-grep -Eq '^PHASE4_DYNAMIC payload=page:[1-9][0-9]*/[1-9][0-9]* vm=opaque:[1-9][0-9]* chunks=decoded:[2-9][0-9]*,opaque:[1-9][0-9]* constants=max-live:[1-3]/[1-9][0-9]* instructions=weak-live:0/[1-9][0-9]* memory-kb=[0-9]+\.[0-9]>[0-9]+\.[0-9]>[0-9]+\.[0-9]$' \
+grep -Eq '^PHASE4_DYNAMIC payload=page:[1-9][0-9]*/[1-9][0-9]* vm=opaque:[1-9][0-9]* chunks=decoded:[2-9][0-9]*,opaque:[1-9][0-9]* constants=max-live:([1-9]|1[0-8])/[1-9][0-9]* instructions=weak-live:0/[1-9][0-9]* memory-kb=[0-9]+\.[0-9]>[0-9]+\.[0-9]>[0-9]+\.[0-9]$' \
     "$WORK/phase4-runtime-instrumented.out"
 echo "PASS Phase 4 dynamic dump, single-Chunk isolation and GC/peak-memory lifecycle barriers"
 

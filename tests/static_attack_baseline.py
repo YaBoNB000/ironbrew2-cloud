@@ -40,6 +40,8 @@ class StaticAttackReport:
     prototypes: int
     blocks: int
     instructions: int
+    logical_instructions: int
+    fused_records: int
     capsules: int
     decoded_constants: list[dict[str, Any]]
     recovered_strings: list[str]
@@ -156,7 +158,7 @@ def decode_opcodes(
             pc = block.start_pc + offset
             descriptor = block.descriptors[offset]
             if descriptor & 1:
-                result.append({"prototype": list(proto_path), "pc": pc, "data_word": True})
+                result.append({"prototype": list(proto_path), "pc": pc, "data_word": True, "fused_members": 0, "logical_width": 1})
             else:
                 opcode_span = block.record_column_spans[offset][1]
                 encoded = info.body[opcode_span[1]:opcode_span[2]]
@@ -181,6 +183,8 @@ def decode_opcodes(
                         "data_word": False,
                         "local_id": local_opcode,
                         "canonical_id": bank[local_opcode],
+                        "fused_members": block.fused_counts[offset],
+                        "logical_width": 1 + block.fused_counts[offset],
                     }
                 )
             fragment = block.fragment_spans[offset]
@@ -202,11 +206,14 @@ def analyze(path: Path, expected_strings: list[str]) -> StaticAttackReport:
     constants: list[dict[str, Any]] = []
     seen_constants: set[tuple[tuple[int, ...], int, str]] = set()
     opcodes: list[dict[str, Any]] = []
-    prototype_count = block_count = instruction_count = capsule_count = 0
+    prototype_count = block_count = instruction_count = logical_instruction_count = fused_record_count = capsule_count = 0
     for proto_path, proto in prototypes(info.root):
         prototype_count += 1
         block_count += len(proto.blocks)
         instruction_count += proto.instruction_count
+        proto_fused_counts = [count for block in proto.blocks for count in block.fused_counts]
+        logical_instruction_count += proto.instruction_count + sum(proto_fused_counts)
+        fused_record_count += sum(count > 0 for count in proto_fused_counts)
         capsule_count += len(proto.capsules)
         for capsule in proto.capsules:
             kind, value = decode_constant(info, proto, capsule)
@@ -245,6 +252,8 @@ def analyze(path: Path, expected_strings: list[str]) -> StaticAttackReport:
         prototypes=prototype_count,
         blocks=block_count,
         instructions=instruction_count,
+        logical_instructions=logical_instruction_count,
+        fused_records=fused_record_count,
         capsules=capsule_count,
         decoded_constants=constants,
         recovered_strings=recovered_strings,
@@ -282,8 +291,8 @@ def main() -> int:
         print(
             "STATIC_ATTACK_BASELINE "
             f"carrier={report.carrier_segments} body={report.plain_body_bytes} "
-            f"prototypes={report.prototypes} instructions={report.instructions} "
-            f"constants={len(report.decoded_constants)} "
+            f"prototypes={report.prototypes} instructions={report.instructions}/{report.logical_instructions} "
+            f"fused={report.fused_records} constants={len(report.decoded_constants)} "
             f"requested={len(report.requested_strings_recovered)}/{len(report.requested_strings)}"
         )
         if args.report:

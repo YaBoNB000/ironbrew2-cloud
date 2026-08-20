@@ -170,7 +170,7 @@ local function __p4_page(value)
     if #value>__p4_stats.max_page then __p4_stats.max_page=#value;end;__p4_heap();
 end;
 local function __p4_instruction(chunk,block,record,constants)
-    assert(type(record)=='table' and type(constants)=='number' and constants>=0 and constants<=3);
+    assert(type(record)=='table' and type(constants)=='number' and constants>=0 and constants<=18);
     __p4_stats.current_constants=0;__p4_stats.current_constant_limit=constants;__p4_stats.instruction_ready=true;
     assert(type(chunk[{chunk[1]}])=='table' and next(chunk[{chunk[1]}])==nil,'complete instruction array became reachable');
     assert(type(chunk[{chunk[15]}])=='number','prototype-wide constant pool became reachable');
@@ -216,7 +216,7 @@ local function __p4_finalize(root)
     local decoded,opaque_children,opaque_blocks,total_constants=__p4_snapshot(root);
     assert(__p4_stats.pages>=2 and __p4_stats.page_bytes=={expected_body} and __p4_stats.max_page<{expected_body},'complete plaintext payload existed as one page');
     assert(__p4_stats.instructions>0 and live==0,'plaintext instruction record outlived VM execution');
-    assert(__p4_stats.max_fields<=4 and __p4_stats.max_constants>=1 and __p4_stats.max_constants<=3,'handler-use constant material escaped operand lifetime');
+    assert(__p4_stats.max_fields<=5 and __p4_stats.max_constants>=1 and __p4_stats.max_constants<=18,'handler-use constant/fusion material escaped operand lifetime');
     assert(decoded>=2 and opaque_children>=1,'executing one child recovered sibling Chunks');
     assert(opaque_blocks>=decoded,'normal execution recovered the complete VM buffer');
     assert(total_constants>__p4_stats.max_constants,'constant pool collapsed into one instruction lifetime');
@@ -232,8 +232,10 @@ __p4_heap();
     edits.append((resolver_increment_position, "__p4_constant_use();\n"))
     edits.append((
         decoder_return_position,
-        f"local __p4_constant_count=0;if {constant_fields_name} then for _ in pairs({constant_fields_name}) do "
-        f"__p4_constant_count=__p4_constant_count+1;end;end;"
+        f"local __p4_constant_count=0;if {constant_fields_name} then for __p4_key,__p4_value in pairs({constant_fields_name}) do "
+        f"if __p4_key==5 and type(__p4_value)=='table' then for _,__p4_nested in pairs(__p4_value) do "
+        f"for _ in pairs(__p4_nested) do __p4_constant_count=__p4_constant_count+1;end;end;"
+        f"else __p4_constant_count=__p4_constant_count+1;end;end;end;"
         f"__p4_instruction({decoder_params[0]},{decoder_params[1]},{instruction_name},__p4_constant_count);\n",
     ))
 

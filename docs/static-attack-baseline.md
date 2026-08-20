@@ -1,95 +1,54 @@
 # Final-output static attack baseline
 
-Date: 2026-08-19
+Date: 2026-08-20
 
 ## Scope
 
-`tests/static_attack_baseline.py` is the attacker-side counterpart to the white-box
-payload verifier. It accepts only the final production Lua file. It does not read:
+`tests/static_attack_baseline.py` is an attacker-side harness that accepts only the final production Lua file. It does not read `temp/t2.lua`, build logs, compiler state, `luac.out`, intermediate bytecode, or original source.
 
-- `temp/t2.lua`;
-- obfuscator logs;
-- BuildSeed/compiler state;
-- `luac.out` or intermediate bytecode;
-- the original source file.
+The harness mirrors formulas and format coordinates delivered in the wrapper. This is intentional: breaking an old parser is not a security milestone when an analyst can adapt it to the public runtime.
 
-The harness mirrors formulas and format coordinates that are shipped in the final
-wrapper. This is intentional: deleting an internal verifier does not prevent an
-analyst or AI from rebuilding it from delivered runtime code.
+## Current tracked result
 
-## Current result for `test_obf.lua`
+For the tracked `test.lua` (`local aop = 9`), a current build still yields a successful final-file-only recovery of:
 
-The current materializer build remains fully recoverable before handler semantic
-classification:
+- Base91 carrier topology and source order;
+- environment-derived outer binding and authenticated envelope;
+- complete prototype/block framing;
+- the number constant `9`;
+- physical canonical head-opcode IDs;
+- IR-fusion supplemental-member counts and logical widths.
 
-```text
-carrier segments:       13 (build-random)
-encoded payload:        87,213 bytes (build-random)
-plain protected body:   245 bytes
-prototypes:             1
-blocks:                 1
-instructions:           4
-constant capsules:      2
-recovered strings:      "print", "idk"
-canonical opcode IDs:   recovered for all 4 PCs
-```
+Exact entropy size, carrier segments, seeds, opcode IDs and hashes vary every build. `tests/semantic.lua` is the material fusion fixture: recent validation recovered roughly 140–145 physical records representing 224 logical instructions, with 25–26 fused records of widths 2–6. The exact values are randomized and are not fixed expectations.
 
-The exact carrier count, entropy size, seed, attestation value and opcode IDs vary
-per build. The security-relevant baseline is that a final-file-only analyzer can
-still recover all of them.
-
-The attack harness has already been adapted to the first M1–M5 changes: the
-four-word payload KDF, nested segment tables, 2 KiB decoded-ciphertext chunks,
-four prototype-local column families and two-stage materializer replay. It still
-recovers the complete body, constants and canonical opcode IDs because the
-compatibility `GuardAttestation` and all four-word fold formulas remain client-side. This prevents us from mistaking structural
-novelty for a broken static recovery chain.
-
-Run it with:
+Run the tracked baseline with:
 
 ```bash
 python3 tests/static_attack_baseline.py test_obf.lua \
-  --expect-string print --expect-string idk \
   --require-current-baseline \
   --report /tmp/static-attack-report.json
 ```
 
-## Recovery stages measured
+## Adapted recovery stages
 
-1. **Carrier location** — identifies the final file's large Base91 segments and
-   restores their authenticated source order.
-2. **Environment binding** — recovers shipped attestation candidates, derives the
-   envelope stream seed and independent outer-integrity key, then validates the
-   randomized envelope header.
-3. **Payload restoration** — decrypts records, validates entropy/framing, reverses
-   the page pipeline and inflates bounded pages.
-4. **Prototype parsing** — derives Build-local schema, verifies prototype/block
-   manifests and reconstructs the prototype tree.
-5. **Constant recovery** — opens state-bound constant capsules and records strings,
-   numbers and booleans.
-6. **Opcode recovery** — derives the prototype opcode bank and chained opcode state
-   to recover canonical virtual opcode IDs for every serialized instruction.
+1. **Carrier location** — identifies nested Base91 segments and restores authenticated source order.
+2. **Environment binding** — derives the envelope stream state and independent outer-integrity key from shipped formulas.
+3. **Payload restoration** — validates entropy/framing, reverses page transforms and inflates bounded pages.
+4. **Prototype parsing** — derives build-local schema and validates prototype/block manifests.
+5. **Constant recovery** — opens state-bound capsules, including constants referenced only by supplemental fused members.
+6. **Opcode recovery** — derives each prototype opcode bank and chained opcode state to recover the canonical head-opcode ID of every physical record.
+7. **Fusion recovery** — parses descriptor bit 6, supplemental member descriptors, physical/logical widths and fused constant references.
 
-The harness intentionally stops before assigning Lua semantic names to canonical
-handler IDs. The final wrapper still contains handler implementations, so AI can
-currently finish that mapping with def-use analysis.
+The harness stops before assigning Lua semantic names to every canonical handler or every member operation. The final wrapper still contains the randomized fusion handler and shared-fragment implementations, so a sufficiently capable static analyzer can continue with control/data-flow classification.
 
-## Milestone policy
+## Current interpretation
 
-This baseline is currently an **expected successful attack**, not a protection
-claim. CI uses `--require-current-baseline` so the attack harness cannot silently
-rot while defenses change.
+This remains an **expected successful attack baseline**, not a secrecy claim. The implemented defenses change exposure and classifier cost:
 
-Each hardening milestone must update the expected result deliberately:
+- constants are not decoded during record parsing or four replay stages; a capsule opens only when a handler indexes that operand;
+- terminal handlers compose shared acquisition/operation/writeback/PC fragments instead of each carrying one complete repeated dataflow;
+- safe IR sequences become one physical record with a combined descriptor and one cross-member register dataflow proxy instead of replaying serialized member PCs.
 
-| Milestone | Required attack regression |
-|---|---|
-| M1 multi-word guard/key state | no single attestation candidate yields every payload key |
-| M2 streaming carrier/pages | no complete encoded/decrypted payload buffer is recoverable |
-| M3 prototype-local decoder families | one recovered parser cannot decode all prototypes |
-| M4 staged materialization | initial records do not expose final opcode/all operands |
-| M5 handler semantic polymorphism | canonical IDs cannot be mapped by one stable handler classifier |
+None of those creates a server-held secret. All formulas and handler code remain client-side, so full static simulation or runtime instrumentation remains possible.
 
-A milestone is not complete merely because this script breaks syntactically. The
-replacement attack harness must first be adapted to the new public runtime; only
-then is a reduced recovery result meaningful.
+CI uses `--require-current-baseline` to prevent the attack harness from silently becoming stale. Any future hardening change must first adapt this harness to the new public format, then measure whether recovery actually decreased.
