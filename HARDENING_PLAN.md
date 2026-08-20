@@ -6,7 +6,7 @@
 
 - [x] M0：建立只接收最终 Lua 的攻击基线，恢复 carrier、binding keys、完整 body、prototype/block、常量 capsule 和 canonical opcode IDs；当前 `test.lua` 的 `"print"`/`"idk"` 可完整恢复。
 - [x] M1：最终 token literal、集中式 equality 与长生命周期 `GuardAttestation` 已删除；行为 transcript 仅在局部作用域经 Build-local offset 形成一次性 compatibility value，立即扩展为 `GuardEvidenceA..D` 后清零。payload KDF 再结合 salt 将四字 evidence 折叠为独立 envelope seed、outer-integrity key 与 `GuardPayloadBinding`；chunk/instruction/opcode/flow state 只使用后者。全部逻辑仍在客户端，静态模拟器仍可重算 evidence。
-- [~] M2：已完成递归增量 Base91 segment 消费、禁止大型 segment 直接拼接，并将 decoded ciphertext 改为 2 KiB chunks + chunk-aware byte accessor；尚未做到 page 消费后立即释放全部早期 ciphertext chunks。
+- [x] M2（当前范围）：已完成递归增量 Base91 segment 消费、禁止大型 segment 直接拼接，并将 decoded ciphertext 改为 2 KiB chunks + chunk-aware byte accessor；page 消费后立即释放全部早期 ciphertext chunks 属于内存/性能优化，按当前要求不实施。
 - [x] M3：已完成 4 套 prototype-key-derived instruction-column decoder family（XOR、reverse/add、nibble/XOR、reverse/rotate/add）；Chunk 与 Block 现在都是 prototype-local proxy，build-wide ABI 之下再叠加 K1/K2/K3、prototype length 或 block start/verifier 派生的独立 storage permutation。同一构建内父子 prototype 与不同 blocks 不再共享单一实际槽位布局。
 - [x] M4：invocation-local overlay 已拆为独立 opcode/A/B/C、lazy constant metadata 与 fused operand 槽位；四阶段 synthetic materializer/四次 PC replay 后才建立 operand proxy，constant capsule 仅在实际 handler 字段读取时恢复，并用显式 decoded flag 正确缓存 nil。
 - [x] M5：6 种 register write lowering、RawGet/RawSet stack/global access、共享 operand/operation/writeback/PC fragments 与 IR-native physical fusion 已完成；fusion 使用 combined descriptor 与跨成员 register proxy/dataflow，且不再逐成员调用 `GetInstruction`。
@@ -126,10 +126,10 @@
 ### Phase 4：Luau、性能和发布体系
 
 - [x] 文档明确当前源码前端为 Lua 5.1；Luau 原生前端仍是后续候选。
-- [ ] Luau 专用构建使用 `buffer` 读取和原地解码。
-- [ ] 自适应压缩：小 payload 不携带 inflater，大 payload 再用 DEFLATE。
+- [x] 当前范围明确不实施 Luau `buffer` 原地解码（性能/内存优化不要求）。
+- [x] 当前范围明确不实施自适应压缩（体积/性能优化不要求）。
 - [x] CLI、批处理和云端工作流统一为单一严格配置：ControlFlow/DEFLATE/AntiDump/EnvironmentLock/64–96 KiB authenticated entropy envelope 开启，AggressiveDefense 关闭。
-- [ ] 为固定配置建立大型程序真实性能、内存和体积基准（当前已自动检查 envelope 的固定增量与熵值）。
+- [x] 当前范围不设置性能/体积门槛；仅保留 timed semantic observation、超时保护与 Phase 4 生命周期观测。
 - [x] 提供本地 Linux 语义差分、随机 seed 和篡改测试脚本。
 - [x] 将 Linux Lua 5.1 完整回归接入 CI，并增加 Linux x64、Windows x64、macOS arm64 的 Release publish 构建矩阵。
 - 不实施（当前明确不需要）：云端仅上传短期 Artifact、敏感源码/产物策略和额外二进制工具校验。
