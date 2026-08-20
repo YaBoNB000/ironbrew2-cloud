@@ -556,9 +556,25 @@ local function ConstantMaskState(Index, EntryState, CurrentChunkState, BlockStar
     return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
 end;
 
-local function StringShardState(Index, ShardIndex, Length, EntryState, CurrentChunkState, BlockStart, K1, K2, K3)
+local function BeginConstantChain(EntryState, CurrentChunkState, BlockStart, K1, K2, K3)
+    local Keyed = (K1 * 65537 + K2 * 257 + K3) % 4294967296;
+    local Value = (BitXOR(EntryState, PayloadRotate16(CurrentChunkState))
+        + BlockStart * 65537 + Keyed + __IB2_DOMAIN_CONSTANT_MASK__ + 3266489909) % 4294967296;
+    return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
+end;
+
+local function AdvanceConstantChain(State, Capsule, Index)
+    local Value = BitXOR(State, (Index * 2654435761) % 4294967296) % 4294967296;
+    for I = 1, #Capsule do
+        Value = (U32Mul(Value, 65599) + Byte(Capsule, I, I) + I * 257) % 4294967296;
+    end;
+    return BitXOR(Value, PayloadRotate16((#Capsule * 65537 + Index) % 4294967296)) % 4294967296;
+end;
+
+local function StringShardState(Index, ShardIndex, Length, ConstantChainState, EntryState, CurrentChunkState, BlockStart, K1, K2, K3)
     local Value = (ConstantMaskState(Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3)
-        + ShardIndex * 65537 + Length * 257 + __IB2_DOMAIN_CONSTANT_MASK__ + 2654435769) % 4294967296;
+        + ShardIndex * 65537 + Length * 257 + U32Mul(ConstantChainState, 257)
+        + __IB2_DOMAIN_CONSTANT_MASK__ + 2654435769) % 4294967296;
     return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
 end;
 

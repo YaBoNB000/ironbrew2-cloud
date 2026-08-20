@@ -144,6 +144,7 @@ class Capsule:
     entry_state: int
     chunk_state: int
     logical_slot: int
+    chain_state: int = 0
 
 
 @dataclass
@@ -526,6 +527,16 @@ def _attestation_candidates(source: str) -> set[int]:
             re.S,
         )
     }
+    # Minification/control-flow rewriting can separate the surrounding `if not`
+    # anchor. The compatibility scalar remains uniquely tied to its first evidence
+    # lane, so recover the same public offset from that local def-use shape.
+    for _compatibility_name, value in re.findall(
+        rf"local\s+({ident})\s*=\s*\(\s*{ident}\s*\+\s*(\d+)\s*\)\s*%\s*4294967296\s*;"
+        rf"\s*{ident}\s*=\s*\(\s*\1\s*\*\s*65599\s*\+\s*2654435769\s*\)",
+        source,
+        re.S,
+    ):
+        offsets.add(int(value))
     base_candidates = list(candidates)
     for offset in offsets:
         candidates.update((candidate + offset) & MASK32 for candidate in base_candidates)
@@ -845,6 +856,7 @@ def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) ->
         )
 
     capsules: dict[int, Capsule] = {}
+    constant_chain_state = begin_constant_chain(prototype, block)
     for reference_offset, constant_index in enumerate(block.references):
         logical_slot = block.count + reference_offset
         capsule_data = fragments[logical_slot]
@@ -854,10 +866,12 @@ def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) ->
         capsule = Capsule(
             constant_index, capsule_start, capsule_end, capsule_start, capsule_start + 4,
             block.start_pc, block.entry_state, source_chunk_state, logical_slot,
+            constant_chain_state,
         )
         validate_capsule(data, prototype, capsule)
         capsules[constant_index] = capsule
         prototype.capsules.append(capsule)
+        constant_chain_state = advance_constant_chain(constant_chain_state, capsule_data, constant_index)
 
     block.fragment_order = order
     block.fragment_spans = spans
@@ -887,12 +901,35 @@ def constant_mask_state(index: int, prototype: Prototype, capsule: Capsule) -> i
     return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
 
 
+def begin_constant_chain(prototype: Prototype, block: Block) -> int:
+    keyed = (prototype.k1 * 65537 + prototype.k2 * 257 + prototype.k3) & MASK32
+    source_chunk_state = chunk_state(
+        block.entry_state, block.start_pc, block.count, prototype
+    )
+    value = (
+        (block.entry_state ^ rotate16(source_chunk_state))
+        + block.start_pc * 65537
+        + keyed
+        + CONSTANT_MASK_DOMAIN
+        + 0xC2B2AE35
+    ) & MASK32
+    return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
+
+
+def advance_constant_chain(state: int, capsule_bytes: bytes, index: int) -> int:
+    value = state ^ ((index * 0x9E3779B1) & MASK32)
+    for offset, byte in enumerate(capsule_bytes, 1):
+        value = (value * 65599 + byte + offset * 257) & MASK32
+    return (value ^ rotate16((len(capsule_bytes) * 65537 + index) & MASK32)) & MASK32
+
+
 def string_shard_state(index: int, shard_index: int, length: int,
                        prototype: Prototype, capsule: Capsule) -> int:
     value = (
         constant_mask_state(index, prototype, capsule)
         + shard_index * 65537
         + length * 257
+        + capsule.chain_state * 257
         + CONSTANT_MASK_DOMAIN
         + 0x9E3779B9
     ) & MASK32

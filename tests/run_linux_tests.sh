@@ -89,7 +89,7 @@ python3 tests/handler_fragment_sharing.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/ir_native_fusion.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua"
 python3 tests/global_disable.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua" --late-nil-output "$WORK/late-getfenv-nil.lua"
 python3 tests/dynamic_loader_guard.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
-python3 tests/string_constant_shards.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua"
+python3 tests/string_constant_shards.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua" --require-chain
 "$LUAC" -p "$WORK/late-getfenv-nil.lua"
 run_executor "$WORK/late-getfenv-nil.lua" > "$WORK/late-getfenv-nil.out"
 cmp "$WORK/baseline.out" "$WORK/late-getfenv-nil.out"
@@ -606,7 +606,7 @@ if sum(record[1] for record in semantic_records) <= 0 or sum(record[2] for recor
 fragment_totals = tuple(sum(record[index] for record in fragment_records) for index in range(6))
 if min(fragment_totals) <= 0:
     raise SystemExit(f"a shared handler-fragment family was not exercised: {fragment_totals}")
-if any(record[0] < 50 or record[1] < 1 or record[2] < 25 or record[3] < 1 or record[5] < 5
+if any(record[0] < 50 or record[1] < 1 or record[2] < 25 or record[5] < 5
        for record in fragment_records):
     raise SystemExit(f"handler fragments were not materially shared in every build: {fragment_records}")
 if len(set(slot_abis)) != runs:

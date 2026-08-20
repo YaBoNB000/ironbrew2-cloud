@@ -35,7 +35,7 @@ python3 tests/static_attack_baseline.py test_obf.lua \
 2. **Environment binding** — derives the envelope stream state and independent outer-integrity key from shipped formulas.
 3. **Payload restoration** — validates entropy/framing, reverses page transforms and inflates bounded pages.
 4. **Prototype parsing** — derives build-local schema and validates prototype/block manifests.
-5. **Constant recovery** — opens state-bound capsules, then derives each string's shard order/state and reassembles interleaved inner-masked bytes, including constants referenced only by supplemental fused members.
+5. **Constant recovery** — opens state-bound capsules, then replays each block's ordered cross-capsule ciphertext chain, derives each string's shard order/state and reassembles interleaved inner-masked bytes, including constants referenced only by supplemental fused members.
 6. **Opcode recovery** — derives each prototype opcode bank and chained opcode state to recover the canonical head-opcode ID of every physical record.
 7. **Fusion recovery** — parses descriptor bit 6, supplemental member descriptors, physical/logical widths and fused constant references.
 

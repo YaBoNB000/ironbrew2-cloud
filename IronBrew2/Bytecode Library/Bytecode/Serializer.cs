@@ -437,11 +437,29 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return unchecked(value * 1664525u + 1013904223u);
 		}
 
-		private uint StringShardState(int oneBasedIndex, int logicalShard, int length,
+		private uint BeginConstantChain(uint entryState, uint chunkState, int blockStart,
+			ushort k1, ushort k2, ushort k3)
+		{
+			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
+			uint value = unchecked((entryState ^ Rotate16(chunkState)) + (uint)blockStart * 65537u
+			                       + keyed + _context.Domains.ConstantMaskDomain + 3266489909u);
+			return unchecked(value * 1664525u + 1013904223u);
+		}
+
+		private static uint AdvanceConstantChain(uint state, IReadOnlyList<byte> capsule, int oneBasedIndex)
+		{
+			uint value = state ^ unchecked((uint)oneBasedIndex * 2654435761u);
+			for (int index = 0; index < capsule.Count; index++)
+				value = unchecked(value * 65599u + capsule[index] + (uint)(index + 1) * 257u);
+			return value ^ Rotate16(unchecked((uint)capsule.Count * 65537u + (uint)oneBasedIndex));
+		}
+
+		private uint StringShardState(int oneBasedIndex, int logicalShard, int length, uint constantChainState,
 			uint entryState, uint chunkState, int blockStart, ushort k1, ushort k2, ushort k3)
 		{
 			uint value = unchecked(ConstantMaskState(oneBasedIndex, entryState, chunkState, blockStart, k1, k2, k3)
 			                       + (uint)logicalShard * 65537u + (uint)length * 257u
+			                       + constantChainState * 257u
 			                       + _context.Domains.ConstantMaskDomain + 2654435769u);
 			return unchecked(value * 1664525u + 1013904223u);
 		}
@@ -959,7 +977,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			int[] schema = DerivePermutation((int)ChunkStep.StepCount, k1, k2, k3, _context.Domains.SchemaPermutationDomain);
 			int[] constantTags = DerivePermutation(4, k1, k2, k3, _context.Domains.ConstantTagPermutationDomain);
 
-			byte[] BuildConstantCapsule(Constant constant, int constantIndex, uint entryState,
+			byte[] BuildConstantCapsule(Constant constant, int constantIndex, uint constantChainState, uint entryState,
 				uint chunkState, int blockStart)
 			{
 				int oneBasedIndex = constantIndex + 1;
@@ -988,7 +1006,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 						foreach (int logicalShard in shardOrder)
 						{
 							var shard = new List<byte>();
-							uint shardState = StringShardState(oneBasedIndex, logicalShard, value.Length,
+							uint shardState = StringShardState(oneBasedIndex, logicalShard, value.Length, constantChainState,
 								entryState, chunkState, blockStart, k1, k2, k3);
 							for (int position = logicalShard; position < value.Length; position += shardCount)
 							{
@@ -1104,9 +1122,14 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							// EntryState + ChunkState, producing real code/data record interleaving.
 							var logicalFragments = new List<byte[]>(count + constantReferences.Count);
 							logicalFragments.AddRange(instructionRecords);
+							uint constantChainState = BeginConstantChain(entryState, sourceChunkState, start + 1, k1, k2, k3);
 							foreach (int constantIndex in constantReferences)
-								logicalFragments.Add(BuildConstantCapsule(chunk.Constants[constantIndex - 1],
-									constantIndex - 1, entryState, sourceChunkState, start + 1));
+							{
+								byte[] capsule = BuildConstantCapsule(chunk.Constants[constantIndex - 1],
+									constantIndex - 1, constantChainState, entryState, sourceChunkState, start + 1);
+								logicalFragments.Add(capsule);
+								constantChainState = AdvanceConstantChain(constantChainState, capsule, constantIndex);
+							}
 
 							var blockBody = new List<byte>();
 							uint fragmentState = entryState ^ sourceChunkState;

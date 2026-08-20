@@ -934,7 +934,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"Columns","ColumnOrder","ColumnPositions","ColumnRead8","ColumnRead16","ColumnRead32","ColumnData","ColumnPosition","PhysicalSlot","Role",
 				"PrototypeDecoderMode","DecodePrototypeColumn","DecoderMode","Output","Shift","Divisor",
 				"Body","BodyPosition","FragmentCount","FragmentOrder","FragmentSpans","LogicalSlot","MinimumLength","ReadFragment","TargetSlot","Record","ReferenceSlots","HeaderWords","HeaderIndex",
-				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","StringShardState","DecodeConstantCapsule","StoredTag","EncodedBody","RawParts","Raw","Cons","StringParts","ShardCount","ShardOrder","ShardIndex","ShardOffset","ShardLength","ShardPosition","ShardByte","ExpectedShardLength","PreviousReference","Reference","ResolvedConstants","ResolvedConstantFlags",
+				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","BeginConstantChain","AdvanceConstantChain","ConstantChainState","StringShardState","DecodeConstantCapsule","StoredTag","EncodedBody","RawParts","Raw","Cons","StringParts","ShardCount","ShardOrder","ShardIndex","ShardOffset","ShardLength","ShardPosition","ShardByte","ExpectedShardLength","PreviousReference","Reference","ResolvedConstants","ResolvedConstantFlags",
 				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root","Blocks","BlockMap",
 				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
 				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier","CurrentChunkState",
@@ -992,7 +992,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"PageByteIndex","FramingIndex","MaskState","InnerKey","OuterKey","NestedByte","PlainByte","RawLength","Multiplier","SavedSourceLength","SavedSourceMode",
 				"CipherByte","KeyByte","EnvelopeReadWidth","Width","FieldIndex","LengthOffset","EncodedIndex","Left","Right","Counter","Word","Mixed","Absorb","PipelineState","PipelineIndex","TransformedByte","EncodedPartIndex",
 				"ChunkState","InitialChunkKey","ChunkChainKey","SourceChunkState","SourceEntryState","CurrentChunkState","WrappedChunkState","ChunkSuccessors",
-				"TargetIndex","TargetInstruction","ReferencedConstants","ResolveConstant","BeginPrototypeIntegrity","Words","WordIndex","Word",
+				"TargetIndex","TargetInstruction","ReferencedConstants","ResolveConstant","ReferenceSlot","PreviousCapsule","BeginPrototypeIntegrity","Words","WordIndex","Word",
 				"LayoutFrameA","LayoutFrameB","LayoutFrameC"
 				};
 			string[] luaKws = {"and","break","do","else","elseif","end","false","for","function","if","in","local","nil","not","or","repeat","return","then","true","until","while"};
@@ -2087,7 +2087,7 @@ local function GetProto(Proto, Index)
     return Encoded;
 end;
 
-local function DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3, ConstTags)
+local function DecodeConstantCapsule(Capsule, Index, ConstantChainState, EntryState, CurrentChunkState, BlockStart, K1, K2, K3, ConstTags)
     local SavedByteString, SavedPos = ByteString, Pos;
     local SavedSourceLength, SavedSourceMode = ActiveSourceLength, SourceIsPaged;
     ByteString, Pos, ActiveSourceLength, SourceIsPaged = Capsule, 1, #Capsule, false;
@@ -2130,7 +2130,7 @@ local function DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkSta
                 ExpectedShardLength = ExpectedShardLength + 1;
             end;
             if ShardLength ~= ExpectedShardLength or Pos + ShardLength - 1 > #Raw then error('invalid protected payload', 0); end;
-            local State = StringShardState(Index, ShardIndex, Length,
+            local State = StringShardState(Index, ShardIndex, Length, ConstantChainState,
                 EntryState, CurrentChunkState, BlockStart, K1, K2, K3);
             for I = 0, ShardLength - 1 do
                 local ShardPosition = ShardIndex + I * ShardCount;
@@ -2281,10 +2281,20 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     local ResolvedConstants, ResolvedConstantFlags = {}, {};
     local function ResolveConstant(Index)
         if ResolvedConstantFlags[Index] then return ResolvedConstants[Index]; end;
-        local LogicalSlot = ReferenceSlots[Index];
+        local ConstantChainState = BeginConstantChain(EntryState, CurrentChunkState, Block[1], K1, K2, K3);
+        local LogicalSlot;
+        for ReferenceIndex = 1, #References do
+            local Reference = References[ReferenceIndex];
+            local ReferenceSlot = ReferenceSlots[Reference];
+            if Reference == Index then LogicalSlot = ReferenceSlot; break; end;
+            local PreviousCapsule = ReadFragment(ReferenceSlot);
+            ConstantChainState = AdvanceConstantChain(ConstantChainState, PreviousCapsule, Reference);
+            PreviousCapsule = nil;
+        end;
         if not LogicalSlot then error('invalid protected payload', 0); end;
         local Capsule = ReadFragment(LogicalSlot);
-        local Value = DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkState, Block[1], K1, K2, K3, ConstTags);
+        local Value = DecodeConstantCapsule(Capsule, Index, ConstantChainState,
+            EntryState, CurrentChunkState, Block[1], K1, K2, K3, ConstTags);
         Capsule = nil;
         ResolvedConstantFlags[Index], ResolvedConstants[Index] = true, Value;
         return Value;
