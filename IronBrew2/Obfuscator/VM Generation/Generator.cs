@@ -937,7 +937,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
 				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
-				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched",
+				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched","HandlerReadStack","HandlerReadEnvironment","HandlerWriteStack","HandlerBinary","HandlerUnary","HandlerPc","HandlerFragmentIndex","HandlerFragmentValue","HandlerFragmentMode","HandlerFragmentLeft","HandlerFragmentRight","HandlerFragmentCurrent","HandlerFragmentTarget",
 				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetInfo","GuardInfo","GuardInspector",
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardEnvironmentRead","GuardGetGenV",
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
@@ -1443,6 +1443,185 @@ namespace IronBrew2.Obfuscator.VM_Generation
 						return "RawGet(Env,Inst[OP_B])";
 					});
 				return code;
+			}
+
+			// Handler fragment sharing: common operand acquisition, arithmetic,
+			// destination writeback and PC transitions are emitted once per dispatch
+			// scope. Terminal leaves retain only a composition of these fragments,
+			// rather than repeating one complete semantic dataflow per virtual opcode.
+			string[] binaryOperators = {"+", "-", "*", "/", "%", "^", ".."};
+			string[] unaryOperators = {"-", "not", "#"};
+			var usedFragmentTokens = new HashSet<uint>();
+			uint NewFragmentToken()
+			{
+				uint token;
+				do token = unchecked((uint)r.NextInt64(1L, 4294967296L));
+				while (!usedFragmentTokens.Add(token));
+				return token;
+			}
+			var binaryFragmentTokens = binaryOperators.ToDictionary(op => op, _ => NewFragmentToken());
+			var unaryFragmentTokens = unaryOperators.ToDictionary(op => op, _ => NewFragmentToken());
+			int handlerFragmentReadCalls = 0;
+			int handlerFragmentEnvironmentCalls = 0;
+			int handlerFragmentWriteCalls = 0;
+			int handlerFragmentBinaryCalls = 0;
+			int handlerFragmentUnaryCalls = 0;
+			int handlerFragmentPcCalls = 0;
+
+			string ApplyHandlerFragmentSharing(string code)
+			{
+				const string instructionField = @"Inst\s*\[\s*OP_[ABC]\s*\]";
+				string stackOperand = @"Stk\s*\[\s*" + instructionField + @"\s*\]";
+				string scalarOperand = "(?:" + stackOperand + "|" + instructionField + ")";
+
+				// Joint operation fragments are selected by build-random 32-bit tokens.
+				// Operand acquisition is fragmented separately in a later pass.
+				string binaryPattern = @"(?<left>" + scalarOperand + @")\s*(?<operator>\.\.|[+\-*/%^])\s*(?<right>" + scalarOperand + ")";
+				code = Regex.Replace(code, binaryPattern, match =>
+				{
+					string op = match.Groups["operator"].Value;
+					if (!binaryFragmentTokens.TryGetValue(op, out uint token))
+						return match.Value;
+					handlerFragmentBinaryCalls++;
+					return "HandlerBinary(" + ScrambleUInt(token) + "," +
+					       match.Groups["left"].Value + "," + match.Groups["right"].Value + ")";
+				});
+				string unaryPattern = @"(?<operator>not\s+|[-#])(?<value>" + scalarOperand + ")";
+				code = Regex.Replace(code, unaryPattern, match =>
+				{
+					string op = match.Groups["operator"].Value.Trim();
+					if (op == "-")
+					{
+						int previous = match.Index - 1;
+						while (previous >= 0 && char.IsWhiteSpace(code[previous])) previous--;
+						if (previous >= 0 && (char.IsLetterOrDigit(code[previous]) ||
+						    code[previous] == '_' || code[previous] == ']' || code[previous] == ')'))
+							return match.Value;
+					}
+					if (!unaryFragmentTokens.TryGetValue(op, out uint token))
+						return match.Value;
+					handlerFragmentUnaryCalls++;
+					return "HandlerUnary(" + ScrambleUInt(token) + "," + match.Groups["value"].Value + ")";
+				});
+
+				string simpleIndex = "(?:" + instructionField + @"|[A-Za-z_]\w*(?:\s*[+\-]\s*\d+)?)";
+				// Restrict regex-based writeback extraction to scalar values. Complex
+				// expressions may contain nested function/table bodies with semicolons;
+				// result-temporary lowering still routes those through this shared sink.
+				string directWriteValue = @"(?:[A-Za-z_]\w*|" + instructionField + @")";
+				string directWrite = @"Stk\s*\[\s*(?<index>" + simpleIndex + @")\s*\]\s*=(?!=)\s*(?<value>" + directWriteValue + @")\s*;";
+				code = Regex.Replace(code, directWrite, match =>
+				{
+					handlerFragmentWriteCalls++;
+					return "HandlerWriteStack(" + match.Groups["index"].Value + "," +
+					       match.Groups["value"].Value.Trim() + "," + ScrambleNumber(r.Next(2)) + ");";
+				});
+				// Only rewrite RawSet forms whose value is already a scalar temporary or
+				// instruction field. A regex must not consume nested call parentheses;
+				// complex direct RawSet forms remain valid and still share read fragments.
+				string rawWriteValue = @"(?:[A-Za-z_]\w*|" + instructionField + @")";
+				string rawWrite = @"RawSet\s*\(\s*Stk\s*,\s*(?<index>" + simpleIndex + @")\s*,\s*(?<value>" + rawWriteValue + @")\s*\)\s*;";
+				code = Regex.Replace(code, rawWrite, match =>
+				{
+					handlerFragmentWriteCalls++;
+					return "HandlerWriteStack(" + match.Groups["index"].Value + "," +
+					       match.Groups["value"].Value.Trim() + "," + ScrambleNumber(r.Next(2)) + ");";
+				});
+
+				string stackRead = @"Stk\s*\[\s*(?<index>" + simpleIndex + @")\s*\]";
+				code = Regex.Replace(code, stackRead, match =>
+				{
+					int cursor = match.Index + match.Length;
+					while (cursor < code.Length && char.IsWhiteSpace(code[cursor])) cursor++;
+					if (cursor < code.Length && code[cursor] == '=' &&
+					    (cursor + 1 >= code.Length || code[cursor + 1] != '='))
+						return match.Value;
+					handlerFragmentReadCalls++;
+					return "HandlerReadStack(" + match.Groups["index"].Value + "," + ScrambleNumber(r.Next(2)) + ")";
+				});
+				string rawStackRead = @"RawGet\s*\(\s*Stk\s*,\s*(?<index>" + simpleIndex + @")\s*\)";
+				code = Regex.Replace(code, rawStackRead, match =>
+				{
+					handlerFragmentReadCalls++;
+					return "HandlerReadStack(" + match.Groups["index"].Value + "," + ScrambleNumber(r.Next(2)) + ")";
+				});
+
+				string environmentRead = @"Env\s*\[\s*(?<index>" + simpleIndex + @")\s*\]";
+				code = Regex.Replace(code, environmentRead, match =>
+				{
+					int cursor = match.Index + match.Length;
+					while (cursor < code.Length && char.IsWhiteSpace(code[cursor])) cursor++;
+					if (cursor < code.Length && code[cursor] == '=' &&
+					    (cursor + 1 >= code.Length || code[cursor + 1] != '='))
+						return match.Value;
+					handlerFragmentEnvironmentCalls++;
+					return "HandlerReadEnvironment(" + match.Groups["index"].Value + "," + ScrambleNumber(r.Next(2)) + ")";
+				});
+				string rawEnvironmentRead = @"RawGet\s*\(\s*Env\s*,\s*(?<index>" + simpleIndex + @")\s*\)";
+				code = Regex.Replace(code, rawEnvironmentRead, match =>
+				{
+					handlerFragmentEnvironmentCalls++;
+					return "HandlerReadEnvironment(" + match.Groups["index"].Value + "," + ScrambleNumber(r.Next(2)) + ")";
+				});
+
+				code = Regex.Replace(code, @"InstrPoint\s*=\s*InstrPoint\s*\+\s*(\d+)\s*;", match =>
+				{
+					handlerFragmentPcCalls++;
+					return "InstrPoint=HandlerPc(InstrPoint," + match.Groups[1].Value + "," + ScrambleNumber(2) + ");";
+				});
+				code = Regex.Replace(code, @"InstrPoint\s*=\s*InstrPoint\s*-\s*(\d+)\s*;", match =>
+				{
+					handlerFragmentPcCalls++;
+					return "InstrPoint=HandlerPc(InstrPoint,-" + match.Groups[1].Value + "," + ScrambleNumber(2) + ");";
+				});
+				code = Regex.Replace(code, @"InstrPoint\s*=\s*Inst\s*\[\s*OP_B\s*\]\s*;", _ =>
+				{
+					handlerFragmentPcCalls++;
+					return "InstrPoint=HandlerPc(InstrPoint,Inst[OP_B]," + ScrambleNumber(1) + ");";
+				});
+				return code;
+			}
+
+			string BuildHandlerFragmentRuntime()
+			{
+				var fragment = new StringBuilder();
+				fragment.Append("local function HandlerReadStack(HandlerFragmentIndex,HandlerFragmentMode)")
+				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0))
+				        .Append(" then return Stk[HandlerFragmentIndex];end;return RawGet(Stk,HandlerFragmentIndex);end;");
+				fragment.Append("local function HandlerReadEnvironment(HandlerFragmentIndex,HandlerFragmentMode)")
+				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0))
+				        .Append(" then return Env[HandlerFragmentIndex];end;return RawGet(Env,HandlerFragmentIndex);end;");
+				fragment.Append("local function HandlerWriteStack(HandlerFragmentIndex,HandlerFragmentValue,HandlerFragmentMode)")
+				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0))
+				        .Append(" then Stk[HandlerFragmentIndex]=HandlerFragmentValue;else RawSet(Stk,HandlerFragmentIndex,HandlerFragmentValue);end;")
+				        .Append("return HandlerFragmentValue;end;");
+
+				fragment.Append("local function HandlerBinary(HandlerFragmentMode,HandlerFragmentLeft,HandlerFragmentRight)");
+				var binaryOrder = binaryOperators.OrderBy(_ => r.Next()).ToArray();
+				for (int index = 0; index < binaryOrder.Length; index++)
+				{
+					string op = binaryOrder[index];
+					fragment.Append(index == 0 ? "if " : "elseif ").Append("HandlerFragmentMode==")
+					        .Append(ScrambleUInt(binaryFragmentTokens[op])).Append(" then return HandlerFragmentLeft")
+					        .Append(op).Append("HandlerFragmentRight;");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+
+				fragment.Append("local function HandlerUnary(HandlerFragmentMode,HandlerFragmentValue)");
+				var unaryOrder = unaryOperators.OrderBy(_ => r.Next()).ToArray();
+				for (int index = 0; index < unaryOrder.Length; index++)
+				{
+					string op = unaryOrder[index];
+					fragment.Append(index == 0 ? "if " : "elseif ").Append("HandlerFragmentMode==")
+					        .Append(ScrambleUInt(unaryFragmentTokens[op])).Append(" then return ")
+					        .Append(op == "not" ? "not " : op).Append("HandlerFragmentValue;");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+				fragment.Append("local function HandlerPc(HandlerFragmentCurrent,HandlerFragmentTarget,HandlerFragmentMode)")
+				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0)).Append(" then return HandlerFragmentCurrent+").Append(ScrambleNumber(1)).Append(";")
+				        .Append("elseif HandlerFragmentMode==").Append(ScrambleNumber(1)).Append(" then return HandlerFragmentTarget;")
+				        .Append("else return HandlerFragmentCurrent+HandlerFragmentTarget;end;end;");
+				return fragment.ToString();
 			}
 
 			// Handler 结构多态：先用词法 statement splitter 找到安全边界，再从
@@ -2338,6 +2517,7 @@ end;";
 				? "GuardProbe(false);"
 				: "");
 			vm += T(loopRuntime);
+			vm += T(BuildHandlerFragmentRuntime());
 
 			if (settings.Noise)
 				vm += T(AntiDumpGenerator.GenerateLoopNoise(guardRandom));
@@ -2371,6 +2551,7 @@ end;";
 			string BuildHandler(int opcodeIndex)
 			{
 				string code = ApplySemanticPolymorphism(virtuals[opcodeIndex].GetObfuscated(_context));
+				code = ApplyHandlerFragmentSharing(code);
 				code = ApplyHandlerTemplate(code);
 				code = T(code);
 				code = ScrambleOps(code);
@@ -2661,6 +2842,12 @@ end;";
 			Console.WriteLine("Semantic lowering: writes=" + string.Join(",", semanticWriteVariants)
 				+ "; raw-stack-reads=" + semanticRawStackReads
 				+ "; raw-environment-reads=" + semanticRawEnvironmentReads + ".");
+			Console.WriteLine("Handler fragments: stack-read=" + handlerFragmentReadCalls
+				+ "; environment-read=" + handlerFragmentEnvironmentCalls
+				+ "; writeback=" + handlerFragmentWriteCalls
+				+ "; binary=" + handlerFragmentBinaryCalls
+				+ "; unary=" + handlerFragmentUnaryCalls
+				+ "; pc=" + handlerFragmentPcCalls + ".");
 
 			return vm;
 		}

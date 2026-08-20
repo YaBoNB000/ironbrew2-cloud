@@ -85,6 +85,7 @@ python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
 python3 tests/materializer_replay.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/constant_use_materialization.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/handler_fragment_sharing.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/prototype_decoder_families.py "$WORK/fixed.lua"
 python3 tests/prototype_runtime_abi.py "$WORK/fixed.lua"
 python3 tests/streaming_carrier.py "$WORK/fixed.lua"
@@ -481,6 +482,7 @@ derivation_profiles = [derivation_profile(layout["domains"]) for layout in layou
 payload_layout_vectors = [json.dumps(layout, sort_keys=True) for layout in payload_layouts]
 super_records = []
 semantic_records = []
+fragment_records = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
     match = re.search(
@@ -502,6 +504,13 @@ for index in range(1, runs + 1):
     if len(writes) != 6:
         raise SystemExit(f"semantic-lowering write profile is not six-way: {writes}")
     semantic_records.append((writes, int(semantic.group(2)), int(semantic.group(3))))
+    fragments = re.search(
+        r"Handler fragments: stack-read=(\d+); environment-read=(\d+); writeback=(\d+); binary=(\d+); unary=(\d+); pc=(\d+)\.",
+        log,
+    )
+    if not fragments:
+        raise SystemExit(f"missing handler-fragment coverage record for build {index}")
+    fragment_records.append(tuple(int(value) for value in fragments.groups()))
 slot_abis = [json.dumps({key: layout[key] for key in ("chunk", "block", "flow", "flow_cache")}, sort_keys=True)
              for layout in layouts]
 if min(counts) <= 44:
@@ -586,6 +595,12 @@ if len({record[0] for record in semantic_records}) < 3:
     raise SystemExit("semantic write-lowering profiles did not vary across builds")
 if sum(record[1] for record in semantic_records) <= 0 or sum(record[2] for record in semantic_records) <= 0:
     raise SystemExit(f"raw accessor lowering coverage is missing: {semantic_records}")
+fragment_totals = tuple(sum(record[index] for record in fragment_records) for index in range(6))
+if min(fragment_totals) <= 0:
+    raise SystemExit(f"a shared handler-fragment family was not exercised: {fragment_totals}")
+if any(record[0] < 50 or record[1] < 1 or record[2] < 25 or record[3] < 1 or record[5] < 25
+       for record in fragment_records):
+    raise SystemExit(f"handler fragments were not materially shared in every build: {fragment_records}")
 if len(set(slot_abis)) != runs:
     raise SystemExit("a runtime slot ABI was reused across builds")
 
