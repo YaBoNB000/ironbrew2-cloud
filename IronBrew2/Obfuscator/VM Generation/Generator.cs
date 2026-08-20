@@ -928,7 +928,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"Columns","ColumnOrder","ColumnPositions","ColumnRead8","ColumnRead16","ColumnRead32","ColumnData","ColumnPosition","PhysicalSlot","Role",
 				"PrototypeDecoderMode","DecodePrototypeColumn","DecoderMode","Output","Shift","Divisor",
 				"Body","BodyPosition","FragmentCount","FragmentOrder","FragmentSpans","LogicalSlot","MinimumLength","ReadFragment","TargetSlot","Record","ReferenceSlots","HeaderWords","HeaderIndex",
-				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","StoredTag","EncodedBody","RawParts","Raw","Cons","PreviousReference","Reference",
+				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","DecodeConstantCapsule","StoredTag","EncodedBody","RawParts","Raw","Cons","PreviousReference","Reference","ResolvedConstants","ResolvedConstantFlags",
 				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root","Blocks","BlockMap",
 				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
 				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier","CurrentChunkState",
@@ -950,7 +950,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
 				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
 				"GuardBehaviorKey","GuardFirstKey","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential",
-				"AllowMaterializer","MaterializeIndexSlot","MaterializeOpcodeSlot","MaterializeASlot","MaterializeBSlot","MaterializeCSlot","MaterializeStageSlot","MaterializeStage","MaterializeMode","MaterializeEnum","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction",
+				"AllowMaterializer","MaterializeIndexSlot","MaterializeOpcodeSlot","MaterializeASlot","MaterializeBSlot","MaterializeCSlot","MaterializeStageSlot","MaterializeConstantFieldsSlot","MaterializeConstantResolverSlot","MaterializeStage","MaterializeMode","MaterializeEnum","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction","MaterializedFields","MaterializedConstantFields","MaterializedConstantResolver",
+				"BindInstructionOperands","InstructionFields","InstructionConstantFields","InstructionConstantResolver","InstructionDecodedFields","InstructionDecodedValues","InstructionRemainingConstants","InstructionFieldKey","InstructionConstantIndex",
 				"GuardEvidenceFold","GuardEvidenceA","GuardEvidenceB","GuardEvidenceC","GuardEvidenceD","GuardCompatibility","GuardAttested","GuardKeyA","GuardKeyB","GuardKeyC","GuardKeyD","GuardPayloadBinding","BinderRotate16","SeedByte","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
 				"GuardClassOK1","GuardClassOK2","GuardClassOK3","GuardClassOK4","GuardCompileOK","GuardConstantProbe","GuardConstants","GuardConstantsOK",
 				"GuardCurrentEnvOK","GuardCurrentEnvironment","GuardCurrentIdentity","GuardExpected","GuardGame","GuardGetConstants","GuardGetProto","GuardGetProtos",
@@ -2059,18 +2060,22 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     local ReferenceSlots = {};
     for ReferenceIndex = 1, #References do ReferenceSlots[References[ReferenceIndex]] = Block[2] + ReferenceIndex; end;
     local ConstTags = DerivePermutation(4, K1, K2, K3, __IB2_DOMAIN_CONSTANT_TAG_PERMUTATION__);
+    local ResolvedConstants, ResolvedConstantFlags = {}, {};
     local function ResolveConstant(Index)
+        if ResolvedConstantFlags[Index] then return ResolvedConstants[Index]; end;
         local LogicalSlot = ReferenceSlots[Index];
         if not LogicalSlot then error('invalid protected payload', 0); end;
         local Capsule = ReadFragment(LogicalSlot);
         local Value = DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkState, Block[1], K1, K2, K3, ConstTags);
         Capsule = nil;
+        ResolvedConstantFlags[Index], ResolvedConstants[Index] = true, Value;
         return Value;
     end;
 
     local Descriptor = BitXOR(ColumnRead8(1), BlockFieldKey(EntryState, TargetIndex, 7, K1, K2, K3) % 256);
     if Descriptor >= 64 then error('invalid protected payload', 0); end;
     local Inst;
+    local InstructionConstantFields = {};
     if (gBit(Descriptor, 1, 1) == 0) then
         local Type = gBit(Descriptor, 2, 3);
         local Mask = gBit(Descriptor, 4, 6);
@@ -2094,9 +2099,9 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
             Inst[OP_C] = BitXOR(BitXOR(ColumnRead16(5), FieldKey(TargetIndex, 3, K1, K2, K3)), BlockFieldKey(EntryState, TargetIndex, 3, K1, K2, K3));
         end;
 
-        if gBit(Mask, 1, 1) == 1 then Inst[OP_A] = ResolveConstant(Inst[OP_A]); end;
-        if gBit(Mask, 2, 2) == 1 then Inst[OP_B] = ResolveConstant(Inst[OP_B]); end;
-        if gBit(Mask, 3, 3) == 1 then Inst[OP_C] = ResolveConstant(Inst[OP_C]); end;
+        if gBit(Mask, 1, 1) == 1 then InstructionConstantFields[OP_A] = Inst[OP_A]; end;
+        if gBit(Mask, 2, 2) == 1 then InstructionConstantFields[OP_B] = Inst[OP_B]; end;
+        if gBit(Mask, 3, 3) == 1 then InstructionConstantFields[OP_C] = Inst[OP_C]; end;
     elseif Descriptor == 1 then
         Inst = {nil, nil, nil, nil};
     else
@@ -2105,8 +2110,46 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     for Role = 1, 5 do
         if type(Columns[Role]) ~= 'string' or ColumnPositions[Role] ~= #Columns[Role] + 1 then error('invalid protected payload', 0); end;
     end;
-    Columns, FragmentSpans, Body = nil, nil, nil;
-    return Inst, Digest;
+    Columns = nil;
+    if next(InstructionConstantFields) == nil then
+        InstructionConstantFields, ResolveConstant = nil, nil;
+        FragmentSpans, Body, ReferenceSlots = nil, nil, nil;
+    end;
+    return Inst, Digest, InstructionConstantFields, ResolveConstant;
+end;
+
+-- Constant capsules stay inside the authenticated block body through all four
+-- synthetic field-replay passes. The operand proxy opens a capsule only when
+-- the selected handler first indexes that exact operand. Separate decoded flags
+-- preserve nil constants, and clearing the resolver releases retained block
+-- material as soon as every constant operand used by this invocation is read.
+local function BindInstructionOperands(InstructionFields, InstructionConstantFields, InstructionConstantResolver)
+    if not InstructionConstantFields then return InstructionFields; end;
+    local InstructionDecodedFields, InstructionDecodedValues = {}, {};
+    local InstructionRemainingConstants = 0;
+    for InstructionFieldKey in pairs(InstructionConstantFields) do
+        InstructionRemainingConstants = InstructionRemainingConstants + 1;
+    end;
+    if InstructionRemainingConstants == 0 or type(InstructionConstantResolver) ~= 'function' then
+        error('invalid protected payload', 0);
+    end;
+    return Setmetatable({}, {__index = function(_, InstructionFieldKey)
+        if InstructionDecodedFields[InstructionFieldKey] then
+            return InstructionDecodedValues[InstructionFieldKey];
+        end;
+        local InstructionConstantIndex = InstructionConstantFields and InstructionConstantFields[InstructionFieldKey];
+        if InstructionConstantIndex ~= nil then
+            local Value = InstructionConstantResolver(InstructionConstantIndex);
+            InstructionDecodedFields[InstructionFieldKey] = true;
+            InstructionDecodedValues[InstructionFieldKey] = Value;
+            InstructionRemainingConstants = InstructionRemainingConstants - 1;
+            if InstructionRemainingConstants == 0 then
+                InstructionConstantFields, InstructionConstantResolver = nil, nil;
+            end;
+            return Value;
+        end;
+        return InstructionFields[InstructionFieldKey];
+    end});
 end;
 
 local function SelectMaterializerEnum(Chunk, Stage)
@@ -2133,6 +2176,8 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     local MaterializeBSlot = MaterializeIndexSlot + 314187;
     local MaterializeCSlot = MaterializeIndexSlot + 418916;
     local MaterializeStageSlot = MaterializeIndexSlot + 523645;
+    local MaterializeConstantFieldsSlot = MaterializeIndexSlot + 628374;
+    local MaterializeConstantResolverSlot = MaterializeIndexSlot + 733103;
     local FlowCache = Flow[4];
     if AllowMaterializer and FlowCache and FlowCache[MaterializeIndexSlot] == Index then
         local MaterializeStage = FlowCache[MaterializeStageSlot];
@@ -2146,13 +2191,18 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
             FlowCache[MaterializeStageSlot] = MaterializeStage + 1;
             return {}, SelectMaterializerEnum(Chunk, MaterializeStage);
         end;
-        local MaterializedInstruction = {
+        local MaterializedFields = {
             FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
             FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot]
         };
+        local MaterializedConstantFields = FlowCache[MaterializeConstantFieldsSlot];
+        local MaterializedConstantResolver = FlowCache[MaterializeConstantResolverSlot];
+        local MaterializedInstruction = BindInstructionOperands(
+            MaterializedFields, MaterializedConstantFields, MaterializedConstantResolver);
         FlowCache[MaterializeIndexSlot], FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
-            FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot], FlowCache[MaterializeStageSlot] =
-            nil, nil, nil, nil, nil, nil;
+            FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot], FlowCache[MaterializeStageSlot],
+            FlowCache[MaterializeConstantFieldsSlot], FlowCache[MaterializeConstantResolverSlot] =
+            nil, nil, nil, nil, nil, nil, nil, nil;
         return MaterializedInstruction;
     end;
 
@@ -2201,7 +2251,8 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         error('invalid protected payload', 0);
     end;
 
-    local Inst, Digest = DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkState, PreviousOpcodeState, Index);
+    local Inst, Digest, InstructionConstantFields, InstructionConstantResolver = DecodeInstructionBlock(
+        Chunk, Block, EntryState, CurrentChunkState, PreviousOpcodeState, Index);
     local CurrentInstructionState = AdvanceInstructionState(
         PreviousInstructionState, Digest, Index, CurrentChunkState, EntryState);
     local CurrentInstructionSeal = InstructionStateSeal(
@@ -2222,8 +2273,12 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         FlowCache[MaterializeBSlot] = Inst[3];
         FlowCache[MaterializeCSlot] = Inst[4];
         FlowCache[MaterializeStageSlot] = 1;
+        FlowCache[MaterializeConstantFieldsSlot] = InstructionConstantFields;
+        FlowCache[MaterializeConstantResolverSlot] = InstructionConstantResolver;
         Inst = {};
         MaterializeEnum = SelectMaterializerEnum(Chunk, 0);
+    else
+        Inst = BindInstructionOperands(Inst, InstructionConstantFields, InstructionConstantResolver);
     end;
     __IB2_GUARD_BIND__
     return Inst, MaterializeEnum;

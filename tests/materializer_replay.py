@@ -18,33 +18,51 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     source = vm_path.read_text("latin1")
     code = _code_only(source)
 
-    # Recover six private overlay slots: PC plus opcode/A/B/C and stage. Each
-    # field remains isolated until four synthetic replay passes complete.
+    # Recover eight private overlay slots: PC, opcode/A/B/C, replay stage, the
+    # lazy constant-field map and its invocation-local resolver. Neither lazy
+    # constant object may be dropped before all four replay passes complete.
     slots = re.search(
         rf"local\s+({IDENT})\s*=\s*32\s*\+\s*\(\(.*?\)\s*%\s*104729\s*\)\s*;\s*"
         rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*104729\s*;\s*"
         rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*209458\s*;\s*"
         rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*314187\s*;\s*"
         rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*418916\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*523645\s*;",
+        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*523645\s*;\s*"
+        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*628374\s*;\s*"
+        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*733103\s*;",
         code,
         re.S,
     )
     if not slots:
-        raise ValueError("prototype-derived field materializer slots were not found")
-    index_slot, opcode_slot, a_slot, b_slot, c_slot, stage_slot = slots.groups()
+        raise ValueError("prototype-derived field/lazy-constant materializer slots were not found")
+    index_slot, opcode_slot, a_slot, b_slot, c_slot, stage_slot, constant_slot, resolver_slot = slots.groups()
 
     pending = re.search(
         rf"if\s+({IDENT})\s+and\s+({IDENT})\s+and\s+\2\[{re.escape(index_slot)}\]\s*==\s*({IDENT})\s+then"
         rf".*?if\s+({IDENT})\s*<\s*4\s+then\s*\2\[{re.escape(stage_slot)}\]\s*=\s*\4\s*\+\s*1\s*;"
         rf".*?\2\[{re.escape(index_slot)}\]\s*,\s*\2\[{re.escape(opcode_slot)}\]\s*,\s*\2\[{re.escape(a_slot)}\]\s*,\s*"
-        rf"\2\[{re.escape(b_slot)}\]\s*,\s*\2\[{re.escape(c_slot)}\]\s*,\s*\2\[{re.escape(stage_slot)}\]\s*=\s*"
-        rf"nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*;.*?return\s+({IDENT})\s*;",
+        rf"\2\[{re.escape(b_slot)}\]\s*,\s*\2\[{re.escape(c_slot)}\]\s*,\s*\2\[{re.escape(stage_slot)}\]\s*,\s*"
+        rf"\2\[{re.escape(constant_slot)}\]\s*,\s*\2\[{re.escape(resolver_slot)}\]\s*=\s*"
+        rf"nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*;"
+        rf".*?return\s+({IDENT})\s*;",
         code,
         re.S,
     )
     if not pending:
-        raise ValueError("four-stage field materialization/replay path was not found")
+        raise ValueError("four-stage field/lazy-constant materialization path was not found")
+
+    # The final replay must wrap the four raw fields in a lazy operand proxy
+    # before clearing both resolver slots from FlowCache.
+    flow_cache = pending.group(2)
+    binder_call = re.search(
+        rf"local\s+({IDENT})\s*=\s*{re.escape(flow_cache)}\[{re.escape(constant_slot)}\]\s*;\s*"
+        rf"local\s+({IDENT})\s*=\s*{re.escape(flow_cache)}\[{re.escape(resolver_slot)}\]\s*;\s*"
+        rf"local\s+({IDENT})\s*=\s*({IDENT})\s*\(\s*{IDENT}\s*,\s*\1\s*,\s*\2\s*\)\s*;",
+        pending.group(0),
+        re.S,
+    )
+    if not binder_call:
+        raise ValueError("lazy operand proxy was not bound at the final replay")
 
     # Every selected VM loop must request a top-level materializer and accept a
     # canonical Enum override before falling back to the prototype opcode bank.
@@ -78,7 +96,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     # production output. Comments are removed before this identifier check.
     final_code = _code_only(final_path.read_text("latin1")) if final_path else ""
     leaked = re.search(
-        r"\b(?:AllowMaterializer|SelectMaterializerEnum|Materialize(?:IndexSlot|OpcodeSlot|ASlot|BSlot|CSlot|StageSlot|Stage|Mode|Enum|Target|Delta)|MaterializedInstruction)\b",
+        r"\b(?:AllowMaterializer|SelectMaterializerEnum|BindInstructionOperands|Instruction(?:Fields|ConstantFields|ConstantResolver|DecodedFields|DecodedValues|RemainingConstants|FieldKey|ConstantIndex)|Materialize(?:IndexSlot|OpcodeSlot|ASlot|BSlot|CSlot|StageSlot|ConstantFieldsSlot|ConstantResolverSlot|Stage|Mode|Enum|Target|Delta)|Materialized(?:Instruction|Fields|ConstantFields|ConstantResolver))\b",
         code + "\n" + final_code,
     )
     if leaked:
@@ -86,7 +104,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
 
     print(
         "PASS invocation-local materializer replay: "
-        f"overlay-slots=derived, stages=4, fields=opcode/A/B/C, modes=4, opcode-leaves={opcode_ids}"
+        f"overlay-slots=derived, stages=4, fields=opcode/A/B/C+lazy-constants, modes=4, opcode-leaves={opcode_ids}"
     )
 
 

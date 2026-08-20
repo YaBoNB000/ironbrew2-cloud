@@ -84,6 +84,7 @@ cp "$ROOT/temp/t2.lua" "$WORK/fixed-vm.lua"
 python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
 python3 tests/materializer_replay.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/constant_use_materialization.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/prototype_decoder_families.py "$WORK/fixed.lua"
 python3 tests/prototype_runtime_abi.py "$WORK/fixed.lua"
 python3 tests/streaming_carrier.py "$WORK/fixed.lua"
@@ -886,7 +887,7 @@ python3 tests/phase4_dynamic_dump.py \
 run_executor "$WORK/phase4-runtime-instrumented.lua" > "$WORK/phase4-runtime-instrumented.out"
 head -n 1 "$WORK/phase4-runtime-instrumented.out" > "$WORK/phase4-runtime-instrumented-baseline.out"
 cmp "$WORK/phase4-runtime-baseline.out" "$WORK/phase4-runtime-instrumented-baseline.out"
-grep -Eq '^PHASE4_DYNAMIC payload=page:[1-9][0-9]*/[1-9][0-9]* vm=opaque:[1-9][0-9]* chunks=decoded:[2-9][0-9]*,opaque:[1-9][0-9]* constants=max-live:[0-3]/[1-9][0-9]* instructions=weak-live:0/[1-9][0-9]* memory-kb=[0-9]+\.[0-9]>[0-9]+\.[0-9]>[0-9]+\.[0-9]$' \
+grep -Eq '^PHASE4_DYNAMIC payload=page:[1-9][0-9]*/[1-9][0-9]* vm=opaque:[1-9][0-9]* chunks=decoded:[2-9][0-9]*,opaque:[1-9][0-9]* constants=max-live:[1-3]/[1-9][0-9]* instructions=weak-live:0/[1-9][0-9]* memory-kb=[0-9]+\.[0-9]>[0-9]+\.[0-9]>[0-9]+\.[0-9]$' \
     "$WORK/phase4-runtime-instrumented.out"
 echo "PASS Phase 4 dynamic dump, single-Chunk isolation and GC/peak-memory lifecycle barriers"
 
