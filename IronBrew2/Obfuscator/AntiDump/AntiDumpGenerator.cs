@@ -294,7 +294,7 @@ GuardDecoy = function(...)
 
             string guard = @"
 local GuardEvidenceFold, GuardEvidenceA, GuardEvidenceB, GuardEvidenceC, GuardEvidenceD;
-local GuardProbe, GuardBindPayload, GuardFaultWord, GuardDecoy;
+local GuardProbe, GuardBindPayload, GuardValidateCallTarget, GuardFaultWord, GuardDecoy;
 do
 local GuardString = PrimitiveString;
 local GuardTable = PrimitiveTable;
@@ -424,6 +424,28 @@ local function GuardClassifies(GuardFunction, GuardExpectedC)
     local GuardLOK, GuardLResult = PCall(GuardIsL, GuardFunction);
     return GuardCOK and GuardLOK and GuardCResult == GuardExpectedC
         and GuardLResult == (not GuardExpectedC);
+end;
+
+local GuardDynamicCalls = 0;
+GuardValidateCallTarget = function(GuardFunction)
+    if not RawEqual(GuardFunction, GuardLoadString) then return GuardFunction; end;
+    GuardDynamicCalls = GuardDynamicCalls + 1;
+    local GuardCurrentLoader = GuardLookup(__KEY_LOADSTRING__);
+    if not RawEqual(GuardCurrentLoader, GuardLoadString)
+        or not GuardClassifies(GuardFunction, true) then return GuardReject(); end;
+    local GuardDynamicChallenge = (__IB2_LOAD_EXPECTED__ + GuardState
+        + GuardCounter * 257 + GuardDynamicCalls * 65537) % 1000000007;
+    local GuardDynamicSource = Char(114) .. Char(101) .. Char(116) .. Char(117)
+        .. Char(114) .. Char(110) .. Char(32) .. ToString(GuardDynamicChallenge);
+    local GuardDynamicCompileOK, GuardDynamicLoaded = PCall(GuardFunction, GuardDynamicSource);
+    if not GuardDynamicCompileOK or Type(GuardDynamicLoaded) ~= 'function'
+        or not GuardClassifies(GuardDynamicLoaded, false) then return GuardReject(); end;
+    local GuardDynamicRunOK, GuardDynamicResult = PCall(GuardDynamicLoaded);
+    if not GuardDynamicRunOK or GuardDynamicResult ~= GuardDynamicChallenge then return GuardReject(); end;
+    local GuardDynamicConstantsOK, GuardDynamicConstants = PCall(GuardGetConstants, GuardDynamicLoaded);
+    if not GuardDynamicConstantsOK
+        or not GuardTableContains(GuardDynamicConstants, GuardDynamicChallenge) then return GuardReject(); end;
+    return GuardFunction;
 end;
 
 local function GuardCurrentIdentity()

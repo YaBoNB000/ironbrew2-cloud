@@ -951,7 +951,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardKeyBytes","GuardKeyMeta","GuardKeyCache","GuardKey","GuardKeyRecord","GuardKeyParts","GuardKeyIndex",
 				"GuardPayloadState","GuardPayloadSeal","GuardPayloadActive","GuardPayloadExpectedSeal","GuardBindPayload","GuardPayloadLow","GuardPayloadHigh",
 				"GuardVMState","GuardChunkState","GuardEntryState","GuardInstructionPoint","GuardVMLow","GuardVMHigh","GuardChunkLow","GuardChunkHigh","GuardEntryLow","GuardEntryHigh","GuardOpcodeState","GuardOpcodeSeal","GuardOpcodeLow","GuardOpcodeHigh",
-				"GuardProbe","Force","GuardScore","GuardHeavy",
+				"GuardProbe","GuardValidateCallTarget","GuardDynamicCalls","GuardDynamicChallenge","GuardDynamicSource","GuardDynamicCompileOK","GuardDynamicLoaded","GuardDynamicRunOK","GuardDynamicResult","GuardDynamicConstantsOK","GuardDynamicConstants","GuardCurrentLoader","Force","GuardScore","GuardHeavy",
 				"GuardCurrentIsC","GuardCurrentIsL","GuardNativeMisses","GuardOK1","GuardOK2","GuardOK3","GuardOK4",
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
 				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
@@ -1442,8 +1442,13 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				});
 				code = Regex.Replace(code,
 					@"Env\s*\[\s*Inst\s*\[\s*OP_B\s*\]\s*\]",
-					_ =>
+					match =>
 					{
+						int cursor = match.Index + match.Length;
+						while (cursor < code.Length && char.IsWhiteSpace(code[cursor])) cursor++;
+						if (cursor < code.Length && code[cursor] == '=' &&
+						    (cursor + 1 >= code.Length || code[cursor + 1] != '='))
+							return match.Value;
 						if (r.Next(2) == 0) return "Env[Inst[OP_B]]";
 						semanticRawEnvironmentReads++;
 						return "RawGet(Env,Inst[OP_B])";
@@ -2602,9 +2607,21 @@ end;";
 			
 			ComputeInstrs(_context.HeadChunk);
 
+			bool NeedsDynamicCallGuard(VOpcode opcode)
+			{
+				if (opcode is OpAlias alias) return NeedsDynamicCallGuard(alias.Target);
+				if (opcode is OpMutated mutated) return NeedsDynamicCallGuard(mutated.Mutated);
+				string name = opcode.GetType().Name;
+				return name.StartsWith("OpCall", StringComparison.Ordinal)
+				       || name.StartsWith("OpTailCall", StringComparison.Ordinal);
+			}
+
 			string BuildHandler(int opcodeIndex)
 			{
-				string code = ApplySemanticPolymorphism(virtuals[opcodeIndex].GetObfuscated(_context));
+				string code = virtuals[opcodeIndex].GetObfuscated(_context);
+				if (settings.AntiDump && NeedsDynamicCallGuard(virtuals[opcodeIndex]))
+					code = "Stk[Inst[OP_A]]=GuardValidateCallTarget(Stk[Inst[OP_A]]);" + code;
+				code = ApplySemanticPolymorphism(code);
 				code = ApplyHandlerFragmentSharing(code);
 				code = ApplyHandlerTemplate(code);
 				code = T(code);

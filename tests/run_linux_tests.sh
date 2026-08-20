@@ -88,6 +88,7 @@ python3 tests/constant_use_materialization.py "$WORK/fixed-vm.lua" "$WORK/fixed.
 python3 tests/handler_fragment_sharing.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/ir_native_fusion.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua"
 python3 tests/global_disable.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua" --late-nil-output "$WORK/late-getfenv-nil.lua"
+python3 tests/dynamic_loader_guard.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 "$LUAC" -p "$WORK/late-getfenv-nil.lua"
 run_executor "$WORK/late-getfenv-nil.lua" > "$WORK/late-getfenv-nil.out"
 cmp "$WORK/baseline.out" "$WORK/late-getfenv-nil.out"
@@ -960,6 +961,31 @@ set -e
 [[ $line_runtime_code -ne 0 ]]
 grep -q 'ERROR IN IRONBREW SCRIPT \[LINE 3\]' "$WORK/line-runtime.stderr"
 echo "PASS VM-internal line reporting with payload error disabled"
+
+# Every CALL/TAILCALL leaf validates a saved loadstring reference immediately
+# before invocation. Positive compilation succeeds; replacing the environment
+# binding after startup causes the saved alias call to enter the silent sink.
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/dynamic_loader.lua > "$WORK/dynamic-loader-build.log"
+mv out.lua "$WORK/dynamic-loader.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/dynamic-loader-vm.lua"
+"$LUAC" -p "$WORK/dynamic-loader.lua"
+python3 tests/dynamic_loader_guard.py "$WORK/dynamic-loader-vm.lua" "$WORK/dynamic-loader.lua"
+run_executor "$WORK/dynamic-loader.lua" > "$WORK/dynamic-loader.out"
+grep -qx 'dynamic-loader:321' "$WORK/dynamic-loader.out"
+
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/dynamic_loader_hook.lua > "$WORK/dynamic-loader-hook-build.log"
+mv out.lua "$WORK/dynamic-loader-hook.lua"
+"$LUAC" -p "$WORK/dynamic-loader-hook.lua"
+set +e
+timeout 2s "$LUA" tests/executor_runner.lua trusted "$WORK/dynamic-loader-hook.lua" \
+    > "$WORK/dynamic-loader-hook.stdout" 2> "$WORK/dynamic-loader-hook.stderr"
+dynamic_hook_code=$?
+set -e
+[[ $dynamic_hook_code -eq 124 ]]
+[[ ! -s "$WORK/dynamic-loader-hook.stdout" && ! -s "$WORK/dynamic-loader-hook.stderr" ]]
+echo "PASS per-call loadstring validation and post-startup hook rejection"
 
 # Simulate LuaJIT's signed 32-bit bit.bxor result.
 run_executor_mode signed-bit "$WORK/fixed.lua" > "$WORK/signed-bit.out"

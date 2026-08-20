@@ -115,6 +115,7 @@
 - [x] 准入采用硬性 AND，不使用评分或 quorum：同时要求稳定 `getgenv()`、`checkcaller()`、Roblox `game`/`Instance`/`Vector3`/`task` 行为、`iscclosure`/`islclosure`、`newcclosure`、`loadstring`、debug constants/upvalues/proto/setupvalue 及其行为契约。
 - [x] 捕获关键库表、原语、capability provider 和 debug inspector 身份；验证关键 primitive、动态 Lua closure、`newcclosure` 结果与 inspector 的 native/Lua provenance，并拒绝活动 debug hook 或中途替换。
 - [x] primitive root/member 与 VM Env 读取采用 raw-first/indexed-fallback；支持 builtins 仅通过 thread environment `__index` 暴露的 executor，并禁止任何 `RawGet(nil, key)` 路径。
+- [x] 所有 CALL/TAILCALL handler 在调用捕获的 `loadstring` 前执行即时身份、C/L provenance、动态编译/运行与 constants challenge；启动后替换环境 binding 会进入 silent sink。
 - [x] 每次生成随机 constants/upvalue/proto/load/newcclosure challenge，按固定顺序合成 transcript；仅完整成功的 transcript 才恢复该构建的 attestation token。
 - [x] `EnvironmentLock` 用 `Hash(salt|attestation token)` 派生 serializer seed；同一绑定还进入 initial flow key、edge transition key、flow verifier、完整 block manifest 和 initial route 解封，不再只是外层单点 `if bad then reject`。
 - [x] guard 状态用 seal 约束 token 与内部状态，并以状态更新产生 interval+jitter 调度；避免固定周期和绝对时序阈值。
