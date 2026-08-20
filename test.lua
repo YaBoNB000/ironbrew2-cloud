@@ -1,1 +1,2 @@
-local aop = 9
+local success, err = pcall(function()
+end)
