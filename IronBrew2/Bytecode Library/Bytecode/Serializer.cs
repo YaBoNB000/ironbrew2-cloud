@@ -785,6 +785,10 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			for (int localIndex = 0; localIndex < opcodeBank.Length; localIndex++)
 				opcodeToLocal[opcodeBank[localIndex]] = localIndex;
 
+			// Constant operands carry per-use random handles rather than stable
+			// prototype constant indices. Every occurrence gets its own capsule.
+			var constantsByHandle = new Dictionary<int, Constant>();
+
 			void WriteByte(byte value) => output.Add(value);
 			void WriteUInt16Local(ushort value) => WriteUInt16(output, value);
 			void WriteUInt32Local(uint value) => WriteUInt32(output, value);
@@ -912,6 +916,27 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			chunk.UpdateMappings();
 			foreach (Instruction instruction in chunk.Instructions) instruction.UpdateRegisters();
 			foreach (Instruction instruction in chunk.Instructions) instruction.CustomData?.Opcode?.Mutate(instruction);
+			var usedConstantHandles = new HashSet<int>();
+			int AssignConstantHandle(int oneBasedConstantIndex)
+			{
+				if (oneBasedConstantIndex < 1 || oneBasedConstantIndex > chunk.Constants.Count)
+					throw new InvalidOperationException("Invalid constant operand before handle assignment.");
+				int handle;
+				do handle = _random.Next(1, 65536); while (!usedConstantHandles.Add(handle));
+				constantsByHandle.Add(handle, chunk.Constants[oneBasedConstantIndex - 1]);
+				return handle;
+			}
+			foreach (Instruction physical in chunk.Instructions)
+			{
+				IEnumerable<Instruction> members = physical.CustomData?.FusedInstructions ?? (IEnumerable<Instruction>)new[] {physical};
+				foreach (Instruction member in members)
+				{
+					if ((member.ConstantMask & InstructionConstantMask.RA) != 0) member.A = AssignConstantHandle(member.A);
+					if ((member.ConstantMask & InstructionConstantMask.RB) != 0) member.B = AssignConstantHandle(member.B);
+					if ((member.ConstantMask & InstructionConstantMask.RC) != 0) member.C = AssignConstantHandle(member.C);
+				}
+			}
+
 			DispatcherFlatteningDecision flattening = _settings.ControlFlow
 				? DispatcherFlatteningPlanner.Apply(chunk, _context.MaxBlockInstructions)
 				: null;
@@ -976,10 +1001,10 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			int[] schema = DerivePermutation((int)ChunkStep.StepCount, k1, k2, k3, _context.Domains.SchemaPermutationDomain);
 			int[] constantTags = DerivePermutation(4, k1, k2, k3, _context.Domains.ConstantTagPermutationDomain);
 
-			byte[] BuildConstantCapsule(Constant constant, int constantIndex, uint constantChainState, uint entryState,
+			byte[] BuildConstantCapsule(Constant constant, int constantHandle, uint constantChainState, uint entryState,
 				uint chunkState, int blockStart)
 			{
-				int oneBasedIndex = constantIndex + 1;
+				int oneBasedIndex = constantHandle;
 				var raw = new List<byte>();
 				raw.Add((byte)constantTags[(int)constant.Type]);
 				switch (constant.Type)
@@ -1112,9 +1137,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								}
 							}
 							List<int> constantReferences = referenceSet.OrderBy(value => value).ToList();
-							foreach (int constantIndex in constantReferences)
-								if (constantIndex < 1 || constantIndex > chunk.Constants.Count)
-									throw new InvalidOperationException("Invalid block constant reference.");
+							foreach (int constantHandle in constantReferences)
+								if (!constantsByHandle.ContainsKey(constantHandle))
+									throw new InvalidOperationException("Invalid block constant handle.");
 
 							// Logical records are instruction windows followed by this block's
 							// state-bound constant partition.  Their physical order is shuffled from
@@ -1122,12 +1147,12 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							var logicalFragments = new List<byte[]>(count + constantReferences.Count);
 							logicalFragments.AddRange(instructionRecords);
 							uint constantChainState = BeginConstantChain(entryState, sourceChunkState, start + 1, k1, k2, k3);
-							foreach (int constantIndex in constantReferences)
+							foreach (int constantHandle in constantReferences)
 							{
-								byte[] capsule = BuildConstantCapsule(chunk.Constants[constantIndex - 1],
-									constantIndex - 1, constantChainState, entryState, sourceChunkState, start + 1);
+								byte[] capsule = BuildConstantCapsule(constantsByHandle[constantHandle],
+									constantHandle, constantChainState, entryState, sourceChunkState, start + 1);
 								logicalFragments.Add(capsule);
-								constantChainState = AdvanceConstantChain(constantChainState, capsule, constantIndex);
+								constantChainState = AdvanceConstantChain(constantChainState, capsule, constantHandle);
 							}
 
 							var blockBody = new List<byte>();

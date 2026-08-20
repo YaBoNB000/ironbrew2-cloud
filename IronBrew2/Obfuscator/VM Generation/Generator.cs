@@ -2061,7 +2061,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 	    local Block = Blocks[BlockIndex];
 	    local References = Block[4];
 	    for ReferenceIndex = 1, #References do
-	        if References[ReferenceIndex] > ConstCount then error('invalid protected payload', 0); end;
+	        if References[ReferenceIndex] < 1 or References[ReferenceIndex] > 65535 then error('invalid protected payload', 0); end;
 	    end;
 	    local SuccessorRecords = Block[9];
 	    for SuccessorIndex = 1, #SuccessorRecords do

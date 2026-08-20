@@ -37,7 +37,7 @@ python3 tests/static_attack_baseline.py test_obf.lua \
 4. **Prototype parsing** — derives build-local schema and validates prototype/block manifests.
 5. **Constant recovery** — opens state-bound capsules, then replays each block's ordered cross-capsule ciphertext chain, derives each string's shard order/state and reassembles interleaved inner-masked bytes, including constants referenced only by supplemental fused members.
 6. **Opcode recovery** — derives each prototype opcode bank and chained opcode state to recover the canonical head-opcode ID of every physical record.
-7. **Fusion recovery** — parses descriptor bit 6, supplemental member descriptors, physical/logical widths and fused constant references.
+7. **Fusion recovery** — parses descriptor bit 6, supplemental member descriptors, physical/logical widths, randomized per-use constant handles and fused constant references.
 
 The harness stops before assigning Lua semantic names to every canonical handler or every member operation. The final wrapper still contains the randomized fusion handler and shared-fragment implementations, so a sufficiently capable static analyzer can continue with control/data-flow classification.
 

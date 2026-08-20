@@ -1299,8 +1299,8 @@ def parse_prototype(
     occupied = [False] * (prototype.instruction_count + 1)
     starts = {block.start_pc for block in prototype.blocks}
     for block in prototype.blocks:
-        if any(not 1 <= item <= prototype.constant_count for item in block.references):
-            raise ValueError("block references a missing prototype constant")
+        if any(not 1 <= item <= 65535 for item in block.references):
+            raise ValueError("block references an invalid per-use constant handle")
         for pc in range(block.start_pc, block.start_pc + block.count):
             if occupied[pc]:
                 raise ValueError("overlapping instruction blocks")

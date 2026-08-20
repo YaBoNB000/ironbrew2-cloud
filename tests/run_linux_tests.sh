@@ -399,6 +399,18 @@ run_executor "$WORK/microblock.lua" > "$WORK/microblock.out"
 cmp "$WORK/microblock-baseline.out" "$WORK/microblock.out"
 echo "PASS branch-free synthetic micro-block routing"
 
+# Repeated uses of one logical constant must receive independent random handles
+# and independent capsules instead of exposing one stable prototype index.
+"$LUA" tests/per_use_constants.lua > "$WORK/per-use-constants-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/per_use_constants.lua > "$WORK/per-use-constants-build.log"
+mv out.lua "$WORK/per-use-constants.lua"
+"$LUAC" -p "$WORK/per-use-constants.lua"
+python3 tests/per_use_constant_handles.py "$WORK/per-use-constants.lua" --expect repeated-value
+run_executor "$WORK/per-use-constants.lua" > "$WORK/per-use-constants.out"
+cmp "$WORK/per-use-constants-baseline.out" "$WORK/per-use-constants.out"
+echo "PASS per-use randomized constant handles"
+
 # Repeat randomized prototype keys, opcode maps, schema orders and dispatcher
 # control-flow templates. Each generated VM is parsed structurally before it is
 # executed, so template diversity never replaces semantic validation.
