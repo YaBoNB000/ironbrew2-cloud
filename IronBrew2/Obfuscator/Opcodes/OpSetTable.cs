@@ -9,7 +9,7 @@ namespace IronBrew2.Obfuscator.Opcodes
 			instruction.OpCode == Opcode.SetTable && instruction.B <= 255 && instruction.C <= 255;
 
 		public override string GetObfuscated(ObfuscationContext context) =>
-			"Stk[Inst[OP_A]][Stk[Inst[OP_B]]]=Stk[Inst[OP_C]];";
+			"HandlerTableWrite(" + context.TableWriteTokens[0] + ",Inst);";
 	}
 	
 	public class OpSetTableB : VOpcode
@@ -18,7 +18,7 @@ namespace IronBrew2.Obfuscator.Opcodes
 			instruction.OpCode == Opcode.SetTable && instruction.B > 255 && instruction.C <= 255;
 
 		public override string GetObfuscated(ObfuscationContext context) =>
-			"Stk[Inst[OP_A]][Inst[OP_B]] = Stk[Inst[OP_C]];";
+			"HandlerTableWrite(" + context.TableWriteTokens[1] + ",Inst);";
 
 		public override void Mutate(Instruction instruction)
 		{
@@ -33,7 +33,7 @@ namespace IronBrew2.Obfuscator.Opcodes
 			instruction.OpCode == Opcode.SetTable && instruction.B <= 255 && instruction.C > 255;
 
 		public override string GetObfuscated(ObfuscationContext context) =>
-			"Stk[Inst[OP_A]][Stk[Inst[OP_B]]] = Inst[OP_C];";
+			"HandlerTableWrite(" + context.TableWriteTokens[2] + ",Inst);";
 
 		public override void Mutate(Instruction instruction)
 		{
@@ -48,7 +48,7 @@ namespace IronBrew2.Obfuscator.Opcodes
 			instruction.OpCode == Opcode.SetTable && instruction.B > 255 && instruction.C > 255;
 
 		public override string GetObfuscated(ObfuscationContext context) =>
-			"Stk[Inst[OP_A]][Inst[OP_B]] = Inst[OP_C];";
+			"HandlerTableWrite(" + context.TableWriteTokens[3] + ",Inst);";
 
 		public override void Mutate(Instruction instruction)
 		{

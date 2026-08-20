@@ -50,6 +50,7 @@ namespace IronBrew2.Obfuscator
 		// Build-local synthetic micro-block limit. Small randomized straight-line
 		// partitions force even branch-free payloads through route/state boundaries.
 		public int MaxBlockInstructions;
+		public uint[] TableWriteTokens;
 
 		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|attestation token)，
 		// 序列化头部只写盐，VM 端严格探针成功后才派生同一种子。

@@ -411,6 +411,19 @@ run_executor "$WORK/per-use-constants.lua" > "$WORK/per-use-constants.out"
 cmp "$WORK/per-use-constants-baseline.out" "$WORK/per-use-constants.out"
 echo "PASS per-use randomized constant handles"
 
+# SETTABLE key and value operands are acquired through independent tokenized
+# fragments before one shared commit fragment.
+"$LUA" tests/table_materialization.lua > "$WORK/table-materialization-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/table_materialization.lua > "$WORK/table-materialization-build.log"
+mv out.lua "$WORK/table-materialization.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/table-materialization-vm.lua"
+"$LUAC" -p "$WORK/table-materialization.lua"
+python3 tests/table_materialization.py "$WORK/table-materialization-vm.lua" "$WORK/table-materialization.lua"
+run_executor "$WORK/table-materialization.lua" > "$WORK/table-materialization.out"
+cmp "$WORK/table-materialization-baseline.out" "$WORK/table-materialization.out"
+echo "PASS separated table key/value materialization"
+
 # Repeat randomized prototype keys, opcode maps, schema orders and dispatcher
 # control-flow templates. Each generated VM is parsed structurally before it is
 # executed, so template diversity never replaces semantic validation.

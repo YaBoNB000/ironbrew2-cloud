@@ -944,7 +944,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
 				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
-				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched","HandlerReadStack","HandlerReadEnvironment","HandlerWriteStack","HandlerBinary","HandlerUnary","HandlerPc","HandlerFragmentIndex","HandlerFragmentValue","HandlerFragmentMode","HandlerFragmentLeft","HandlerFragmentRight","HandlerFragmentCurrent","HandlerFragmentTarget",
+				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched","HandlerReadStack","HandlerReadEnvironment","HandlerWriteStack","HandlerTableWrite","HandlerTableAcquireKey","HandlerTableAcquireValue","HandlerTableCommit","HandlerTableTarget","HandlerTableKey","HandlerTableValue","HandlerTableMode","HandlerBinary","HandlerUnary","HandlerPc","HandlerFragmentIndex","HandlerFragmentValue","HandlerFragmentMode","HandlerFragmentLeft","HandlerFragmentRight","HandlerFragmentCurrent","HandlerFragmentTarget",
 				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetInfo","GuardInfo","GuardInspector",
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardEnvironmentRead","GuardGetGenV",
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
@@ -1473,6 +1473,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			}
 			var binaryFragmentTokens = binaryOperators.ToDictionary(op => op, _ => NewFragmentToken());
 			var unaryFragmentTokens = unaryOperators.ToDictionary(op => op, _ => NewFragmentToken());
+			_context.TableWriteTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
+			bool[] tableWriteValueFirst = Enumerable.Range(0, 4).Select(_ => r.Next(2) == 0).ToArray();
 			int handlerFragmentReadCalls = 0;
 			int handlerFragmentEnvironmentCalls = 0;
 			int handlerFragmentWriteCalls = 0;
@@ -1608,6 +1610,32 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0))
 				        .Append(" then Stk[HandlerFragmentIndex]=HandlerFragmentValue;else RawSet(Stk,HandlerFragmentIndex,HandlerFragmentValue);end;")
 				        .Append("return HandlerFragmentValue;end;");
+
+				fragment.Append("local function HandlerTableAcquireKey(HandlerTableMode,InstructionFields)")
+				        .Append("if HandlerTableMode==").Append(ScrambleUInt(_context.TableWriteTokens[0]))
+				        .Append(" or HandlerTableMode==").Append(ScrambleUInt(_context.TableWriteTokens[2]))
+				        .Append(" then return HandlerReadStack(InstructionFields[3],").Append(ScrambleNumber(r.Next(2))).Append(");end;")
+				        .Append("return InstructionFields[3];end;");
+				fragment.Append("local function HandlerTableAcquireValue(HandlerTableMode,InstructionFields)")
+				        .Append("if HandlerTableMode==").Append(ScrambleUInt(_context.TableWriteTokens[0]))
+				        .Append(" or HandlerTableMode==").Append(ScrambleUInt(_context.TableWriteTokens[1]))
+				        .Append(" then return HandlerReadStack(InstructionFields[4],").Append(ScrambleNumber(r.Next(2))).Append(");end;")
+				        .Append("return InstructionFields[4];end;");
+				fragment.Append("local function HandlerTableCommit(HandlerTableTarget,HandlerTableKey,HandlerTableValue)")
+				        .Append("HandlerTableTarget[HandlerTableKey]=HandlerTableValue;return HandlerTableValue;end;");
+				fragment.Append("local function HandlerTableWrite(HandlerTableMode,InstructionFields)")
+				        .Append("local HandlerTableTarget=HandlerReadStack(InstructionFields[2],").Append(ScrambleNumber(r.Next(2))).Append(");")
+				        .Append("local HandlerTableKey,HandlerTableValue;");
+				for (int index = 0; index < _context.TableWriteTokens.Length; index++)
+				{
+					fragment.Append(index == 0 ? "if " : "elseif ").Append("HandlerTableMode==")
+					        .Append(ScrambleUInt(_context.TableWriteTokens[index])).Append(" then ");
+					if (tableWriteValueFirst[index])
+						fragment.Append("HandlerTableValue=HandlerTableAcquireValue(HandlerTableMode,InstructionFields);HandlerTableKey=HandlerTableAcquireKey(HandlerTableMode,InstructionFields);");
+					else
+						fragment.Append("HandlerTableKey=HandlerTableAcquireKey(HandlerTableMode,InstructionFields);HandlerTableValue=HandlerTableAcquireValue(HandlerTableMode,InstructionFields);");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;return HandlerTableCommit(HandlerTableTarget,HandlerTableKey,HandlerTableValue);end;");
 
 				fragment.Append("local function HandlerBinary(HandlerFragmentMode,HandlerFragmentLeft,HandlerFragmentRight)");
 				var binaryOrder = binaryOperators.OrderBy(_ => r.Next()).ToArray();
