@@ -432,7 +432,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				FoldMutations(mutations, used, _c);
 		}
 
-		private static bool[] BuildSuperOperatorBarrierMap(Chunk chunk)
+		private bool[] BuildSuperOperatorBarrierMap(Chunk chunk)
 		{
 			var barriers = new bool[chunk.Instructions.Count + 1];
 			void Mark(int index)
@@ -444,7 +444,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			// Treat both semantic CFG entries and serializer-imposed bounded-block cuts
 			// as hard fusion boundaries. Marking the preceding instruction still allows
 			// a new fusion to begin at the destination block.
-			ControlFlowGraph graph = ControlFlowGraph.Build(chunk, DispatcherFlatteningPlanner.MaxBlockInstructions);
+			ControlFlowGraph graph = ControlFlowGraph.Build(chunk, _context.MaxBlockInstructions);
 			foreach (ControlFlowBlock block in graph.Blocks)
 				if (block.Start > 0) Mark(block.Start - 1);
 
@@ -848,6 +848,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			Random guardRandom = _context.Seed.GetStream("runtime.guard");
 			Random payloadCarrierRandom = _context.Seed.GetStream("payload.carrier");
 			VMLayout vmLayout = VMLayoutSelector.Select(layoutRandom);
+			Console.WriteLine("Synthetic micro-block limit: " + _context.MaxBlockInstructions + ".");
 
 			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
 			                                 .Where(t => t.IsSubclassOf(typeof(VOpcode)))

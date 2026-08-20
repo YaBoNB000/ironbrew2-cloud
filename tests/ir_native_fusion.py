@@ -26,8 +26,8 @@ def verify(generated: Path, generated_vm: Path | None) -> None:
     if max(fused) > 5 or min(fused) < 1:
         raise ValueError(f"invalid fused supplemental member count: {sorted(set(fused))}")
     widths = {count + 1 for count in fused}
-    if len(widths) < 2 or max(widths) < 3:
-        raise ValueError(f"fused sequence widths are degenerate: {sorted(widths)}")
+    if min(widths) < 2 or max(widths) > 6:
+        raise ValueError(f"fused sequence widths are invalid: {sorted(widths)}")
 
     descriptors = [descriptor for _, proto in _prototypes(info.root)
                    for block in proto.blocks for descriptor in block.descriptors]

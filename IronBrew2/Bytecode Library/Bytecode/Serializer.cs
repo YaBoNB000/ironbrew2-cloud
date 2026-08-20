@@ -16,7 +16,6 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private const byte BasicBlockFeature = 2;
 		private const byte DispatcherFlatteningFeature = 4;
 		private const byte EntropyEnvelopeFeature = 8;
-		private const int MaxBlockInstructions = DispatcherFlatteningPlanner.MaxBlockInstructions;
 		private const int EntropyMinBytes = 64 * 1024;
 		private const int EntropyMaxBytes = 96 * 1024;
 		private const int PayloadPageMinBytes = 2048;
@@ -914,7 +913,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			foreach (Instruction instruction in chunk.Instructions) instruction.UpdateRegisters();
 			foreach (Instruction instruction in chunk.Instructions) instruction.CustomData?.Opcode?.Mutate(instruction);
 			DispatcherFlatteningDecision flattening = _settings.ControlFlow
-				? DispatcherFlatteningPlanner.Apply(chunk)
+				? DispatcherFlatteningPlanner.Apply(chunk, _context.MaxBlockInstructions)
 				: null;
 			if (!_settings.ControlFlow)
 			{
@@ -923,7 +922,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			}
 
 			ControlFlowGraph controlFlow = flattening?.Graph ??
-			                                   ControlFlowGraph.Build(chunk, MaxBlockInstructions);
+			                                   ControlFlowGraph.Build(chunk, _context.MaxBlockInstructions);
 			var instructionBlocks = controlFlow.Blocks.ToList();
 			if (controlFlow.EntryBlock == null)
 				throw new InvalidOperationException("Prototype has no entry block.");

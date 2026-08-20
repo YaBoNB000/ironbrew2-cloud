@@ -319,7 +319,7 @@ DOTNET=/path/to/dotnet LUA=/path/to/lua LUAC=/path/to/luac \
 3. root prototype 的 schema、opaque constant capsules 和 block framing 仍在启动时恢复，但常量值只在引用它的完整 block manifest 认证后、实际 handler operand 首次读取时进入 invocation-local cache。字符串进一步拆为 1–7 个 prototype-keyed shards，按逻辑列分配字节、物理顺序 permutation 并各自 rolling-mask；outer capsule unmask 不再直接得到连续明文。 每个后续字符串的 inner state 还顺序吸收该 block 前序 capsule 的完整 authenticated ciphertext；静态工具必须恢复 block reference order 并重放整条 constant chain，不能独立打开单个 later capsule。默认 AntiDump 模式不会在共享 Chunk 表累积明文常量或指令；不过 capsule、索引和恢复算法都留在客户端，分析者仍可 hook capsule decode 或逐块触发执行来收集值。
 4. CFG state 是客户端执行一致性与反静态批量恢复机制，不是不可伪造的 CFI 信任根。修改 VM、跳过 verifier，或在每个临时块进入 handler 前主动收集，仍可绕过本地保护。
 5. 当前每个 block 使用一个固定 entry state；多前驱通过不同 wrapped edge 恢复同一目标状态。尚未实现按 predecessor 产生多版本 block 或动态 state merge。
-6. 自动 dispatcher 已按 prototype 启用，但它复用随机物理 block 和 VM route token，不是把原 Lua 指令复制成多版本 block；客户端仍可在 route 解析后观测真实 PC。
+6. 自动 dispatcher 已按 prototype 启用；每 Build 还随机采用 3–6 instruction synthetic micro-block limit，使无分支直线区域也形成多个独立 manifest/route/entry-state blocks。但它仍复用随机物理 block 和 VM route token，不是把原 Lua 指令复制成多版本 block；客户端仍可在 route 解析后观测真实 PC。
 7. Mutation 仍关闭；IR-native superoperator 已启用并覆盖 CFG、CLOSURE/CLOSE、SETLIST/data word 与 variable-return 安全边界，10-build/CI 随机语义矩阵验证 physical lowering。
 8. 前端仍是 Lua 5.1 bytecode，不是完整 Luau 前端。Roblox/Luau 专有语法需要单独支持；“Luau/Roblox 优先”目前仅指 capability-gated 运行时防护。
 9. 活动合法调试 hook 会进入无限静默 sink。准入是 hard-AND，因此缺失某项 inspector 或行为差异的真实执行器也会被拒绝；本实现不承诺覆盖所有定制执行器或零误报。恶意宿主若一致伪造 closure/debug/provenance/host 全部契约，客户端无法从根本上区分。

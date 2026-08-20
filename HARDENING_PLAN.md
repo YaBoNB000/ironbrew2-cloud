@@ -68,6 +68,7 @@
 ### Phase 3：真实 CFG 与执行状态耦合（核心状态协议已完成）
 
 - [x] 在 serializer 侧建立稳定 basic-block leader 与有界分区，供按需解码使用。
+- [x] 每 Build 随机选择 3–6 条 synthetic micro-block limit；无分支直线代码也拆为多个独立 route token / entry state / manifest blocks。
 - [x] 在 IR 上补全显式 CFG edge / predecessor 模型，并实际用于 wire successor records 与状态变换。
 - [x] 自动选择安全 prototype 做 route-state dispatcher flattening，不要求源码 marker；跨 basic-block 转移先变为随机状态 token，再由 invocation-local dispatcher 恢复目标入口。
 - [x] descriptor、opcode 与 operand mask 绑定每个基本块的独立随机入口状态；opcode 只在带当前状态的 dispatch 中恢复。

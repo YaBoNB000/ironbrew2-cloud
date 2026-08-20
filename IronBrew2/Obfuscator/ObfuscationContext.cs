@@ -47,6 +47,10 @@ namespace IronBrew2.Obfuscator
 		public int VirtualOpcodeCount;
 		public int VirtualOpcodeAliasCount;
 
+		// Build-local synthetic micro-block limit. Small randomized straight-line
+		// partitions force even branch-free payloads through route/state boundaries.
+		public int MaxBlockInstructions;
+
 		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|attestation token)，
 		// 序列化头部只写盐，VM 端严格探针成功后才派生同一种子。
 		public uint XorSeed;
@@ -74,6 +78,7 @@ namespace IronBrew2.Obfuscator
 			PayloadFormat = new PayloadFormatLayout(Domains);
 
 			BuildRandom schemaRandom = Seed.GetStream("bytecode.schema");
+			MaxBlockInstructions = 3 + schemaRandom.Next(4);
 			InstructionSteps1 = Enumerable.Range(0, (int) InstructionStep1.StepCount).Select(i => (InstructionStep1) i).ToArray();
 			InstructionSteps1.Shuffle(schemaRandom);
 			

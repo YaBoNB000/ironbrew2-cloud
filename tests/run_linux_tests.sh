@@ -387,6 +387,18 @@ run_executor "$WORK/dispatcher-fallback-instrumented.lua" > "$WORK/dispatcher-fa
 cmp "$WORK/dispatcher-fallback-baseline.out" "$WORK/dispatcher-fallback.out"
 echo "PASS unsupported dispatcher shape falls back without partial metadata"
 
+# Branch-free code is still split into build-random 3–6 instruction micro-blocks
+# with independent route/state records.
+"$LUA" tests/microblock_straight.lua > "$WORK/microblock-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/microblock_straight.lua > "$WORK/microblock-build.log"
+mv out.lua "$WORK/microblock.lua"
+"$LUAC" -p "$WORK/microblock.lua"
+python3 tests/synthetic_microblocks.py "$WORK/microblock.lua" "$WORK/microblock-build.log"
+run_executor "$WORK/microblock.lua" > "$WORK/microblock.out"
+cmp "$WORK/microblock-baseline.out" "$WORK/microblock.out"
+echo "PASS branch-free synthetic micro-block routing"
+
 # Repeat randomized prototype keys, opcode maps, schema orders and dispatcher
 # control-flow templates. Each generated VM is parsed structurally before it is
 # executed, so template diversity never replaces semantic validation.
@@ -491,8 +503,13 @@ payload_layout_vectors = [json.dumps(layout, sort_keys=True) for layout in paylo
 super_records = []
 semantic_records = []
 fragment_records = []
+micro_limits = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
+    micro = re.search(r"Synthetic micro-block limit: ([3-6])\.", log)
+    if not micro:
+        raise SystemExit(f"missing synthetic micro-block limit for build {index}")
+    micro_limits.append(int(micro.group(1)))
     match = re.search(
         r"Created (\d+) IR-native super operators; folded (\d+) sequences; lengths ([0-9:,]+); structure ([0-9a-f]{8})\.",
         log,
@@ -535,6 +552,8 @@ if set(templates) != expected_templates:
 expected_vm_layouts = {"dual-partitioned", "tiered-partitioned", "hybrid-locals"}
 if set(vm_layout_templates) != expected_vm_layouts:
     raise SystemExit(f"not all VM layout templates were emitted: {sorted(set(vm_layout_templates))}")
+if len(set(micro_limits)) < 3:
+    raise SystemExit(f"synthetic micro-block limit diversity is insufficient: {sorted(set(micro_limits))}")
 # Compact frame layouts are sampled from a finite space; a small number of exact
 # collisions is expected in a 20-build birthday sample. Require broad coverage
 # while the independent slot ABI/domain/dispatcher fingerprints remain unique.
@@ -592,8 +611,11 @@ for field, expected in (
         raise SystemExit(f"payload grammar dimension {field} did not emit both forms: {sorted(observed)}")
 if min(record[0] for record in super_records) < 12 or min(record[1] for record in super_records) < 8:
     raise SystemExit(f"IR-native super operators were not materially emitted/folded: {super_records}")
-if any(len(record[2]) < 2 or sum(record[2].values()) != record[0] for record in super_records):
-    raise SystemExit(f"IR-native fusion length structure is degenerate: {super_records}")
+if any(sum(record[2].values()) != record[0] for record in super_records):
+    raise SystemExit(f"IR-native fusion length totals are inconsistent: {super_records}")
+observed_fusion_lengths = {length for record in super_records for length in record[2]}
+if len(observed_fusion_lengths) < 3 or max(len(record[2]) for record in super_records) < 2:
+    raise SystemExit(f"IR-native fusion length diversity is insufficient: {super_records}")
 if len({record[3] for record in super_records}) != runs:
     raise SystemExit("a IR-native fusion semantic structure was reused across builds")
 write_totals = tuple(sum(record[0][index] for record in semantic_records) for index in range(6))
@@ -705,7 +727,7 @@ if max_handler_similarity > 0.35 or mean_handler_similarity > 0.08:
     )
 print(
     f"PASS {runs}-build execution-model barrier: counts={sorted(set(counts))}, "
-    f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, "
+    f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, micro-limits={sorted(set(micro_limits))}, "
     f"unique graphs/structures/layouts/domains/ABIs/payload-grammars/super-structures={runs}, "
     f"pipelines={sorted({layout['pipeline'] for layout in payload_layouts})}, "
     f"byte transforms={sorted({layout['byte_transform'] for layout in payload_layouts})}, "

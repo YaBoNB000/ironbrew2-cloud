@@ -34,7 +34,7 @@ namespace IronBrew2.Obfuscator.Control_Flow
         private const int MinimumInstructionCount = 6;
         private const int MaximumInstructionCount = 100000;
 
-        public static DispatcherFlatteningDecision Analyze(Chunk chunk)
+        public static DispatcherFlatteningDecision Analyze(Chunk chunk, int maxBlockInstructions = MaxBlockInstructions)
         {
             DispatcherFlatteningDecision Reject(string reason) =>
                 new DispatcherFlatteningDecision(false, reason, null);
@@ -132,7 +132,7 @@ namespace IronBrew2.Obfuscator.Control_Flow
                         !consumedData.Contains(index))
                         return Reject("orphan-data-word");
 
-                ControlFlowGraph graph = ControlFlowGraph.Build(chunk, MaxBlockInstructions);
+                ControlFlowGraph graph = ControlFlowGraph.Build(chunk, maxBlockInstructions);
                 if (graph.EntryBlock == null || graph.Blocks.Count < 2)
                     return new DispatcherFlatteningDecision(false, "single-block", graph);
 
@@ -144,9 +144,9 @@ namespace IronBrew2.Obfuscator.Control_Flow
             }
         }
 
-        public static DispatcherFlatteningDecision Apply(Chunk chunk)
+        public static DispatcherFlatteningDecision Apply(Chunk chunk, int maxBlockInstructions = MaxBlockInstructions)
         {
-            DispatcherFlatteningDecision decision = Analyze(chunk);
+            DispatcherFlatteningDecision decision = Analyze(chunk, maxBlockInstructions);
             if (chunk != null)
             {
                 chunk.DispatcherFlattened = decision.IsEligible;
