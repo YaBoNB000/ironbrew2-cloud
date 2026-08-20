@@ -537,6 +537,18 @@ def _attestation_candidates(source: str) -> set[int]:
         re.S,
     ):
         offsets.add(int(value))
+    # Production minification can move the evidence assignment away from the
+    # compatibility local. The modulo-add assignment itself is unique in audited
+    # outputs and is still filtered by the authenticated envelope oracle.
+    offsets.update(
+        int(value)
+        for _target, _transcript, value in re.findall(
+            rf"(?:local\s+)?({ident})\s*=\s*\(\s*({ident})\s*\+\s*(\d+)\s*\)"
+            rf"\s*%\s*4294967296\s*;",
+            source,
+            re.S,
+        )
+    )
     base_candidates = list(candidates)
     for offset in offsets:
         candidates.update((candidate + offset) & MASK32 for candidate in base_candidates)

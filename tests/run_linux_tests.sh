@@ -424,6 +424,18 @@ run_executor "$WORK/table-materialization.lua" > "$WORK/table-materialization.ou
 cmp "$WORK/table-materialization-baseline.out" "$WORK/table-materialization.out"
 echo "PASS separated table key/value materialization"
 
+# Consecutive distinct constant-key writes into a freshly allocated table are
+# reordered before opcode mapping; no aliased/metatable target is eligible.
+"$LUA" tests/table_write_order.lua > "$WORK/table-write-order-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/table_write_order.lua > "$WORK/table-write-order-build.log"
+mv out.lua "$WORK/table-write-order.lua"
+"$LUAC" -p "$WORK/table-write-order.lua"
+python3 tests/table_write_order.py "$WORK/table-write-order-build.log"
+run_executor "$WORK/table-write-order.lua" > "$WORK/table-write-order.out"
+cmp "$WORK/table-write-order-baseline.out" "$WORK/table-write-order.out"
+echo "PASS safe fresh-table write-order randomization"
+
 # Repeat randomized prototype keys, opcode maps, schema orders and dispatcher
 # control-flow templates. Each generated VM is parsed structurally before it is
 # executed, so template diversity never replaces semantic validation.
@@ -529,12 +541,20 @@ super_records = []
 semantic_records = []
 fragment_records = []
 micro_limits = []
+table_order_profiles = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
     micro = re.search(r"Synthetic micro-block limit: ([3-6])\.", log)
     if not micro:
         raise SystemExit(f"missing synthetic micro-block limit for build {index}")
     micro_limits.append(int(micro.group(1)))
+    table_order = re.search(
+        r"Fresh table write order: groups=(\d+); writes=(\d+); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not table_order:
+        raise SystemExit(f"missing fresh-table write-order profile for build {index}")
+    table_order_profiles.append((int(table_order.group(1)), int(table_order.group(2)), table_order.group(3)))
     match = re.search(
         r"Created (\d+) IR-native super operators; folded (\d+) sequences; lengths ([0-9:,]+); structure ([0-9a-f]{8})\.",
         log,
@@ -579,6 +599,10 @@ if set(vm_layout_templates) != expected_vm_layouts:
     raise SystemExit(f"not all VM layout templates were emitted: {sorted(set(vm_layout_templates))}")
 if len(set(micro_limits)) < 3:
     raise SystemExit(f"synthetic micro-block limit diversity is insufficient: {sorted(set(micro_limits))}")
+if min(profile[0] for profile in table_order_profiles) < 1 or min(profile[1] for profile in table_order_profiles) < 3:
+    raise SystemExit(f"fresh-table write groups were not reordered in every build: {table_order_profiles}")
+if len({profile[2] for profile in table_order_profiles}) < 6:
+    raise SystemExit(f"fresh-table write-order diversity is insufficient: {table_order_profiles}")
 # Compact frame layouts are sampled from a finite space; a small number of exact
 # collisions is expected in a 20-build birthday sample. Require broad coverage
 # while the independent slot ABI/domain/dispatcher fingerprints remain unique.
@@ -752,7 +776,7 @@ if max_handler_similarity > 0.35 or mean_handler_similarity > 0.08:
     )
 print(
     f"PASS {runs}-build execution-model barrier: counts={sorted(set(counts))}, "
-    f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, micro-limits={sorted(set(micro_limits))}, "
+    f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, micro-limits={sorted(set(micro_limits))}, table-orders={len({profile[2] for profile in table_order_profiles})}, "
     f"unique graphs/structures/layouts/domains/ABIs/payload-grammars/super-structures={runs}, "
     f"pipelines={sorted({layout['pipeline'] for layout in payload_layouts})}, "
     f"byte transforms={sorted({layout['byte_transform'] for layout in payload_layouts})}, "

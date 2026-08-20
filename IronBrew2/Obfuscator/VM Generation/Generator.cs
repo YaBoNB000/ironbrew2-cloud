@@ -30,6 +30,13 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			public string Handler;
 			public bool Terminal => Handler != null;
 		}
+
+		private sealed class TableWriteOrderStats
+		{
+			public int Groups;
+			public int Writes;
+			public uint Signature = 2166136261u;
+		}
 		
 		public Generator(ObfuscationContext context) =>
 			_context = context;
@@ -430,6 +437,53 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			
 			foreach (Chunk _c in chunk.Functions)
 				FoldMutations(mutations, used, _c);
+		}
+
+		private TableWriteOrderStats RandomizeFreshTableWrites(Chunk chunk, Random random)
+		{
+			var stats = new TableWriteOrderStats();
+			for (int index = 0; index < chunk.Instructions.Count; index++)
+			{
+				Instruction create = chunk.Instructions[index];
+				if (create.OpCode != Opcode.NewTable)
+					continue;
+				var writes = new List<Instruction>();
+				var keys = new HashSet<Constant>();
+				for (int cursor = index + 1; cursor < chunk.Instructions.Count; cursor++)
+				{
+					Instruction write = chunk.Instructions[cursor];
+					if (write.OpCode != Opcode.SetTable || write.A != create.A || write.B <= 255
+					    || write.RefOperands[0] is not Constant key || !keys.Add(key))
+						break;
+					if (write.BackReferences.Count != 0)
+					{ writes.Clear(); break; }
+					writes.Add(write);
+				}
+				if (writes.Count < 3)
+					continue;
+				Instruction[] shuffled = writes.ToArray();
+				shuffled.Shuffle(random);
+				if (shuffled.SequenceEqual(writes))
+					(shuffled[0], shuffled[1]) = (shuffled[1], shuffled[0]);
+				for (int offset = 0; offset < shuffled.Length; offset++)
+				{
+					chunk.Instructions[index + 1 + offset] = shuffled[offset];
+					int original = writes.IndexOf(shuffled[offset]);
+					stats.Signature = (stats.Signature ^ (uint)(original + 1 + offset * 17)) * 16777619u;
+				}
+				stats.Groups++;
+				stats.Writes += writes.Count;
+				index += writes.Count;
+			}
+			foreach (Chunk child in chunk.Functions)
+			{
+				TableWriteOrderStats childStats = RandomizeFreshTableWrites(child, random);
+				stats.Groups += childStats.Groups;
+				stats.Writes += childStats.Writes;
+				stats.Signature = (stats.Signature ^ childStats.Signature) * 16777619u;
+			}
+			chunk.UpdateMappings();
+			return stats;
 		}
 
 		private bool[] BuildSuperOperatorBarrierMap(Chunk chunk)
@@ -849,6 +903,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			Random payloadCarrierRandom = _context.Seed.GetStream("payload.carrier");
 			VMLayout vmLayout = VMLayoutSelector.Select(layoutRandom);
 			Console.WriteLine("Synthetic micro-block limit: " + _context.MaxBlockInstructions + ".");
+			TableWriteOrderStats tableWriteOrder = RandomizeFreshTableWrites(_context.HeadChunk, r);
+			Console.WriteLine("Fresh table write order: groups=" + tableWriteOrder.Groups
+				+ "; writes=" + tableWriteOrder.Writes + "; signature=" + tableWriteOrder.Signature.ToString("x8") + ".");
 
 			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
 			                                 .Where(t => t.IsSubclassOf(typeof(VOpcode)))
