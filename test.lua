@@ -1,1 +1,2 @@
-print("idk")
+local success, err = pcall(function()
+end)

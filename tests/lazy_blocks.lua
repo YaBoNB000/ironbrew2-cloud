@@ -36,4 +36,6 @@ for index = 1, #items do
     end
 end
 
-print("lazy-blocks:" .. opaque .. ":" .. value .. ":" .. makeAdder(total)(7))
+local test_output = "lazy-blocks:" .. opaque .. ":" .. value .. ":" .. makeAdder(total)(7)
+print(test_output)
+return {__ib2_test_output = test_output}

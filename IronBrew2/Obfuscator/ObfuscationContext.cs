@@ -50,6 +50,9 @@ namespace IronBrew2.Obfuscator
 		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|attestation token)，
 		// 序列化头部只写盐，VM 端严格探针成功后才派生同一种子。
 		public uint XorSeed;
+		// v5 outer authentication uses an independently derived key so its public
+		// tag is not an equation over the envelope stream-decryption seed.
+		public uint OuterIntegrityKey;
 
 		// 环境绑定器：生成盐、attestation token 和 VM 端种子派生代码
 		public EnvBinder Binder;
@@ -81,8 +84,10 @@ namespace IronBrew2.Obfuscator
 
 			if (settings.EnvironmentLock)
 			{
-				// 只有严格 executor guard 成功后才恢复同一 token 与 serializer seed。
+				// 只有严格 executor guard 成功后才恢复同一 token、serializer seed
+				// 与独立 outer-authentication key。
 				XorSeed = Binder.DeriveSeed(Binder.AttestationToken);
+				OuterIntegrityKey = Binder.DeriveIntegrityKey(Binder.AttestationToken);
 			}
 			else
 			{
@@ -91,6 +96,10 @@ namespace IronBrew2.Obfuscator
 			}
 			if (XorSeed == 0)
 				XorSeed = 0x9E3779B9;
+			if (!settings.EnvironmentLock)
+				OuterIntegrityKey = XorSeed;
+			else if (OuterIntegrityKey == 0)
+				OuterIntegrityKey = 0xC4D29A6B;
 		}
 	}
 }
