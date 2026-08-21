@@ -39,7 +39,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
 
     offsets = [
         104729, 209458, 314187, 418916, 523645, 628374, 733103,
-        837832, 942561, 1047290, 1152019, 1256748,
+        837832, 942561, 1047290, 1152019, 1256748, 1361477,
     ]
     slot_match = re.search(
         rf"local\s+({IDENT})\s*=\s*32\s*\+\s*\(\(.*?\)\s*%\s*104729\s*\)\s*;",
@@ -65,8 +65,9 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     serializer = (root / "IronBrew2/Bytecode Library/Bytecode/Serializer.cs").read_text()
     for anchor in (
         "ApplyGenerationRewrite", "BeginGenerationSeal", "AdvanceGenerationSeal",
-        "ComputeGenerationGuard", "MaterializeGenerationProgramSlot",
-        "MaterializeGenerationSealSlot", "MaterializeGenerationGuardSlot",
+        "ComputeGenerationGuard", "GenerationFieldDigest",
+        "MaterializeGenerationProgramSlot", "MaterializeGenerationSealSlot",
+        "MaterializeGenerationGuardSlot", "MaterializeGenerationProgramSealSlot",
     ):
         if anchor not in generator:
             raise ValueError(f"generation runtime architecture is missing: {anchor}")
@@ -93,7 +94,8 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     leaked = re.search(
         r"\b(?:Generation(?:Count|Program|Record|Index|Family|Mask|Seal|Guard|Completed)|"
         r"ApplyGenerationRewrite|BeginGenerationSeal|AdvanceGenerationSeal|ComputeGenerationGuard|"
-        r"MaterializeGeneration(?:Program|Seal|Guard)Slot)\b",
+        r"GenerationFieldDigest|"
+        r"MaterializeGeneration(?:Program|Seal|Guard|ProgramSeal)Slot)\b",
         code + "\n" + final_code,
     )
     if leaked:
@@ -103,7 +105,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     print(
         "PASS authenticated writable instruction generations: "
         f"records={len(programs)}, generations={counts}, families={sorted(families)}, "
-        "overlay=invocation-local, same-PC=replay, guard=state-bound"
+        "overlay=invocation-local, same-PC=replay, guard=state-bound, program=committed"
     )
 
 

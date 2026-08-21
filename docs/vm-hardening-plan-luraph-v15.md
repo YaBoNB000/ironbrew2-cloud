@@ -255,6 +255,8 @@ opcode / A / B / C / lazy constant resolver / fused view
 
 每代执行前验证上一代 guard，执行后把前代 seal、mode、PC、generation index、family、mask、改写后的全部字段、entry/chunk state 吸收到新 seal，并 same-PC replay。最终一代完成后才绑定 lazy constant proxy 和进入真实 handler，随后清除 generation program/seal/guard。Closure inline binding 等非顶层 fetch 在 invocation 内同步重放完整 program，不暴露 generation-0 字段给 closure ABI。
 
+P2 二次审查又补强了 overlay commitment：初始化时对 generation count、每代顺序、family、mask、mode、PC、entry/chunk state 计算独立 program seal；每次 replay 前重新计算并与 FlowCache 中的 commitment 比较。field digest 不再只吸收 opcode/A，还覆盖 B/C、完整 fused supplemental A/B/C view、fused count 和 fresh-table flag。program seal 同时进入 begin/advance/guard 链，最终与其余 generation overlay 一起释放。这样在 commitment 建立后修改 mask 或交换 generation 顺序，不能再形成自洽 overlay。
+
 攻击器已同步解析 generation framing、重放四种 rewrite、恢复最终 opcode/A，并将每代 column-state fingerprint 写入 `AttackExecutionState.generation_trace`。当前 material fixture 报告 generation range `[0..5]`，不再把 parser stale 当收益。
 
 新增或升级验证：
@@ -266,7 +268,7 @@ tests/static_state_model.py
 generation-program payload tamper
 ```
 
-覆盖随机 2–5 generations、四 families、generation-0 wire fields、same-PC replay、mode/state-bound seal、跳过一代、重复一代和改写 mask 后重封装。Phase 4 与递归语义测试确认 overlay 仍为 invocation-local，没有共享 mutable instruction array 或扩大 plaintext lifetime。
+覆盖随机 2–5 generations、四 families、generation-0 wire fields、same-PC replay、mode/state-bound seal、跳过一代、重复一代、commitment 后改写 mask、交换 generation 顺序以及 payload generation-program 重封装。Phase 4 与递归语义测试确认 overlay 仍为 invocation-local，没有共享 mutable instruction array 或扩大 plaintext lifetime。
 
 重读本 MD 后确认：P2 没有弱化 block/prototype/capsule authentication，没有把 payload 改成共享可写状态，没有恢复固定四阶段 replay，也没有提前实施 selector lane migration或 capability graph。为避免 Lua 5.1 signed/AsBx、RK handle 和 NaN 精度倒退，本阶段只改写共同安全的 16-bit opcode/A carrier；B/C、descriptor-role 与 fused-view rewrite 保留为后续可选 family，只有建立对应宽度/类型证明后才能加入。四种 family 都进入真实 generation seal/data dependency，不是纯 MBA decoy。
 

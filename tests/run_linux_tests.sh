@@ -85,7 +85,7 @@ python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
 python3 tests/materializer_replay.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/generation_replay_tamper.py "$WORK/fixed-vm.lua" "$WORK"
-for generation_case in skip duplicate; do
+for generation_case in skip duplicate mask reorder; do
     generation_file="$WORK/generation-$generation_case.lua"
     "$LUAC" -p "$generation_file"
     set +e
@@ -96,7 +96,7 @@ for generation_case in skip duplicate; do
     [[ $generation_code -ne 0 ]]
     [[ ! -s "$WORK/generation-$generation_case.stdout" ]]
 done
-echo "PASS generation skip/duplicate rejection before payload semantics"
+echo "PASS generation skip/duplicate/mask/reorder rejection before payload semantics"
 python3 tests/constant_use_materialization.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/handler_fragment_sharing.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/ir_native_fusion.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua"

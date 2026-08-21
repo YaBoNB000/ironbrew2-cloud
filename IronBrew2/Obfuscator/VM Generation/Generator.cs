@@ -1078,8 +1078,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
 				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
 				"GuardBehaviorKey","GuardFirstKey","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential",
-				"AllowMaterializer","MaterializeIndexSlot","MaterializeOpcodeSlot","MaterializeASlot","MaterializeBSlot","MaterializeCSlot","MaterializeStageSlot","MaterializeConstantFieldsSlot","MaterializeConstantResolverSlot","MaterializeFusedSlot","MaterializeFreshTableSlot","MaterializeGenerationProgramSlot","MaterializeGenerationSealSlot","MaterializeGenerationGuardSlot","MaterializeStage","MaterializeMode","MaterializeEnum","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction","MaterializedFields","MaterializedConstantFields","MaterializedConstantResolver",
-				"BindInstructionOperands","InstructionFields","InstructionConstantFields","InstructionConstantResolver","InstructionDecodedFields","InstructionDecodedValues","InstructionRemainingConstants","InstructionFieldKey","InstructionConstantIndex","GenerationCount","GenerationProgram","GenerationRecord","GenerationIndex","GenerationFamily","GenerationMask","GenerationSeal","GenerationGuard","GenerationCompleted","ApplyGenerationRewrite","BeginGenerationSeal","AdvanceGenerationSeal","ComputeGenerationGuard","FusedOperands","FusedHead","FusedProgramCounter","FusedProgramStep","FusedValues","FusedWritten","FusedStack","FusedKey","FusedValue","FusedInstructionFields","FusedConstantFields","FusedInstruction","FusedDescriptor","FusedCount","FusedIndex","FusedType","FusedMask","FusedInstructionConstants","IsFused","IsFreshTableWrite",
+				"AllowMaterializer","MaterializeIndexSlot","MaterializeOpcodeSlot","MaterializeASlot","MaterializeBSlot","MaterializeCSlot","MaterializeStageSlot","MaterializeConstantFieldsSlot","MaterializeConstantResolverSlot","MaterializeFusedSlot","MaterializeFreshTableSlot","MaterializeGenerationProgramSlot","MaterializeGenerationSealSlot","MaterializeGenerationGuardSlot","MaterializeGenerationProgramSealSlot","MaterializeStage","MaterializeMode","MaterializeEnum","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction","MaterializedFields","MaterializedConstantFields","MaterializedConstantResolver",
+				"BindInstructionOperands","InstructionFields","InstructionConstantFields","InstructionConstantResolver","InstructionDecodedFields","InstructionDecodedValues","InstructionRemainingConstants","InstructionFieldKey","InstructionConstantIndex","GenerationCount","GenerationProgram","GenerationRecord","GenerationIndex","GenerationFamily","GenerationMask","GenerationSeal","GenerationGuard","GenerationCompleted","GenerationProgramSeal","ExpectedGenerationProgramSeal","IgnoredGenerationSeal","GenerationFieldDigest","ApplyGenerationRewrite","BeginGenerationSeal","AdvanceGenerationSeal","ComputeGenerationGuard","FusedOperands","FusedHead","FusedProgramCounter","FusedProgramStep","FusedValues","FusedWritten","FusedStack","FusedKey","FusedValue","FusedInstructionFields","FusedConstantFields","FusedInstruction","FusedDescriptor","FusedCount","FusedIndex","FusedType","FusedMask","FusedInstructionConstants","IsFused","IsFreshTableWrite",
 				"GuardEvidenceFold","GuardEvidenceA","GuardEvidenceB","GuardEvidenceC","GuardEvidenceD","GuardCompatibility","GuardAttested","GuardKeyA","GuardKeyB","GuardKeyC","GuardKeyD","GuardPayloadBinding","BinderRotate16","SeedByte","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
 				"GuardClassOK1","GuardClassOK2","GuardClassOK3","GuardClassOK4","GuardCompileOK","GuardConstantProbe","GuardConstants","GuardConstantsOK",
 				"GuardCurrentEnvOK","GuardCurrentEnvironment","GuardCurrentIdentity","GuardExpected","GuardGame","GuardGetConstants","GuardGetProto","GuardGetProtos",
@@ -1112,7 +1112,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"DescriptorState","DescriptorOffset","EnvelopeMaskState","PayloadSourceLength","PageOrdinal","PayloadPageOrdinal","PayloadPage","PayloadPagePosition","LoadPayloadPage",
 				"SourceRead8","SourceReadBytes","ActiveSourceLength","SourceIsPaged","ActivePrototypeHash","ActivePrototypeRight","ActivePrototypeCounter","PrototypeAbsorb","FinalizePrototypeIntegrity","TrackPrototypeByte","FramedLength","EncodedParts","EncodedPage",
 				"PageByteIndex","FramingIndex","MaskState","InnerKey","OuterKey","NestedByte","PlainByte","RawLength","Multiplier","SavedSourceLength","SavedSourceMode",
-				"CipherByte","KeyByte","EnvelopeReadWidth","Width","FieldIndex","LengthOffset","EncodedIndex","Left","Right","Counter","Word","Mixed","Absorb","PipelineState","PipelineIndex","TransformedByte","EncodedPartIndex",
+				"CipherByte","KeyByte","EnvelopeReadWidth","Width","Field","FieldIndex","LengthOffset","EncodedIndex","Left","Right","Counter","Word","Mixed","Absorb","PipelineState","PipelineIndex","TransformedByte","EncodedPartIndex",
 				"ChunkState","InitialChunkKey","ChunkChainKey","SourceChunkState","SourceEntryState","CurrentChunkState","WrappedChunkState","ChunkSuccessors","InitialDialectModeKey","DialectModeKey","DialectModeSlot","DialectModeCacheSlot","DialectModeSeal","DialectModeValid","DialectModeAccepted","ResolveDialectMode","CurrentDialectMode","DialectEnum",
 				"TargetIndex","TargetInstruction","ReferencedConstants","ResolveConstant","ReferenceSlot","PreviousCapsule","BeginPrototypeIntegrity","Words","WordIndex","Word",
 				"LayoutFrameA","LayoutFrameB","LayoutFrameC"
@@ -2802,28 +2802,71 @@ local function ApplyGenerationRewrite(InstructionFields, GenerationFamily, Gener
     return InstructionFields;
 end;
 
+local function GenerationFieldDigest(InstructionFields)
+    local Value = 2166136261;
+    local Counter = 1;
+    local function Absorb(Field)
+        if type(Field) ~= 'number' then Field = Field and 1 or 0; end;
+        Field = Field % 4294967296;
+        Value = (U32Mul(U32(BitXOR(Value, Field)), 65599) + Counter * 257) % 4294967296;
+        Counter = Counter + 1;
+    end;
+    for FieldIndex = 1, 4 do Absorb(InstructionFields[FieldIndex]); end;
+    local FusedInstructionFields = InstructionFields[5];
+    if type(FusedInstructionFields) == 'table' then
+        Absorb(#FusedInstructionFields);
+        for FusedIndex = 1, #FusedInstructionFields do
+            local FusedInstruction = FusedInstructionFields[FusedIndex];
+            for FieldIndex = 2, 4 do Absorb(FusedInstruction[FieldIndex]); end;
+        end;
+    else
+        Absorb(0);
+    end;
+    Absorb(InstructionFields[6] and 1 or 0);
+    return Value;
+end;
+
 local function BeginGenerationSeal(CurrentDialectMode, Index, InstructionFields,
-    EntryState, CurrentChunkState, InstructionSeal, OpcodeSeal, GenerationCount)
-    local Value = U32(BitXOR(BitXOR(BitXOR(CurrentDialectMode, InstructionSeal), OpcodeSeal),
-        U32(BitXOR(EntryState, PayloadRotate16(CurrentChunkState)))));
-    Value = U32(BitXOR(Value, InstructionFields[1] + InstructionFields[2] * 65536));
-    return (U32Mul(Value, 65599) + Index * 257 + GenerationCount * 65537
-        + __IB2_DOMAIN_INSTRUCTION_STATE__) % 4294967296;
+    EntryState, CurrentChunkState, InstructionSeal, OpcodeSeal, GenerationProgram)
+    if type(GenerationProgram) ~= 'table' or #GenerationProgram < 2 or #GenerationProgram > 5 then
+        error('invalid protected payload', 0);
+    end;
+    local GenerationProgramSeal = U32(BitXOR(BitXOR(CurrentDialectMode, EntryState),
+        PayloadRotate16(CurrentChunkState)));
+    for GenerationIndex = 1, #GenerationProgram do
+        local GenerationRecord = GenerationProgram[GenerationIndex];
+        local GenerationFamily, GenerationMask = GenerationRecord[1], GenerationRecord[2];
+        if type(GenerationFamily) ~= 'number' or GenerationFamily < 0 or GenerationFamily > 3
+        or type(GenerationMask) ~= 'number' or GenerationMask == 0 then
+            error('invalid protected payload', 0);
+        end;
+        GenerationProgramSeal = U32(BitXOR(GenerationProgramSeal, GenerationMask));
+        GenerationProgramSeal = (U32Mul(GenerationProgramSeal, 48271)
+            + GenerationFamily * 65537 + GenerationIndex * 257 + Index
+            + __IB2_DOMAIN_INSTRUCTION_STATE__) % 4294967296;
+    end;
+    local Value = U32(BitXOR(BitXOR(BitXOR(BitXOR(CurrentDialectMode, InstructionSeal), OpcodeSeal),
+        GenerationProgramSeal), U32(BitXOR(EntryState, PayloadRotate16(CurrentChunkState)))));
+    Value = U32(BitXOR(Value, GenerationFieldDigest(InstructionFields)));
+    local GenerationSeal = (U32Mul(Value, 65599) + Index * 257
+        + #GenerationProgram * 65537 + __IB2_DOMAIN_INSTRUCTION_STATE__) % 4294967296;
+    return GenerationSeal, GenerationProgramSeal;
 end;
 
 local function AdvanceGenerationSeal(GenerationSeal, CurrentDialectMode, Index, GenerationIndex,
-    GenerationFamily, GenerationMask, InstructionFields, EntryState, CurrentChunkState)
-    local Value = U32(BitXOR(BitXOR(BitXOR(GenerationSeal, CurrentDialectMode), GenerationMask),
-        InstructionFields[1] + InstructionFields[2] * 65536));
+    GenerationFamily, GenerationMask, InstructionFields, EntryState, CurrentChunkState,
+    GenerationProgramSeal)
+    local Value = U32(BitXOR(BitXOR(BitXOR(BitXOR(GenerationSeal, CurrentDialectMode),
+        GenerationMask), GenerationProgramSeal), GenerationFieldDigest(InstructionFields)));
     return (U32Mul(Value, 48271) + Index * 65537 + GenerationIndex * 257
         + GenerationFamily * 17 + EntryState + PayloadRotate16(CurrentChunkState)
         + __IB2_DOMAIN_OPCODE_STATE__) % 4294967296;
 end;
 
 local function ComputeGenerationGuard(GenerationSeal, CurrentDialectMode, Index, GenerationCompleted,
-    InstructionFields, GenerationCount, EntryState, CurrentChunkState)
-    local Value = U32(BitXOR(BitXOR(GenerationSeal, CurrentDialectMode),
-        InstructionFields[1] + InstructionFields[2] * 65536));
+    InstructionFields, GenerationCount, EntryState, CurrentChunkState, GenerationProgramSeal)
+    local Value = U32(BitXOR(BitXOR(BitXOR(GenerationSeal, CurrentDialectMode),
+        GenerationProgramSeal), GenerationFieldDigest(InstructionFields)));
     return (U32Mul(Value, 22695477) + Index * 257 + GenerationCompleted * 65537
         + GenerationCount * 17 + EntryState + CurrentChunkState
         + __IB2_DOMAIN_CODE_DATA_PERMUTATION__) % 4294967296;
@@ -2902,6 +2945,7 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     local MaterializeGenerationProgramSlot = MaterializeIndexSlot + 1047290;
     local MaterializeGenerationSealSlot = MaterializeIndexSlot + 1152019;
     local MaterializeGenerationGuardSlot = MaterializeIndexSlot + 1256748;
+    local MaterializeGenerationProgramSealSlot = MaterializeIndexSlot + 1361477;
     local FlowCache = Flow[4];
     local DialectModeCacheSlot = DialectModeSlot(Chunk);
     if AllowMaterializer and FlowCache and FlowCache[MaterializeIndexSlot] == Index then
@@ -2909,11 +2953,15 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         local GenerationProgram = FlowCache[MaterializeGenerationProgramSlot];
         local GenerationCount = type(GenerationProgram) == 'table' and #GenerationProgram or 0;
         local CurrentDialectMode = FlowCache[DialectModeCacheSlot];
+        local GenerationProgramSeal = FlowCache[MaterializeGenerationProgramSealSlot];
         local MaterializedFields = {
             FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
             FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot],
             FlowCache[MaterializeFusedSlot], FlowCache[MaterializeFreshTableSlot]
         };
+        local IgnoredGenerationSeal, ExpectedGenerationProgramSeal = BeginGenerationSeal(
+            CurrentDialectMode, Index, MaterializedFields, FlowCache[2], FlowCache[3],
+            FlowCache[5], FlowCache[7], GenerationProgram);
         if type(MaterializeStage) ~= 'number' or MaterializeStage < 1 or MaterializeStage > GenerationCount
         or GenerationCount < 2 or GenerationCount > 5
         or Flow[1] ~= Index - 1 or Flow[2] ~= Block
@@ -2923,9 +2971,11 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         or DialectModeSeal(CurrentDialectMode, FlowCache[5], FlowCache[7],
             Index, FlowCache[2], FlowCache[3], Block, Chunk[5], Chunk[6], Chunk[7])
             ~= FlowCache[DialectModeCacheSlot + 1]
+        or GenerationProgramSeal ~= ExpectedGenerationProgramSeal
         or ComputeGenerationGuard(FlowCache[MaterializeGenerationSealSlot], CurrentDialectMode,
             Index, MaterializeStage - 1, MaterializedFields, GenerationCount,
-            FlowCache[2], FlowCache[3]) ~= FlowCache[MaterializeGenerationGuardSlot] then
+            FlowCache[2], FlowCache[3], GenerationProgramSeal)
+            ~= FlowCache[MaterializeGenerationGuardSlot] then
             error('invalid protected payload', 0);
         end;
         local GenerationRecord = GenerationProgram[MaterializeStage];
@@ -2933,12 +2983,14 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         MaterializedFields = ApplyGenerationRewrite(MaterializedFields, GenerationFamily, GenerationMask);
         local GenerationSeal = AdvanceGenerationSeal(
             FlowCache[MaterializeGenerationSealSlot], CurrentDialectMode, Index, MaterializeStage,
-            GenerationFamily, GenerationMask, MaterializedFields, FlowCache[2], FlowCache[3]);
+            GenerationFamily, GenerationMask, MaterializedFields, FlowCache[2], FlowCache[3],
+            GenerationProgramSeal);
         FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot] = MaterializedFields[1], MaterializedFields[2];
         FlowCache[MaterializeGenerationSealSlot] = GenerationSeal;
         FlowCache[MaterializeGenerationGuardSlot] = ComputeGenerationGuard(
             GenerationSeal, CurrentDialectMode, Index, MaterializeStage,
-            MaterializedFields, GenerationCount, FlowCache[2], FlowCache[3]);
+            MaterializedFields, GenerationCount, FlowCache[2], FlowCache[3],
+            GenerationProgramSeal);
         Flow[1] = Index;
         if MaterializeStage < GenerationCount then
             FlowCache[MaterializeStageSlot] = MaterializeStage + 1;
@@ -2953,8 +3005,8 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
             FlowCache[MaterializeConstantFieldsSlot], FlowCache[MaterializeConstantResolverSlot],
             FlowCache[MaterializeFusedSlot], FlowCache[MaterializeFreshTableSlot],
             FlowCache[MaterializeGenerationProgramSlot], FlowCache[MaterializeGenerationSealSlot],
-            FlowCache[MaterializeGenerationGuardSlot] =
-            nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil;
+            FlowCache[MaterializeGenerationGuardSlot], FlowCache[MaterializeGenerationProgramSealSlot] =
+            nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil;
         return MaterializedInstruction;
     end;
 
@@ -3056,12 +3108,14 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
         local GenerationCount = type(GenerationProgram) == 'table' and #GenerationProgram or 0;
         if GenerationCount < 2 or GenerationCount > 5 then error('invalid protected payload', 0); end;
         FlowCache[MaterializeGenerationProgramSlot] = GenerationProgram;
-        local GenerationSeal = BeginGenerationSeal(CurrentDialectMode, Index, Inst,
-            EntryState, CurrentChunkState, CurrentInstructionSeal, CurrentOpcodeSeal, GenerationCount);
+        local GenerationSeal, GenerationProgramSeal = BeginGenerationSeal(
+            CurrentDialectMode, Index, Inst, EntryState, CurrentChunkState,
+            CurrentInstructionSeal, CurrentOpcodeSeal, GenerationProgram);
+        FlowCache[MaterializeGenerationProgramSealSlot] = GenerationProgramSeal;
         FlowCache[MaterializeGenerationSealSlot] = GenerationSeal;
         FlowCache[MaterializeGenerationGuardSlot] = ComputeGenerationGuard(
             GenerationSeal, CurrentDialectMode, Index, 0, Inst, GenerationCount,
-            EntryState, CurrentChunkState);
+            EntryState, CurrentChunkState, GenerationProgramSeal);
         Inst = {};
         MaterializeEnum = SelectMaterializerEnum(
             Chunk, 0, GenerationProgram[1][1], CurrentDialectMode);
