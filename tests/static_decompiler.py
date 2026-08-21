@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -35,7 +36,23 @@ class DecodedOperand:
 
 
 @dataclass
+class AttackExecutionState:
+    """Attacker-side state key; later phases populate mode/generation dynamics."""
+
+    prototype: tuple[int, ...]
+    block_start: int
+    predecessors: tuple[int, ...]
+    mode: int
+    physical_pc: int
+    generation: int
+    replay_depth: int
+    selector_lane: str
+    column_state: str
+
+
+@dataclass
 class LogicalInstruction:
+    state: AttackExecutionState
     prototype: tuple[int, ...]
     physical_pc: int
     member: int
@@ -53,10 +70,20 @@ class LogicalInstruction:
 @dataclass
 class DecompilerReport:
     file: str
+    state_model_version: int
     prototypes: int
     physical_instructions: int
     logical_instructions: int
+    execution_states: int
     classified_instructions: int
+    unknown_instructions: int
+    block_predecessor_edges: int
+    dialect_modes: list[int]
+    mode_transitions: int
+    generations: list[int]
+    max_generation: int
+    replay_transitions: int
+    selector_lanes: list[str]
     fused_programs: int
     fused_members: int
     calls: int
@@ -784,6 +811,29 @@ def _operand_value(operand: DecodedOperand, registers: dict[int, Any]) -> Any:
     return _literal(operand.value)
 
 
+def _prototype_predecessors(prototype: payload.Prototype) -> dict[int, tuple[int, ...]]:
+    predecessors: dict[int, set[int]] = {block.start_pc: set() for block in prototype.blocks}
+    for source in prototype.blocks:
+        for successor_start, _wrapped_state, _wrapped_chunk_state in source.successors:
+            predecessors.setdefault(successor_start, set()).add(source.start_pc)
+    return {start: tuple(sorted(sources)) for start, sources in predecessors.items()}
+
+
+def _column_state_fingerprint(
+    info: payload.PayloadInfo,
+    prototype: payload.Prototype,
+    block: payload.Block,
+    offset: int,
+) -> str:
+    columns = _decoded_columns(info, prototype, block, offset)
+    material = bytearray()
+    for role in sorted(columns):
+        material.extend(role.to_bytes(1, "little"))
+        material.extend(len(columns[role]).to_bytes(4, "little"))
+        material.extend(columns[role])
+    return hashlib.sha256(material).hexdigest()[:16]
+
+
 def recover_logical_instructions(
     info: payload.PayloadInfo,
     handlers: dict[int, str],
@@ -792,6 +842,7 @@ def recover_logical_instructions(
     instructions: list[LogicalInstruction] = []
     virtual_count = len(handlers)
     for proto_path, prototype in baseline.prototypes(info.root):
+        predecessors = _prototype_predecessors(prototype)
         opcode_rows = {
             row["pc"]: row
             for row in baseline.decode_opcodes(info, prototype, proto_path, virtual_count)
@@ -804,6 +855,7 @@ def recover_logical_instructions(
                     continue
                 canonical = int(opcode_rows[pc]["canonical_id"])
                 members = decode_instruction_members(info, prototype, block, offset)
+                column_state = _column_state_fingerprint(info, prototype, block, offset)
                 semantics = classifications[canonical]
                 if len(members) != len(semantics):
                     raise ValueError(
@@ -824,6 +876,17 @@ def recover_logical_instructions(
                         _resolve_operand(info, prototype, block, descriptor, 4, c),
                     )
                     instructions.append(LogicalInstruction(
+                        state=AttackExecutionState(
+                            prototype=proto_path,
+                            block_start=block.start_pc,
+                            predecessors=predecessors.get(block.start_pc, ()),
+                            mode=0,
+                            physical_pc=pc,
+                            generation=0,
+                            replay_depth=0,
+                            selector_lane="canonical-opcode",
+                            column_state=column_state,
+                        ),
                         prototype=proto_path,
                         physical_pc=pc,
                         member=semantic_index,
@@ -952,6 +1015,33 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
             if kind == "string" and isinstance(value, str):
                 recovered_string_set.add(value)
     recovered_strings = sorted(recovered_string_set)
+
+    unique_states: dict[tuple[Any, ...], AttackExecutionState] = {}
+    for instruction in instructions:
+        state = instruction.state
+        key = (
+            state.prototype, state.block_start, state.mode, state.physical_pc,
+            state.generation, state.selector_lane, state.column_state,
+        )
+        unique_states.setdefault(key, state)
+    ordered_states = list(unique_states.values())
+    mode_transitions = sum(
+        left.prototype == right.prototype and left.mode != right.mode
+        for left, right in zip(ordered_states, ordered_states[1:])
+    )
+    replay_transitions = sum(
+        left.prototype == right.prototype
+        and left.physical_pc == right.physical_pc
+        and right.generation > left.generation
+        for left, right in zip(ordered_states, ordered_states[1:])
+    )
+    predecessor_edges = {
+        (state.prototype, predecessor, state.block_start)
+        for state in ordered_states
+        for predecessor in state.predecessors
+    }
+    classified = sum(instruction.semantic != "UNKNOWN" for instruction in instructions)
+
     serialized = []
     for instruction in instructions:
         record = asdict(instruction)
@@ -959,10 +1049,20 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
         serialized.append(record)
     return DecompilerReport(
         file=str(path),
+        state_model_version=1,
         prototypes=sum(1 for _ in baseline.prototypes(info.root)),
         physical_instructions=sum(prototype.instruction_count for _, prototype in baseline.prototypes(info.root)),
         logical_instructions=len(instructions),
-        classified_instructions=sum(instruction.semantic != "UNKNOWN" for instruction in instructions),
+        execution_states=len(ordered_states),
+        classified_instructions=classified,
+        unknown_instructions=len(instructions) - classified,
+        block_predecessor_edges=len(predecessor_edges),
+        dialect_modes=sorted({state.mode for state in ordered_states}),
+        mode_transitions=mode_transitions,
+        generations=sorted({state.generation for state in ordered_states}),
+        max_generation=max((state.generation for state in ordered_states), default=0),
+        replay_transitions=replay_transitions,
+        selector_lanes=sorted({state.selector_lane for state in ordered_states}),
         fused_programs=fused_programs,
         fused_members=sum(instruction.fused for instruction in instructions),
         calls=counts["calls"],
@@ -1063,6 +1163,8 @@ def main() -> int:
         print(
             "STATIC_DECOMPILER "
             f"physical/logical={report.physical_instructions}/{report.logical_instructions} "
+            f"states={report.execution_states} modes={len(report.dialect_modes)} "
+            f"generations={len(report.generations)} replay={report.replay_transitions} "
             f"classified={report.classified_instructions} fused={report.fused_programs}/{report.fused_members} "
             f"calls={report.calls} self={report.self_calls} tables={report.new_tables}/{report.table_writes} "
             f"discarded={report.discarded_calls} returns={report.returns}"

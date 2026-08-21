@@ -136,6 +136,23 @@ shards、cross-capsule chain、per-use handles 和 handler-use decode 提高成�
 - `UNKNOWN` 不得被猜成已恢复语义；
 - 保留用户上传样本的完整恢复基线。
 
+#### P0 完成记录与重读审查（2026-08-21）
+
+状态：**已完成**。
+
+已加入 `AttackExecutionState`，当前每个恢复状态明确携带：
+
+```text
+prototype / block_start / predecessors / mode / physical_pc /
+generation / replay_depth / selector_lane / column_state
+```
+
+`DecompilerReport` 现输出 state-model version、execution-state 数、predecessor edges、dialect modes、mode transitions、generations、max generation、replay transitions、selector lanes 和显式 UNKNOWN 数。新增 `tests/static_state_model.py` 同时验证当前生成样本与用户上传的 loader 样本；后者必须继续完整恢复 11/11 逻辑操作、四个 CALL、SELF、SETTABLE、discarded CALL 和真实 RETURN。
+
+按本 MD 重新逐项检查后，P0 没有遗漏以下前置维度：prototype、block、predecessor、mode、PC、generation、selector lane、column state。当前 VM 尚未实现 P1/P2，因此 baseline 必须如实报告单 mode `[0]`、单 generation `[0]`、零 replay transition，而不是伪造动态性。P0 只扩展攻击与度量工具，没有改变 VM、认证边界、明文生命周期或 Lua 语义，不存在需要删除的倒退设计。
+
+下一步仍是 P1；在 P1 完成前不得提前实施 P2/P4。
+
 ### P1：block/edge-local 多 dialect mode lattice（批准，最高优先级）
 
 每个 build 生成 3–5 个同时存在的 VM dialect，而不是仅在 build 时选择一个 dispatcher 模板。

@@ -104,6 +104,8 @@ python3 tests/static_attack_baseline.py "$WORK/fixed.lua" \
     --require-current-baseline --report "$WORK/static-attack-baseline.json"
 python3 tests/static_decompiler.py "$WORK/fixed.lua" \
     --report "$WORK/static-decompiler-baseline.json"
+python3 tests/static_state_model.py "$WORK/fixed.lua"
+python3 tests/static_state_model.py "$ROOT/test_obf.txt" --uploaded-loader
 run_executor "$WORK/fixed.lua" > "$WORK/fixed.out"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
