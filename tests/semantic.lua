@@ -1,10 +1,13 @@
+local emitted = {}
 local function emit(label, ...)
     local values = {...}
     local parts = {label}
     for i = 1, #values do
         parts[#parts + 1] = tostring(values[i])
     end
-    print(table.concat(parts, ":"))
+    local line = table.concat(parts, ":")
+    emitted[#emitted + 1] = line
+    print(line)
 end
 
 local truth = true
@@ -89,3 +92,5 @@ for key, value in pairs(data) do
     end
 end
 emit("table", data[1] .. data[2], sum)
+
+return {__ib2_test_output = table.concat(emitted, "\n")}
