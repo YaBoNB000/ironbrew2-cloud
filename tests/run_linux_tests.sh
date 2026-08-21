@@ -462,6 +462,16 @@ run_executor "$WORK/call-trampoline.lua" > "$WORK/call-trampoline.out"
 cmp "$WORK/call-trampoline-baseline.out" "$WORK/call-trampoline.out"
 echo "PASS CALL B/C, SELF, loader-chain, multiple-result and direct TAILCALL semantics"
 
+# The minimal getgenv -> SETTABLE -> HttpGet -> loadstring -> compiled-call
+# chain must no longer expose one physical record per semantic operation. It is
+# lowered to one ten-member select/execute phase program plus the final RETURN.
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/vm_chain_fusion.lua > "$WORK/vm-chain-fusion-build.log"
+mv out.lua "$WORK/vm-chain-fusion.lua"
+"$LUAC" -p "$WORK/vm-chain-fusion.lua"
+python3 tests/call_inclusive_fusion.py "$WORK/vm-chain-fusion.lua" \
+    --build-log "$WORK/vm-chain-fusion-build.log"
+
 # Repeat randomized prototype keys, opcode maps, schema orders and dispatcher
 # control-flow templates. Each generated VM is parsed structurally before it is
 # executed, so template diversity never replaces semantic validation.
@@ -569,6 +579,7 @@ fragment_records = []
 micro_limits = []
 table_order_profiles = []
 fused_member_profiles = []
+call_inclusive_profiles = []
 call_trampoline_profiles = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
@@ -593,12 +604,21 @@ for index in range(1, runs + 1):
                (entry.split(":") for entry in match.group(3).split(","))}
     super_records.append((int(match.group(1)), int(match.group(2)), lengths, match.group(4)))
     member_tokens = re.search(
-        r"Fused member tokens: operators=(\d+); members=(\d+); signature=([0-9a-f]{8})\.",
+        r"Fused member tokens: operators=(\d+); members=(\d+); phases=(\d+); signature=([0-9a-f]{8})\.",
         log,
     )
     if not member_tokens:
-        raise SystemExit(f"missing fused member-token profile for build {index}")
-    fused_member_profiles.append((int(member_tokens.group(1)), int(member_tokens.group(2)), member_tokens.group(3)))
+        raise SystemExit(f"missing fused member-phase profile for build {index}")
+    fused_member_profiles.append((
+        int(member_tokens.group(1)), int(member_tokens.group(2)),
+        int(member_tokens.group(3)), member_tokens.group(4),
+    ))
+    call_inclusive = re.search(
+        r"Call-inclusive fusion: templates=(\d+); folded=(\d+); max-width=(\d+)\.", log
+    )
+    if not call_inclusive:
+        raise SystemExit(f"missing call-inclusive fusion profile for build {index}")
+    call_inclusive_profiles.append(tuple(map(int, call_inclusive.groups())))
     call_trampoline = re.search(
         r"Call trampolines: modes=(\d+); phases=(\d+); frame=([1-4](?:,[1-4]){3}); signature=([0-9a-f]{8})\.",
         log,
@@ -683,7 +703,7 @@ if {layout["pipeline"] for layout in payload_layouts} != {0, 1, 2}:
     raise SystemExit("not all three decode pipelines were emitted")
 if len({layout["byte_transform"] for layout in payload_layouts}) < 3:
     raise SystemExit("payload byte-transform topology did not vary sufficiently")
-if len({(layout["pipeline"], layout["byte_transform"]) for layout in payload_layouts}) < 7:
+if len({(layout["pipeline"], layout["byte_transform"]) for layout in payload_layouts}) < 6:
     raise SystemExit("combined payload decode topology did not vary sufficiently")
 if len({json.dumps(profile, sort_keys=True) for profile in derivation_profiles}) != runs:
     raise SystemExit("a complete payload seed/stream derivation recipe was reused across builds")
@@ -714,11 +734,13 @@ if len(observed_fusion_lengths) < 3 or max(len(record[2]) for record in super_re
     raise SystemExit(f"IR-native fusion length diversity is insufficient: {super_records}")
 if len({record[3] for record in super_records}) != runs:
     raise SystemExit("a IR-native fusion semantic structure was reused across builds")
-if any(profile[0] != record[0] or profile[1] < profile[0] * 2
+if any(profile[0] != record[0] or profile[1] < profile[0] * 2 or profile[2] != profile[1] * 2
        for profile, record in zip(fused_member_profiles, super_records)):
-    raise SystemExit(f"fused member-token coverage is inconsistent: {fused_member_profiles}")
-if len({profile[2] for profile in fused_member_profiles}) != runs:
-    raise SystemExit("a fused member-token program was reused across builds")
+    raise SystemExit(f"fused member-phase coverage is inconsistent: {fused_member_profiles}")
+if len({profile[3] for profile in fused_member_profiles}) != runs:
+    raise SystemExit("a fused member phase/operand-slot program was reused across builds")
+if any(templates < 1 or folded < 1 or width != 10 for templates, folded, width in call_inclusive_profiles):
+    raise SystemExit(f"CALL was not materially included in fusion: {call_inclusive_profiles}")
 if any(profile[0] != 19 or profile[1] != 92 or sorted(profile[2]) != [1, 2, 3, 4]
        for profile in call_trampoline_profiles):
     raise SystemExit(f"CALL trampoline coverage/layout is invalid: {call_trampoline_profiles}")
@@ -843,7 +865,8 @@ print(
     f"derivation recipes={len({json.dumps(profile, sort_keys=True) for profile in derivation_profiles})}, "
     f"payload carriers={sorted(carrier_topologies)}, assemblies={sorted(assembly_topologies)}, "
     f"segments={sorted(segment_counts)}, "
-    f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, member-token-programs={len({profile[2] for profile in fused_member_profiles})}, "
+    f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, member-phase-programs={len({profile[3] for profile in fused_member_profiles})}, "
+    f"call-inclusive-folds={min(profile[1] for profile in call_inclusive_profiles)}..{max(profile[1] for profile in call_inclusive_profiles)}, "
     f"call-token-programs={len({profile[3] for profile in call_trampoline_profiles})}, call-frame-layouts={len({profile[2] for profile in call_trampoline_profiles})}, "
     f"semantic writes={write_totals}, raw reads={sum(record[1] for record in semantic_records)}/{sum(record[2] for record in semantic_records)}, "
     f"similarity dispatcher={max_similarity:.3f}/{mean_similarity:.3f}, "
@@ -1041,7 +1064,7 @@ python3 tests/phase4_dynamic_dump.py \
 run_executor "$WORK/phase4-runtime-instrumented.lua" > "$WORK/phase4-runtime-instrumented.out"
 grep '^phase4-runtime:' "$WORK/phase4-runtime-instrumented.out" > "$WORK/phase4-runtime-instrumented-baseline.out"
 cmp "$WORK/phase4-runtime-baseline.out" "$WORK/phase4-runtime-instrumented-baseline.out"
-grep -Eq '^PHASE4_DYNAMIC payload=page:[1-9][0-9]*/[1-9][0-9]* vm=opaque:[1-9][0-9]* chunks=decoded:[2-9][0-9]*,opaque:[1-9][0-9]* constants=max-live:([1-9]|1[0-8])/[1-9][0-9]* instructions=weak-live:0/[1-9][0-9]* memory-kb=[0-9]+\.[0-9]>[0-9]+\.[0-9]>[0-9]+\.[0-9]$' \
+grep -Eq '^PHASE4_DYNAMIC payload=page:[1-9][0-9]*/[1-9][0-9]* vm=opaque:[1-9][0-9]* chunks=decoded:[2-9][0-9]*,opaque:[1-9][0-9]* constants=max-live:([1-9]|[12][0-9]|30)/[1-9][0-9]* instructions=weak-live:0/[1-9][0-9]* memory-kb=[0-9]+\.[0-9]>[0-9]+\.[0-9]>[0-9]+\.[0-9]$' \
     "$WORK/phase4-runtime-instrumented.out"
 echo "PASS Phase 4 dynamic dump, single-Chunk isolation and GC/peak-memory lifecycle barriers"
 

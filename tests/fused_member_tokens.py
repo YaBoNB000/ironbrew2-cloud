@@ -12,16 +12,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from runtime_layout import _code_only
 
 IDENT = r"[A-Za-z_]\w*"
-PROFILE = re.compile(r"Fused member tokens: operators=(\d+); members=(\d+); signature=([0-9a-f]{8})\.")
+PROFILE = re.compile(
+    r"Fused member tokens: operators=(\d+); members=(\d+); phases=(\d+); signature=([0-9a-f]{8})\."
+)
 
 
 def verify(vm_path: Path, final_path: Path | None, build_log: Path) -> None:
     profile = PROFILE.search(build_log.read_text("utf-8", errors="replace"))
     if not profile:
         raise ValueError("fused member-token profile was not found")
-    operators, members, signature = int(profile.group(1)), int(profile.group(2)), profile.group(3)
-    if operators < 1 or members < operators * 2 or signature in ("00000000", "811c9dc5"):
-        raise ValueError(f"fused member-token profile is degenerate: {profile.group(0)}")
+    operators, members, phases, signature = (
+        int(profile.group(1)), int(profile.group(2)), int(profile.group(3)), profile.group(4)
+    )
+    if (operators < 1 or members < operators * 2 or phases != members * 2
+            or signature in ("00000000", "811c9dc5")):
+        raise ValueError(f"fused member-phase profile is degenerate: {profile.group(0)}")
 
     source = vm_path.read_text("latin1")
     code = _code_only(source)
@@ -45,18 +50,19 @@ def verify(vm_path: Path, final_path: Path | None, build_log: Path) -> None:
         if len(branches) != expected_width or len(set(branches)) != expected_width:
             raise ValueError(f"fusion member branches are incomplete: {branches}/{expected_width}")
         tokens.extend(branches)
-    if len(tokens) != members or len(set(tokens)) != members:
-        raise ValueError("fused member tokens were reused across handlers")
+    if len(tokens) != phases or len(set(tokens)) != phases:
+        raise ValueError("fused member select/execute tokens were reused across handlers")
 
     root = Path(__file__).resolve().parents[1]
     opcode = (root / "IronBrew2/Obfuscator/Opcodes/OpSuperOperator.cs").read_text()
-    for anchor in ("MemberTokens", "MemberBranchOrder", "FusedProgramCounter", "FusedProgramStep"):
+    for anchor in ("MemberTokens", "MemberExecuteTokens", "MemberOperandSlots", "MemberBranchOrder",
+                   "FusedProgramCounter", "FusedProgramStep"):
         if anchor not in opcode:
             raise ValueError(f"IR fusion token-program architecture is missing: {anchor}")
 
     final_code = _code_only(final_path.read_text("latin1")) if final_path else ""
     leaked = re.search(
-        r"\b(?:FusedHead|FusedProgramCounter|FusedProgramStep|MemberTokens|MemberBranchOrder)\b",
+        r"\b(?:FusedHead|FusedProgramCounter|FusedProgramStep|MemberTokens|MemberExecuteTokens|MemberOperandSlots|MemberBranchOrder)\b",
         code + "\n" + final_code,
     )
     if leaked:
@@ -64,7 +70,8 @@ def verify(vm_path: Path, final_path: Path | None, build_log: Path) -> None:
 
     print(
         "PASS fused member tokens: "
-        f"operators={operators}, members={members}, unique-tokens={len(set(tokens))}, signature={signature}"
+        f"operators={operators}, members={members}, phases={phases}, "
+        f"unique-tokens={len(set(tokens))}, signature={signature}"
     )
 
 

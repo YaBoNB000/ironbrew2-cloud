@@ -42,7 +42,7 @@ A current randomized build is required to recover, from the final Lua alone:
 - discarded calls as statements, separately from genuine RETURN instructions;
 - every physical fused record's logical member count and token-defined semantic order.
 
-A representative run recovered 333 logical instructions from roughly 270–305 physical records, classified over 300 logical instructions, expanded 24 fused programs, recovered 57 calls, two SELF instructions, six NEWTABLE instructions, eleven SETTABLE instructions, sixteen discarded calls and twenty-four true returns. Physical counts and classification totals vary because fusion, aliases, layouts and handlers are randomized.
+A representative current run recovered 333 logical instructions from roughly 220–260 physical records, classified over 300 logical instructions, expanded up to 24 fused programs, recovered 57 calls, two SELF instructions, six NEWTABLE instructions, eleven SETTABLE instructions, sixteen discarded calls and twenty-four true returns. Physical counts and classification totals vary because call-inclusive fusion, aliases, layouts and handlers are randomized.
 
 Run it with:
 
@@ -66,6 +66,20 @@ python3 tests/static_decompiler.py /path/to/final-call-fixture.lua \
 10. **Data-flow rendering** — tracks GETGLOBAL/LOADK/MOVE/CLOSURE, SELF, NEWTABLE/SETTABLE and CALL results sufficiently to render the loader chain and options table. CALL-discard and RETURN are counted separately.
 
 The classifier intentionally reports unknown operations rather than inventing semantics. It currently focuses on the operations needed to measure loader/table/call-chain recovery; it is not a complete general-purpose Lua source regenerator.
+
+## VM response to the uploaded loader-chain sample
+
+The uploaded `test_obf.txt` contains ten physical records / eleven logical operations. The adapted final-output attacker recovers all eleven, including `getgenv`, the environment table write, SELF/HttpGet, URL, loadstring, the compiled call, discarded result and true RETURN. This confirms that capsule encryption and the earlier one-state fusion program did not prevent full client-side reconstruction.
+
+The VM now applies three additional execution-shape barriers:
+
+1. ordinary CALL is eligible for IR-native fusion instead of forcing a physical boundary;
+2. a straight-line fusion may contain up to ten members and ignores synthetic (but never semantic CFG) block cuts;
+3. every semantic member is split into independent operand-select and execute tokens, while supplemental descriptor/operand pages use a separate build-random physical slot permutation.
+
+For the same minimal logical shape, a current build lowers the first ten operations—`getgenv` through the compiled function call—to one physical record with ten members, twenty independently shuffled select/execute phases and shuffled supplemental operand slots. The genuine RETURN remains a second record. `tests/call_inclusive_fusion.py` enforces this exact VM property.
+
+The adapted attacker is deliberately updated to follow both phase types and operand-slot selection. It still recovers the chain. The result is therefore accurately described as higher VM simulation and classifier cost, not secrecy or cryptographic irreversibility.
 
 ## Interpretation
 

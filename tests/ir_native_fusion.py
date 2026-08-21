@@ -23,10 +23,10 @@ def verify(generated: Path, generated_vm: Path | None) -> None:
         raise ValueError(f"too few physical IR-fusion records: {len(fused)}")
     if logical - physical < 16:
         raise ValueError(f"IR fusion did not materially reduce records: {physical}/{logical}")
-    if max(fused) > 5 or min(fused) < 1:
+    if max(fused) > 9 or min(fused) < 1:
         raise ValueError(f"invalid fused supplemental member count: {sorted(set(fused))}")
     widths = {count + 1 for count in fused}
-    if min(widths) < 2 or max(widths) > 6:
+    if min(widths) < 2 or max(widths) > 10:
         raise ValueError(f"fused sequence widths are invalid: {sorted(widths)}")
 
     descriptors = [descriptor for _, proto in _prototypes(info.root)
@@ -44,19 +44,24 @@ def verify(generated: Path, generated_vm: Path | None) -> None:
     serializer_source = (root / "IronBrew2/Bytecode Library/Bytecode/Serializer.cs").read_text()
     if "GetInstruction(Chunk, InstrPoint, Flow)" in opcode_source or "InstrPoint = InstrPoint + 1" in opcode_source:
         raise ValueError("fusion handler still fetches and replays serialized member instructions")
-    if "Inst=FusedOperands[" not in opcode_source:
-        raise ValueError("fusion handler does not consume the combined operand bundle")
+    if "FusedOperands[\" + MemberOperandSlots[member]" not in opcode_source:
+        raise ValueError("fusion select phase does not consume the shuffled operand bundle")
     if "FusedStack=Setmetatable" not in opcode_source or "RawEqual(FusedValue,FusedValues[FusedKey])" not in opcode_source:
         raise ValueError("fusion handler does not generate one cross-member register dataflow")
     for barrier in ("case Opcode.Closure:", "case Opcode.Close:", "case Opcode.SetList:",
-                    "case Opcode.Call:", "case Opcode.PushStack:",
-                    "case Opcode.VarArg when instruction.B == 0:"):
+                    "case Opcode.PushStack:", "case Opcode.VarArg when instruction.B == 0:"):
         if barrier not in generator_source:
             raise ValueError(f"IR fusion safety barrier is missing: {barrier}")
+    if "case Opcode.Call:" in generator_source:
+        raise ValueError("ordinary CALL unexpectedly remains an IR-fusion barrier")
+    if "GenerateSuperOperators(_context.HeadChunk, 10, 2, false)" not in generator_source:
+        raise ValueError("call-inclusive fusion does not use the widened member program")
     if "chunk.Instructions = loweredInstructions" not in serializer_source:
         raise ValueError("serializer does not physically lower fused IR sequences")
     if "fusedInstructions.Skip(1)" not in serializer_source:
         raise ValueError("serializer does not emit supplemental fused operands")
+    if "OrderBy(item => superOperator.MemberOperandSlots[item.SemanticIndex])" not in serializer_source:
+        raise ValueError("serializer does not physically shuffle supplemental member operands")
 
     if generated_vm:
         final_code = _code_only(generated.read_text("latin1"))
@@ -72,7 +77,7 @@ def verify(generated: Path, generated_vm: Path | None) -> None:
     print(
         "PASS IR-native fusion: "
         f"physical/logical={physical}/{logical} ({ratio:.3f}), fused-records={len(fused)}, widths={sorted(widths)}, "
-        "barriers=CFG/CLOSURE/CLOSE/SETLIST/CALL/var-return"
+        "barriers=semantic-CFG/CLOSURE/CLOSE/SETLIST/var-return; CALL=member-eligible"
     )
 
 

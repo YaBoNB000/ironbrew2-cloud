@@ -539,7 +539,7 @@ def recover_fragment_names(
     }
 
 
-def expand_fused_handler(body: str, inst: str) -> list[str]:
+def expand_fused_handler(body: str, inst: str) -> list[tuple[str, int]]:
     normalized = _normalize_arithmetic(body)
     prefix = re.search(
         rf"local\s+({IDENT})\s*=\s*{re.escape(inst)}\s*\[\s*5\s*\]\s*;\s*"
@@ -563,15 +563,17 @@ def expand_fused_handler(body: str, inst: str) -> list[str]:
     state, initial, step = machine.group(1), int(machine.group(2)), machine.group(3)
     branches = _token_branches(normalized[machine.end():], state)
     current = initial
-    members: list[str] = []
+    members: list[tuple[str, int]] = []
     seen: set[int] = set()
+    pending_slot: int | None = None
     while current:
         if current in seen or current not in branches:
             raise ValueError("fused member-token path is cyclic or incomplete")
         seen.add(current)
         branch = branches[current]
         assignment = re.search(
-            rf"{re.escape(inst)}\s*=\s*(?:{re.escape(head)}|{re.escape(operands)}\s*\[\s*\d+\s*\])\s*;",
+            rf"{re.escape(inst)}\s*=\s*(?P<source>{re.escape(head)}|"
+            rf"{re.escape(operands)}\s*\[\s*(?P<slot>\d+)\s*\])\s*;",
             branch,
         )
         finish = re.search(
@@ -579,11 +581,27 @@ def expand_fused_handler(body: str, inst: str) -> list[str]:
             rf"{re.escape(state)}\s*=\s*(\d+)\s*;",
             branch,
         )
-        if not assignment or not finish:
-            raise ValueError("fused member branch has no operand switch/transition")
-        semantic = branch[assignment.end():finish.start()]
-        members.append(f"__FUSED_STACK__={fused_stack};" + semantic)
+        if not finish:
+            raise ValueError("fused member phase has no bounded transition")
+        if assignment:
+            slot = int(assignment.group("slot")) if assignment.group("slot") else 0
+            semantic = branch[assignment.end():finish.start()]
+            if semantic.strip():
+                # Compatibility with the previous one-state member program.
+                members.append((f"__FUSED_STACK__={fused_stack};" + semantic, slot))
+            else:
+                if pending_slot is not None:
+                    raise ValueError("fused member selected two operand slots before execution")
+                pending_slot = slot
+        else:
+            if pending_slot is None:
+                raise ValueError("fused execute phase has no preceding operand selection")
+            semantic = branch[:finish.start()]
+            members.append((f"__FUSED_STACK__={fused_stack};" + semantic, pending_slot))
+            pending_slot = None
         current = int(finish.group(1))
+    if pending_slot is not None:
+        raise ValueError("fused member program ended after selection without execution")
     return members
 
 
@@ -708,11 +726,15 @@ def classify_handlers(
         members = expand_fused_handler(body, inst)
         if members:
             fused_programs += 1
-            result[canonical] = [
-                classify_semantic(member, layout, fragments, call_modes) for member in members
-            ]
+            result[canonical] = []
+            for member, operand_slot in members:
+                semantic = classify_semantic(member, layout, fragments, call_modes)
+                semantic["operand_slot"] = operand_slot
+                result[canonical].append(semantic)
         else:
-            result[canonical] = [classify_semantic(body, layout, fragments, call_modes)]
+            semantic = classify_semantic(body, layout, fragments, call_modes)
+            semantic["operand_slot"] = 0
+            result[canonical] = [semantic]
     return result, fused_programs
 
 
@@ -788,7 +810,14 @@ def recover_logical_instructions(
                         f"fused handler width mismatch at {proto_path}:{pc}: "
                         f"{len(semantics)} != {len(members)}"
                     )
-                for (descriptor, a, b, c, member), semantic in zip(members, semantics):
+                physical_members = {member: (descriptor, a, b, c) for descriptor, a, b, c, member in members}
+                for semantic_index, semantic in enumerate(semantics):
+                    operand_slot = int(semantic.get("operand_slot", semantic_index))
+                    if operand_slot not in physical_members:
+                        raise ValueError(
+                            f"fused semantic member {semantic_index} selects absent physical slot {operand_slot}"
+                        )
+                    descriptor, a, b, c = physical_members[operand_slot]
                     operands = (
                         _resolve_operand(info, prototype, block, descriptor, 1, a),
                         _resolve_operand(info, prototype, block, descriptor, 2, b),
@@ -797,7 +826,7 @@ def recover_logical_instructions(
                     instructions.append(LogicalInstruction(
                         prototype=proto_path,
                         physical_pc=pc,
-                        member=member,
+                        member=semantic_index,
                         canonical_id=canonical,
                         semantic=semantic["semantic"],
                         a=operands[0], b=operands[1], c=operands[2],

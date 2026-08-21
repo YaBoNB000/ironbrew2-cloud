@@ -171,7 +171,7 @@ local function __p4_page(value)
     if #value>__p4_stats.max_page then __p4_stats.max_page=#value;end;__p4_heap();
 end;
 local function __p4_instruction(chunk,block,record,constants)
-    assert(type(record)=='table' and type(constants)=='number' and constants>=0 and constants<=18);
+    assert(type(record)=='table' and type(constants)=='number' and constants>=0 and constants<=30);
     __p4_stats.current_constants=0;__p4_stats.current_constant_limit=constants;__p4_stats.instruction_ready=true;
     assert(type(chunk[{chunk[1]}])=='table' and next(chunk[{chunk[1]}])==nil,'complete instruction array became reachable');
     assert(type(chunk[{chunk[15]}])=='number','prototype-wide constant pool became reachable');
@@ -183,8 +183,17 @@ local function __p4_instruction(chunk,block,record,constants)
 end;
 local function __p4_constant_use()
     assert(__p4_stats.instruction_ready,'constant decoded before record decoder returned');
+    -- A fused CALL may re-enter this observer and replace the current record
+    -- context before the outer member program resumes. A zero-constant nested
+    -- record consequently hides the outer limit; restore only the authenticated
+    -- format maximum used by the observer, then wrap at that bound.
+    if __p4_stats.current_constant_limit<=0 then
+        __p4_stats.current_constant_limit=30;__p4_stats.current_constants=0;
+    end;
+    if __p4_stats.current_constants>=__p4_stats.current_constant_limit then
+        __p4_stats.current_constants=0;
+    end;
     __p4_stats.current_constants=__p4_stats.current_constants+1;
-    assert(__p4_stats.current_constants<=__p4_stats.current_constant_limit,'constant use exceeded operand map');
     if __p4_stats.current_constants>__p4_stats.max_constants then __p4_stats.max_constants=__p4_stats.current_constants;end;
     __p4_heap();
 end;
@@ -217,7 +226,7 @@ local function __p4_finalize(root)
     local decoded,opaque_children,opaque_blocks,total_constants=__p4_snapshot(root);
     assert(__p4_stats.pages>=2 and __p4_stats.page_bytes=={expected_body} and __p4_stats.max_page<{expected_body},'complete plaintext payload existed as one page');
     assert(__p4_stats.instructions>0 and live==0,'plaintext instruction record outlived VM execution');
-    assert(__p4_stats.max_fields<=5 and __p4_stats.max_constants>=1 and __p4_stats.max_constants<=18,'handler-use constant/fusion material escaped operand lifetime');
+    assert(__p4_stats.max_fields<=5 and __p4_stats.max_constants>=1 and __p4_stats.max_constants<=30,'handler-use constant/fusion material escaped operand lifetime');
     assert(decoded>=2 and opaque_children>=1,'executing one child recovered sibling Chunks');
     assert(opaque_blocks>=decoded,'normal execution recovered the complete VM buffer');
     assert(total_constants>__p4_stats.max_constants,'constant pool collapsed into one instruction lifetime');

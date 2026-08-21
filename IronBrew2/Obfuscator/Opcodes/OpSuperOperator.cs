@@ -10,7 +10,13 @@ namespace IronBrew2.Obfuscator.Opcodes
 	public class OpSuperOperator : VOpcode
 	{
 		public VOpcode[] SubOpcodes;
+		public bool CallInclusive;
+		// Each semantic member now has two independent states. The select state
+		// chooses a build-random physical operand slot; only its successor execute
+		// state contains semantics. Branches for both phases are physically shuffled.
 		public uint[] MemberTokens;
+		public uint[] MemberExecuteTokens;
+		public int[] MemberOperandSlots;
 		public int[] MemberBranchOrder;
 
 		public override bool IsInstruction(Instruction instruction) => false;
@@ -35,14 +41,19 @@ namespace IronBrew2.Obfuscator.Opcodes
 
 		public override string GetObfuscated(ObfuscationContext context)
 		{
-			if (MemberTokens == null || MemberTokens.Length != SubOpcodes.Length ||
-			    MemberBranchOrder == null || MemberBranchOrder.Length != SubOpcodes.Length ||
+			int memberCount = SubOpcodes.Length;
+			if (MemberTokens == null || MemberTokens.Length != memberCount ||
+			    MemberExecuteTokens == null || MemberExecuteTokens.Length != memberCount ||
+			    MemberOperandSlots == null || MemberOperandSlots.Length != memberCount ||
+			    MemberOperandSlots[0] != 0 ||
+			    MemberOperandSlots.Skip(1).OrderBy(value => value).Where((value, index) => value != index + 1).Any() ||
+			    MemberBranchOrder == null || MemberBranchOrder.Length != memberCount * 2 ||
 			    MemberBranchOrder.OrderBy(value => value).Where((value, index) => value != index).Any())
-				throw new InvalidOperationException("IR fusion member-token program was not initialized.");
+				throw new InvalidOperationException("IR fusion member phase program was not initialized.");
 
 			var locals = new List<string>();
-			var memberBodies = new string[SubOpcodes.Length];
-			for (int index = 0; index < SubOpcodes.Length; index++)
+			var memberBodies = new string[memberCount];
+			for (int index = 0; index < memberCount; index++)
 			{
 				string body = Regex.Replace(SubOpcodes[index].GetObfuscated(context), @"\bStk\b", "FusedStack");
 				Regex declarations = new Regex("local(.*?)[;=]");
@@ -55,9 +66,7 @@ namespace IronBrew2.Obfuscator.Opcodes
 					else
 						body = body.Replace($"local{match.Groups[1].Value};", "");
 				}
-				uint nextToken = index + 1 < MemberTokens.Length ? MemberTokens[index + 1] : 0u;
-				memberBodies[index] = (index == 0 ? "Inst=FusedHead;" : "Inst=FusedOperands[" + index + "];")
-					+ body + "FusedProgramStep=FusedProgramStep+1;FusedProgramCounter=" + nextToken + ";";
+				memberBodies[index] = body;
 			}
 
 			var output = new StringBuilder(
@@ -70,13 +79,31 @@ namespace IronBrew2.Obfuscator.Opcodes
 				"__newindex=function(_,FusedKey,FusedValue)FusedWritten[FusedKey],FusedValues[FusedKey]=true,FusedValue;" +
 				"RawSet(Stk,FusedKey,FusedValue);end});" +
 				"local FusedProgramCounter=" + MemberTokens[0] + ";local FusedProgramStep=0;" +
-				"while FusedProgramCounter~=0 do if FusedProgramStep>" + SubOpcodes.Length + " then error('invalid protected payload',0);end;");
+				"while FusedProgramCounter~=0 do if FusedProgramStep>" + (memberCount * 2) + " then error('invalid protected payload',0);end;");
 			for (int branch = 0; branch < MemberBranchOrder.Length; branch++)
 			{
-				int member = MemberBranchOrder[branch];
-				output.Append(branch == 0 ? "if " : "elseif ")
-					.Append("FusedProgramCounter==").Append(MemberTokens[member]).Append(" then ")
-					.Append(memberBodies[member]);
+				int phase = MemberBranchOrder[branch];
+				bool execute = phase >= memberCount;
+				int member = execute ? phase - memberCount : phase;
+				output.Append(branch == 0 ? "if " : "elseif ");
+				if (!execute)
+				{
+					string operand = member == 0
+						? "FusedHead"
+						: "FusedOperands[" + MemberOperandSlots[member] + "]";
+					output.Append("FusedProgramCounter==").Append(MemberTokens[member]).Append(" then ")
+						.Append("Inst=").Append(operand).Append(';')
+						.Append("FusedProgramStep=FusedProgramStep+1;FusedProgramCounter=")
+						.Append(MemberExecuteTokens[member]).Append(';');
+				}
+				else
+				{
+					uint nextToken = member + 1 < memberCount ? MemberTokens[member + 1] : 0u;
+					output.Append("FusedProgramCounter==").Append(MemberExecuteTokens[member]).Append(" then ")
+						.Append(memberBodies[member])
+						.Append("FusedProgramStep=FusedProgramStep+1;FusedProgramCounter=")
+						.Append(nextToken).Append(';');
+				}
 			}
 			output.Append("else error('invalid protected payload',0);end;end;");
 			foreach (string local in locals)

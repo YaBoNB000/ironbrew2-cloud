@@ -487,7 +487,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			return stats;
 		}
 
-		private bool[] BuildSuperOperatorBarrierMap(Chunk chunk)
+		private bool[] BuildSuperOperatorBarrierMap(Chunk chunk, bool includeSyntheticCuts = true)
 		{
 			var barriers = new bool[chunk.Instructions.Count + 1];
 			void Mark(int index)
@@ -496,10 +496,14 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					barriers[index] = true;
 			}
 
-			// Treat both semantic CFG entries and serializer-imposed bounded-block cuts
-			// as hard fusion boundaries. Marking the preceding instruction still allows
-			// a new fusion to begin at the destination block.
-			ControlFlowGraph graph = ControlFlowGraph.Build(chunk, _context.MaxBlockInstructions);
+			// Marking the instruction preceding a selected boundary still allows a new
+			// fusion to begin at the destination block. Every fusion observes semantic
+			// CFG entries. Ordinary templates also keep
+			// synthetic micro-block cuts; only explicitly call-inclusive templates may
+			// ignore those later routing boundaries, without crossing a real target.
+			ControlFlowGraph graph = ControlFlowGraph.Build(chunk, includeSyntheticCuts
+				? _context.MaxBlockInstructions
+				: Math.Max(1, chunk.Instructions.Count));
 			foreach (ControlFlowBlock block in graph.Blocks)
 				if (block.Start > 0) Mark(block.Start - 1);
 
@@ -539,7 +543,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 						Mark(index + 1);
 						Mark(index + instruction.B + 1);
 						break;
-					case Opcode.Call:
+					// Ordinary CALL is intentionally not a barrier. HandlerCall captures
+					// exact B/C/Top semantics and commits result writes to Stk, while the
+					// FusedStack proxy detects those writes before the next member executes.
 					case Opcode.PushStack:
 					case Opcode.VarArg when instruction.B == 0:
 					case Opcode.Return:
@@ -555,11 +561,12 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			return barriers;
 		}
 
-		public List<OpSuperOperator> GenerateSuperOperators(Chunk chunk, int maxSize, int minSize = 5)
+		public List<OpSuperOperator> GenerateSuperOperators(
+			Chunk chunk, int maxSize, int minSize = 5, bool includeSyntheticCuts = true)
 		{
 			List<OpSuperOperator> results = new List<OpSuperOperator>();
 
-			bool[] skip = BuildSuperOperatorBarrierMap(chunk);
+			bool[] skip = BuildSuperOperatorBarrierMap(chunk, includeSyntheticCuts);
 
 			int c = 0;
 			while (c < chunk.Instructions.Count)
@@ -599,64 +606,59 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			}
 
 			foreach (var _c in chunk.Functions)
-				results.AddRange(GenerateSuperOperators(_c, maxSize, minSize));
+				results.AddRange(GenerateSuperOperators(_c, maxSize, minSize, includeSyntheticCuts));
 			
 			return results;
 		}
 
 		public void FoldAdditionalSuperOperators(Chunk chunk, List<OpSuperOperator> operators, ref int folded)
 		{
-			bool[] skip = BuildSuperOperatorBarrierMap(chunk);
+			bool[] strictBarriers = BuildSuperOperatorBarrierMap(chunk, true);
+			bool[] semanticBarriers = BuildSuperOperatorBarrierMap(chunk, false);
+			var consumed = new bool[chunk.Instructions.Count];
 
 			int c = 0;
 			while (c < chunk.Instructions.Count)
 			{
-				if (skip[c])
+				if (consumed[c] || semanticBarriers[c])
 				{
 					c++;
 					continue;
 				}
 
 				bool used = false;
-
 				foreach (OpSuperOperator op in operators)
 				{
+					bool[] barriers = op.CallInclusive ? semanticBarriers : strictBarriers;
 					int targetCount = op.SubOpcodes.Length;
-					bool cu = true;
+					bool eligible = true;
 					for (int j = 0; j < targetCount; j++)
 					{
-						if (c + j > chunk.Instructions.Count - 1 || skip[c + j])
+						if (c + j > chunk.Instructions.Count - 1 || consumed[c + j] || barriers[c + j])
 						{
-							cu = false;
+							eligible = false;
 							break;
 						}
 					}
-
-					if (!cu)
-						continue;
-
+					if (!eligible) continue;
 
 					List<Instruction> taken = chunk.Instructions.Skip(c).Take(targetCount).ToList();
 					if (op.IsInstruction(taken))
 					{
 						for (int j = 0; j < targetCount; j++)
 						{
-							skip[c + j] = true;
+							consumed[c + j] = true;
 							chunk.Instructions[c + j].CustomData.FusionContinuation = j != 0;
 						}
-
 						chunk.Instructions[c].CustomData.WrittenOpcode = op;
 						chunk.Instructions[c].CustomData.FusedInstructions = taken;
-
 						used = true;
 						break;
 					}
 				}
 
-				if (!used)
-					c++;
-				else
-					folded++;
+				if (!used) c++;
+				else folded++;
 			}
 
 			foreach (var _c in chunk.Functions)
@@ -937,29 +939,65 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				// data word, while the small cap prevents giant recognizable handlers.
 				int folded = 0;
 				int operatorLimit = Math.Min(settings.MaxMiniSuperOperators, 24);
-				var shortOperators = GenerateSuperOperators(_context.HeadChunk, 6, 2)
-					.OrderBy(_ => r.Next()).Take(operatorLimit).ToList();
+				bool IsCallSemantic(VOpcode opcode)
+				{
+					if (opcode is OpMutated mutated) return IsCallSemantic(mutated.Mutated);
+					return opcode.GetType().Name.StartsWith("OpCall", StringComparison.Ordinal);
+				}
+				var callOperators = GenerateSuperOperators(_context.HeadChunk, 10, 2, false)
+					.Where(op => op.SubOpcodes.Any(IsCallSemantic)).OrderBy(_ => r.Next()).ToList();
+				foreach (OpSuperOperator callOperator in callOperators) callOperator.CallInclusive = true;
+				var regularOperators = GenerateSuperOperators(_context.HeadChunk, 10, 2, true)
+					.Where(op => !op.SubOpcodes.Any(IsCallSemantic)).ToList();
+				int reservedCallOperators = Math.Min(Math.Min(8, operatorLimit), callOperators.Count);
+				var shortOperators = callOperators.Take(reservedCallOperators)
+					.Concat(regularOperators.OrderBy(_ => r.Next()).Take(operatorLimit - reservedCallOperators))
+					.ToList();
 				var usedMemberTokens = new HashSet<uint>();
 				uint memberTokenSignature = 2166136261u;
 				int memberTokenCount = 0;
+				int memberPhaseCount = 0;
 				foreach (OpSuperOperator superOperator in shortOperators)
 				{
-					superOperator.MemberTokens = new uint[superOperator.SubOpcodes.Length];
-					for (int member = 0; member < superOperator.MemberTokens.Length; member++)
+					int count = superOperator.SubOpcodes.Length;
+					superOperator.MemberTokens = new uint[count];
+					superOperator.MemberExecuteTokens = new uint[count];
+					for (int member = 0; member < count; member++)
 					{
-						uint token;
-						do token = unchecked((uint)r.NextInt64(1L, 4294967296L)); while (!usedMemberTokens.Add(token));
-						superOperator.MemberTokens[member] = token;
-						memberTokenSignature = (memberTokenSignature ^ token) * 16777619u;
+						uint selectToken, executeToken;
+						do selectToken = unchecked((uint)r.NextInt64(1L, 4294967296L)); while (!usedMemberTokens.Add(selectToken));
+						do executeToken = unchecked((uint)r.NextInt64(1L, 4294967296L)); while (!usedMemberTokens.Add(executeToken));
+						superOperator.MemberTokens[member] = selectToken;
+						superOperator.MemberExecuteTokens[member] = executeToken;
+						memberTokenSignature = (memberTokenSignature ^ selectToken) * 16777619u;
+						memberTokenSignature = (memberTokenSignature ^ executeToken) * 16777619u;
 						memberTokenCount++;
+						memberPhaseCount += 2;
 					}
-					superOperator.MemberBranchOrder = Enumerable.Range(0, superOperator.SubOpcodes.Length).ToArray();
+					superOperator.MemberOperandSlots = new int[count];
+					superOperator.MemberOperandSlots[0] = 0;
+					int[] supplementalSlots = Enumerable.Range(1, count - 1).ToArray();
+					supplementalSlots.Shuffle(r);
+					for (int member = 1; member < count; member++)
+						superOperator.MemberOperandSlots[member] = supplementalSlots[member - 1];
+					superOperator.MemberBranchOrder = Enumerable.Range(0, count * 2).ToArray();
 					superOperator.MemberBranchOrder.Shuffle(r);
+					foreach (int slot in superOperator.MemberOperandSlots)
+						memberTokenSignature = (memberTokenSignature ^ (uint)(slot + 1)) * 16777619u;
 					foreach (int branch in superOperator.MemberBranchOrder)
 						memberTokenSignature = (memberTokenSignature ^ (uint)(branch + 1)) * 16777619u;
 				}
 				virtuals.AddRange(shortOperators);
 				FoldAdditionalSuperOperators(_context.HeadChunk, shortOperators, ref folded);
+				int CountCallInclusiveFolds(Chunk chunk)
+				{
+					int count = chunk.Instructions.Count(instruction =>
+						instruction.CustomData?.FusedInstructions is {Count: > 1} members &&
+						members.Any(member => member.OpCode == Opcode.Call));
+					foreach (Chunk child in chunk.Functions) count += CountCallInclusiveFolds(child);
+					return count;
+				}
+				int callInclusiveFolds = CountCallInclusiveFolds(_context.HeadChunk);
 				uint structureSignature = 2166136261u;
 				foreach (OpSuperOperator superOperator in shortOperators)
 				{
@@ -976,7 +1014,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				Console.WriteLine("Created " + shortOperators.Count + " IR-native super operators; folded " + folded
 					+ " sequences; lengths " + lengthProfile + "; structure " + structureSignature.ToString("x8") + ".");
 				Console.WriteLine("Fused member tokens: operators=" + shortOperators.Count + "; members=" + memberTokenCount
-					+ "; signature=" + memberTokenSignature.ToString("x8") + ".");
+					+ "; phases=" + memberPhaseCount + "; signature=" + memberTokenSignature.ToString("x8") + ".");
+				Console.WriteLine("Call-inclusive fusion: templates=" + reservedCallOperators
+					+ "; folded=" + callInclusiveFolds + "; max-width=10.");
 			}
 
 			// Four synthetic replay leaves back the invocation-local instruction overlay.
@@ -2629,7 +2669,7 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
 
         if IsFused then
             local FusedCount = ColumnRead8(1);
-            if FusedCount < 1 or FusedCount > 5 then error('invalid protected payload', 0); end;
+            if FusedCount < 1 or FusedCount > 9 then error('invalid protected payload', 0); end;
             local FusedInstructionFields, FusedConstantFields = {}, {};
             for FusedIndex = 1, FusedCount do
                 local FusedDescriptor = ColumnRead8(1);

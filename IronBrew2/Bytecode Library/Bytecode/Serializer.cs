@@ -7,6 +7,7 @@ using System.Text;
 using IronBrew2.Bytecode_Library.IR;
 using IronBrew2.Obfuscator;
 using IronBrew2.Obfuscator.Control_Flow;
+using IronBrew2.Obfuscator.Opcodes;
 
 namespace IronBrew2.Bytecode_Library.Bytecode
 {
@@ -864,11 +865,20 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 				if (isFused)
 				{
-					if (fusedInstructions.Count > 6 || !ReferenceEquals(fusedInstructions[0], instruction))
+					if (fusedInstructions.Count > 10 || !ReferenceEquals(fusedInstructions[0], instruction) ||
+					    instruction.CustomData.WrittenOpcode is not OpSuperOperator superOperator ||
+					    superOperator.MemberOperandSlots == null ||
+					    superOperator.MemberOperandSlots.Length != fusedInstructions.Count)
 						throw new InvalidOperationException("Invalid IR fusion descriptor.");
 					descriptors.Add((byte)(fusedInstructions.Count - 1));
-					foreach (Instruction member in fusedInstructions.Skip(1))
+					// Supplemental descriptor/operand pages use a build-random physical
+					// order. The member select phase maps semantic order back to these slots.
+					var physicalMembers = fusedInstructions.Skip(1)
+						.Select((member, offset) => new {Member = member, SemanticIndex = offset + 1})
+						.OrderBy(item => superOperator.MemberOperandSlots[item.SemanticIndex]);
+					foreach (var physicalMember in physicalMembers)
 					{
+						Instruction member = physicalMember.Member;
 						int memberType = (int)member.InstructionType;
 						int memberMask = (int)member.ConstantMask;
 						if (member.InstructionType == InstructionType.Data || memberType > 3 || memberMask > 7)

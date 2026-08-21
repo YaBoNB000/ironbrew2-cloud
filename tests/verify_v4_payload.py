@@ -803,7 +803,7 @@ def validate_instruction_record(
             if len(columns[0]) < 3:
                 raise ValueError("IR fusion descriptor is incomplete")
             fused_count = columns[0][1]
-            if fused_count < 1 or fused_count > 5 or len(columns[0]) != fused_count + 2:
+            if fused_count < 1 or fused_count > 9 or len(columns[0]) != fused_count + 2:
                 raise ValueError("IR fusion member count/framing mismatch")
             expected[0] += fused_count + 1
             for member_descriptor in columns[0][2:]:
