@@ -52,6 +52,16 @@ def verify(generated: Path, vm_path: Path, build_log: Path) -> None:
             for destination, mode in block.successor_modes.items():
                 payload_tokens.add(mode)
                 incoming.setdefault(destination, []).append(mode)
+        for block in prototype.blocks:
+            expected_modes = set(incoming.get(block.start_pc, []))
+            if block.start_pc == 1:
+                expected_modes.add(prototype.initial_mode)
+            # Unreachable compiler artifacts receive one authenticated fallback
+            # mode but never gain a synthetic CFG predecessor.
+            if expected_modes and expected_modes != set(block.accepted_modes):
+                raise ValueError(
+                    f"target block {block.start_pc} accepted-mode manifest disagrees with incoming edges"
+                )
         distinct_predecessor_target |= any(
             len(values) >= 2 and len(set(values)) >= 2 for values in incoming.values()
         )
