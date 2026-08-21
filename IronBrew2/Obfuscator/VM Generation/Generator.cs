@@ -1024,6 +1024,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
 				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched","HandlerReadStack","HandlerReadEnvironment","HandlerWriteStack","HandlerTableWrite","HandlerTableAcquireKey","HandlerTableAcquireValue","HandlerTableCommit","HandlerTableCommitA","HandlerTableCommitB","HandlerTableCommitC","HandlerTableCommitD","HandlerTableCommitMode","HandlerTableSlot","HandlerTableResult","HandlerTableFresh","HandlerTableDecoyKey","HandlerTableDecoyValue","HandlerTableTarget","HandlerTableKey","HandlerTableValue","HandlerTableMode","HandlerBinary","HandlerUnary","HandlerPc","HandlerFragmentIndex","HandlerFragmentValue","HandlerFragmentMode","HandlerFragmentLeft","HandlerFragmentRight","HandlerFragmentCurrent","HandlerFragmentTarget",
+				"HandlerCall","HandlerCallAcquireTarget","HandlerCallValidateTarget","HandlerCallAcquireArguments","HandlerCallInvoke","HandlerCallInvokeA","HandlerCallInvokeB","HandlerCallInvokeC","HandlerCallInvokeD","HandlerCallTailInvoke","HandlerCallTailInvokeA","HandlerCallTailInvokeB","HandlerCallTailInvokeC","HandlerCallTailInvokeD","HandlerCallForward","HandlerCallMode","HandlerCallInstruction","HandlerCallTop","HandlerCallFrame","HandlerCallArgumentMode","HandlerCallResultMode","HandlerCallInvokeMode","HandlerCallState","HandlerCallSteps","HandlerCallResults","HandlerCallResultCount","HandlerCallA","HandlerCallFirst","HandlerCallLast","HandlerCallTarget","HandlerCallIndex","HandlerCallResultIndex","HandlerCallNewTop",
 				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetInfo","GuardInfo","GuardInspector",
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardEnvironmentRead","GuardGetGenV",
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
@@ -1556,6 +1557,53 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			_context.TableCommitTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
 			uint[] tableCommitRoute = _context.TableCommitTokens.OrderBy(_ => r.Next()).ToArray();
 			bool[] tableWriteValueFirst = Enumerable.Range(0, 4).Select(_ => r.Next(2) == 0).ToArray();
+
+			// CALL/TAILCALL leaves carry only one build-random mode token. The shared
+			// runtime first resolves that token to a mode-local state path, then splits
+			// target acquisition, loader validation, argument-window acquisition,
+			// invocation and result forwarding across independently tokenized phases.
+			// Every tail path stops before result capture and reaches a direct-return
+			// leaf, preserving Lua 5.1 tail-call and multiple-result behavior.
+			int callModeCount = (int)CallMode.ModeCount;
+			_context.CallModeTokens = Enumerable.Range(0, callModeCount).Select(_ => NewFragmentToken()).ToArray();
+			uint[] callArgumentTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
+			uint[] callResultTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
+			uint[] callInvokeTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
+			int[] callArgumentKinds =
+			{
+				0, 1, 2, 3, 0, 1, 0, 1, 2, 2, 3, 3, 0, 1, 2, 3, 0, 2, 3
+			};
+			int[] callResultKinds =
+			{
+				0, 0, 0, 0, 1, 1, 2, 2, 1, 2, 1, 2, 3, 3, 3, 3, -1, -1, -1
+			};
+			bool[] callTailModes = Enumerable.Range(0, callModeCount)
+				.Select(index => index >= (int)CallMode.TailFixedArguments).ToArray();
+			if (callArgumentKinds.Length != callModeCount || callResultKinds.Length != callModeCount)
+				throw new InvalidOperationException("CALL trampoline mode table is out of sync.");
+			int[] callInvokeAssignments = Enumerable.Range(0, callModeCount).Select(index => index % 4).ToArray();
+			callInvokeAssignments.Shuffle(r);
+			uint[][] callPhaseTokens = Enumerable.Range(0, callModeCount)
+				.Select(mode => Enumerable.Range(0, callTailModes[mode] ? 4 : 5)
+					.Select(_ => NewFragmentToken()).ToArray()).ToArray();
+			int[] callFrameSlots = GenerateRuntimeSlotPermutation(4);
+			int[] callModeOrder = Enumerable.Range(0, callModeCount).ToArray();
+			callModeOrder.Shuffle(r);
+			var callPhaseOrder = Enumerable.Range(0, callModeCount)
+				.SelectMany(mode => Enumerable.Range(0, callPhaseTokens[mode].Length)
+					.Select(phase => (Mode: mode, Phase: phase))).ToList();
+			callPhaseOrder.Shuffle(r);
+			uint callTrampolineSignature = 2166136261u;
+			void AbsorbCallTrampoline(uint value) =>
+				callTrampolineSignature = (callTrampolineSignature ^ value) * 16777619u;
+			foreach (uint token in _context.CallModeTokens) AbsorbCallTrampoline(token);
+			foreach (uint token in callArgumentTokens) AbsorbCallTrampoline(token);
+			foreach (uint token in callResultTokens) AbsorbCallTrampoline(token);
+			foreach (uint token in callInvokeTokens) AbsorbCallTrampoline(token);
+			foreach (uint[] phases in callPhaseTokens)
+				foreach (uint token in phases) AbsorbCallTrampoline(token);
+			foreach (int slot in callFrameSlots) AbsorbCallTrampoline((uint)slot);
+
 			int handlerFragmentReadCalls = 0;
 			int handlerFragmentEnvironmentCalls = 0;
 			int handlerFragmentWriteCalls = 0;
@@ -1730,6 +1778,128 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					fragment.Append("HandlerTableCommitMode=").Append(ScrambleUInt(tableCommitRoute[index])).Append(";");
 				}
 				fragment.Append("else error('invalid protected payload',0);end;local HandlerTableResult=HandlerTableCommit(HandlerTableCommitMode,HandlerTableTarget,HandlerTableKey,HandlerTableValue);if HandlerTableFresh then HandlerTableCommit(HandlerTableCommitMode,HandlerTableTarget,HandlerTableDecoyKey,nil);end;return HandlerTableResult;end;");
+
+				// A four-slot frame has a per-build physical layout applied after identifier
+				// randomization: A, the validated callee, and the inclusive argument window.
+				fragment.Append("local function HandlerCallAcquireTarget(HandlerCallInstruction)local HandlerCallFrame={};")
+				        .Append("local HandlerCallA=HandlerCallInstruction[OP_A];HandlerCallFrame[1]=HandlerCallA;")
+				        .Append("HandlerCallFrame[2]=HandlerReadStack(HandlerCallA,").Append(ScrambleNumber(r.Next(2))).Append(");return HandlerCallFrame;end;");
+				fragment.Append("local function HandlerCallValidateTarget(HandlerCallFrame)");
+				if (settings.AntiDump)
+					fragment.Append("local HandlerCallTarget=HandlerCallFrame[2];HandlerCallFrame[2]=GuardValidateCallTarget(HandlerCallTarget);");
+				fragment.Append("return HandlerCallFrame;end;");
+				fragment.Append("local function HandlerCallAcquireArguments(HandlerCallArgumentMode,HandlerCallFrame,HandlerCallInstruction,HandlerCallTop)")
+				        .Append("local HandlerCallA=HandlerCallFrame[1];HandlerCallFrame[3]=HandlerCallA+").Append(ScrambleNumber(1)).Append(";");
+				int[] argumentBranchOrder = Enumerable.Range(0, 4).ToArray();
+				argumentBranchOrder.Shuffle(r);
+				for (int orderIndex = 0; orderIndex < argumentBranchOrder.Length; orderIndex++)
+				{
+					int kind = argumentBranchOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallArgumentMode==")
+					        .Append(ScrambleUInt(callArgumentTokens[kind])).Append(" then ");
+					fragment.Append(kind switch
+					{
+						0 => "HandlerCallFrame[4]=HandlerCallInstruction[OP_B];",
+						1 => "HandlerCallFrame[4]=HandlerCallA+1;",
+						2 => "HandlerCallFrame[4]=HandlerCallTop;",
+						_ => "HandlerCallFrame[4]=HandlerCallA;"
+					});
+				}
+				fragment.Append("else error('invalid protected payload',0);end;return HandlerCallFrame;end;");
+
+				string[] invokeLeaves = {"HandlerCallInvokeA", "HandlerCallInvokeB", "HandlerCallInvokeC", "HandlerCallInvokeD"};
+				fragment.Append("local function HandlerCallInvokeA(HandlerCallFrame)local HandlerCallTarget=HandlerCallFrame[2];return _R(HandlerCallTarget(Unpack(Stk,HandlerCallFrame[3],HandlerCallFrame[4])));end;");
+				fragment.Append("local function HandlerCallInvokeB(HandlerCallFrame)local HandlerCallFirst=HandlerCallFrame[3];local HandlerCallTarget=HandlerCallFrame[2];return _R(HandlerCallTarget(Unpack(Stk,HandlerCallFirst,HandlerCallFrame[4])));end;");
+				fragment.Append("local function HandlerCallInvokeC(HandlerCallFrame)local HandlerCallTarget=HandlerCallFrame[2];local HandlerCallLast=HandlerCallFrame[4];return _R((HandlerCallTarget)(Unpack(Stk,HandlerCallFrame[3],HandlerCallLast)));end;");
+				fragment.Append("local function HandlerCallInvokeD(HandlerCallFrame)local HandlerCallFirst,HandlerCallLast=HandlerCallFrame[3],HandlerCallFrame[4];local HandlerCallTarget=HandlerCallFrame[2];return _R(HandlerCallTarget(Unpack(Stk,HandlerCallFirst,HandlerCallLast)));end;");
+				int[] invokeBranchOrder = Enumerable.Range(0, 4).ToArray();
+				invokeBranchOrder.Shuffle(r);
+				fragment.Append("local function HandlerCallInvoke(HandlerCallInvokeMode,HandlerCallFrame)");
+				for (int orderIndex = 0; orderIndex < invokeBranchOrder.Length; orderIndex++)
+				{
+					int leaf = invokeBranchOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallInvokeMode==")
+					        .Append(ScrambleUInt(callInvokeTokens[leaf])).Append(" then return ")
+					        .Append(invokeLeaves[leaf]).Append("(HandlerCallFrame);");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+
+				string[] tailInvokeLeaves = {"HandlerCallTailInvokeA", "HandlerCallTailInvokeB", "HandlerCallTailInvokeC", "HandlerCallTailInvokeD"};
+				fragment.Append("local function HandlerCallTailInvokeA(HandlerCallFrame)local HandlerCallTarget=HandlerCallFrame[2];return HandlerCallTarget(Unpack(Stk,HandlerCallFrame[3],HandlerCallFrame[4]));end;");
+				fragment.Append("local function HandlerCallTailInvokeB(HandlerCallFrame)local HandlerCallFirst=HandlerCallFrame[3];local HandlerCallTarget=HandlerCallFrame[2];return HandlerCallTarget(Unpack(Stk,HandlerCallFirst,HandlerCallFrame[4]));end;");
+				fragment.Append("local function HandlerCallTailInvokeC(HandlerCallFrame)local HandlerCallTarget=HandlerCallFrame[2];local HandlerCallLast=HandlerCallFrame[4];return (HandlerCallTarget)(Unpack(Stk,HandlerCallFrame[3],HandlerCallLast));end;");
+				fragment.Append("local function HandlerCallTailInvokeD(HandlerCallFrame)local HandlerCallFirst,HandlerCallLast=HandlerCallFrame[3],HandlerCallFrame[4];local HandlerCallTarget=HandlerCallFrame[2];return HandlerCallTarget(Unpack(Stk,HandlerCallFirst,HandlerCallLast));end;");
+				int[] tailInvokeBranchOrder = Enumerable.Range(0, 4).ToArray();
+				tailInvokeBranchOrder.Shuffle(r);
+				fragment.Append("local function HandlerCallTailInvoke(HandlerCallInvokeMode,HandlerCallFrame)");
+				for (int orderIndex = 0; orderIndex < tailInvokeBranchOrder.Length; orderIndex++)
+				{
+					int leaf = tailInvokeBranchOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallInvokeMode==")
+					        .Append(ScrambleUInt(callInvokeTokens[leaf])).Append(" then return ")
+					        .Append(tailInvokeLeaves[leaf]).Append("(HandlerCallFrame);");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+
+				fragment.Append("local function HandlerCallForward(HandlerCallResultMode,HandlerCallFrame,HandlerCallInstruction,HandlerCallResults,HandlerCallResultCount,HandlerCallTop)")
+				        .Append("local HandlerCallA=HandlerCallFrame[1];local HandlerCallResultIndex;");
+				int[] resultBranchOrder = Enumerable.Range(0, 4).ToArray();
+				resultBranchOrder.Shuffle(r);
+				for (int orderIndex = 0; orderIndex < resultBranchOrder.Length; orderIndex++)
+				{
+					int kind = resultBranchOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallResultMode==")
+					        .Append(ScrambleUInt(callResultTokens[kind])).Append(" then ");
+					if (kind == 0)
+						fragment.Append("HandlerCallResultIndex=0;for HandlerCallIndex=HandlerCallA,HandlerCallInstruction[OP_C] do HandlerCallResultIndex=HandlerCallResultIndex+1;HandlerWriteStack(HandlerCallIndex,HandlerCallResults[HandlerCallResultIndex],")
+						        .Append(ScrambleNumber(r.Next(2))).Append(");end;return HandlerCallTop;");
+					else if (kind == 1)
+						fragment.Append("local HandlerCallNewTop=HandlerCallA+HandlerCallResultCount-1;HandlerCallResultIndex=0;for HandlerCallIndex=HandlerCallA,HandlerCallNewTop do HandlerCallResultIndex=HandlerCallResultIndex+1;HandlerWriteStack(HandlerCallIndex,HandlerCallResults[HandlerCallResultIndex],")
+						        .Append(ScrambleNumber(r.Next(2))).Append(");end;return HandlerCallNewTop;");
+					else if (kind == 2)
+						fragment.Append("return HandlerCallTop;");
+					else
+						fragment.Append("HandlerWriteStack(HandlerCallA,HandlerCallResults[1],").Append(ScrambleNumber(r.Next(2))).Append(");return HandlerCallTop;");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+
+				fragment.Append("local function HandlerCall(HandlerCallMode,HandlerCallInstruction,HandlerCallTop)local HandlerCallState;");
+				for (int orderIndex = 0; orderIndex < callModeOrder.Length; orderIndex++)
+				{
+					int mode = callModeOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallMode==")
+					        .Append(ScrambleUInt(_context.CallModeTokens[mode])).Append(" then HandlerCallState=")
+					        .Append(ScrambleUInt(callPhaseTokens[mode][0])).Append(";");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;")
+				        .Append("local HandlerCallFrame,HandlerCallResults,HandlerCallResultCount;local HandlerCallSteps=0;while true do HandlerCallSteps=HandlerCallSteps+1;if HandlerCallSteps>")
+				        .Append(ScrambleNumber(5)).Append(" then error('invalid protected payload',0);end;");
+				for (int orderIndex = 0; orderIndex < callPhaseOrder.Count; orderIndex++)
+				{
+					(int mode, int phase) = callPhaseOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallState==")
+					        .Append(ScrambleUInt(callPhaseTokens[mode][phase])).Append(" then ");
+					if (phase == 0)
+						fragment.Append("HandlerCallFrame=HandlerCallAcquireTarget(HandlerCallInstruction);HandlerCallState=")
+						        .Append(ScrambleUInt(callPhaseTokens[mode][1])).Append(";");
+					else if (phase == 1)
+						fragment.Append("HandlerCallFrame=HandlerCallValidateTarget(HandlerCallFrame);HandlerCallState=")
+						        .Append(ScrambleUInt(callPhaseTokens[mode][2])).Append(";");
+					else if (phase == 2)
+						fragment.Append("HandlerCallFrame=HandlerCallAcquireArguments(").Append(ScrambleUInt(callArgumentTokens[callArgumentKinds[mode]]))
+						        .Append(",HandlerCallFrame,HandlerCallInstruction,HandlerCallTop);HandlerCallState=")
+						        .Append(ScrambleUInt(callPhaseTokens[mode][3])).Append(";");
+					else if (phase == 3 && callTailModes[mode])
+						fragment.Append("return HandlerCallTailInvoke(").Append(ScrambleUInt(callInvokeTokens[callInvokeAssignments[mode]]))
+						        .Append(",HandlerCallFrame);");
+					else if (phase == 3)
+						fragment.Append("HandlerCallResults,HandlerCallResultCount=HandlerCallInvoke(").Append(ScrambleUInt(callInvokeTokens[callInvokeAssignments[mode]]))
+						        .Append(",HandlerCallFrame);HandlerCallState=").Append(ScrambleUInt(callPhaseTokens[mode][4])).Append(";");
+					else
+						fragment.Append("return HandlerCallForward(").Append(ScrambleUInt(callResultTokens[callResultKinds[mode]]))
+						        .Append(",HandlerCallFrame,HandlerCallInstruction,HandlerCallResults,HandlerCallResultCount,HandlerCallTop);");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;end;");
 
 				fragment.Append("local function HandlerBinary(HandlerFragmentMode,HandlerFragmentLeft,HandlerFragmentRight)");
 				var binaryOrder = binaryOperators.OrderBy(_ => r.Next()).ToArray();
@@ -2772,20 +2942,12 @@ end;";
 			
 			ComputeInstrs(_context.HeadChunk);
 
-			bool NeedsDynamicCallGuard(VOpcode opcode)
-			{
-				if (opcode is OpAlias alias) return NeedsDynamicCallGuard(alias.Target);
-				if (opcode is OpMutated mutated) return NeedsDynamicCallGuard(mutated.Mutated);
-				string name = opcode.GetType().Name;
-				return name.StartsWith("OpCall", StringComparison.Ordinal)
-				       || name.StartsWith("OpTailCall", StringComparison.Ordinal);
-			}
-
 			string BuildHandler(int opcodeIndex)
 			{
+				// CALL and TAILCALL validation now lives between target acquisition and
+				// argument acquisition in the shared tokenized trampoline. Keeping it out
+				// of terminal leaves avoids the old validate-write-reread-call signature.
 				string code = virtuals[opcodeIndex].GetObfuscated(_context);
-				if (settings.AntiDump && NeedsDynamicCallGuard(virtuals[opcodeIndex]))
-					code = "Stk[Inst[OP_A]]=GuardValidateCallTarget(Stk[Inst[OP_A]]);" + code;
 				code = ApplySemanticPolymorphism(code);
 				code = ApplyHandlerFragmentSharing(code);
 				code = ApplyHandlerTemplate(code);
@@ -3115,6 +3277,7 @@ return Wrap(Root, {}, DisabledGlobalEnvironment);";
 				vm = ApplyRuntimeSlotPermutation(vm, idents[blockAlias], blockSlots);
 			vm = ApplyRuntimeSlotPermutation(vm, idents["Flow"], flowSlots);
 			vm = ApplyRuntimeSlotPermutation(vm, idents["FlowCache"], flowCacheSlots);
+			vm = ApplyRuntimeSlotPermutation(vm, idents["HandlerCallFrame"], callFrameSlots);
 
 			// Apply the selected carrier topology only after the nested Flow ABI was
 			// permuted, so accesses such as Frame[x][flowSlot] stay consistent with
@@ -3129,6 +3292,10 @@ return Wrap(Root, {}, DisabledGlobalEnvironment);";
 				+ "; binary=" + handlerFragmentBinaryCalls
 				+ "; unary=" + handlerFragmentUnaryCalls
 				+ "; pc=" + handlerFragmentPcCalls + ".");
+			Console.WriteLine("Call trampolines: modes=" + callModeCount
+				+ "; phases=" + callPhaseOrder.Count
+				+ "; frame=" + string.Join(",", callFrameSlots)
+				+ "; signature=" + callTrampolineSignature.ToString("x8") + ".");
 
 			return vm;
 		}

@@ -90,6 +90,7 @@ python3 tests/ir_native_fusion.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua"
 python3 tests/fused_member_tokens.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua" --build-log "$WORK/obfuscator.log"
 python3 tests/global_disable.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua" --late-nil-output "$WORK/late-getfenv-nil.lua"
 python3 tests/dynamic_loader_guard.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/call_trampoline.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua" --build-log "$WORK/obfuscator.log"
 python3 tests/string_constant_shards.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua" --require-chain
 "$LUAC" -p "$WORK/late-getfenv-nil.lua"
 run_executor "$WORK/late-getfenv-nil.lua" > "$WORK/late-getfenv-nil.out"
@@ -439,6 +440,24 @@ run_executor "$WORK/table-write-order.lua" > "$WORK/table-write-order.out"
 cmp "$WORK/table-write-order-baseline.out" "$WORK/table-write-order.out"
 echo "PASS safe fresh-table write-order randomization"
 
+# Exercise every CALL B/C family, all TAILCALL argument windows, SELF receiver
+# forwarding, embedded nils and the HttpGet -> loadstring -> chunk -> options
+# chain against the shared tokenized trampoline.
+"$LUA" tests/call_trampoline.lua > "$WORK/call-trampoline-baseline.out"
+"$LUAC" -l -p tests/call_trampoline.lua > "$WORK/call-trampoline-bytecode.txt"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/call_trampoline.lua > "$WORK/call-trampoline-build.log"
+mv out.lua "$WORK/call-trampoline.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/call-trampoline-vm.lua"
+"$LUAC" -p "$WORK/call-trampoline.lua"
+python3 tests/call_trampoline.py "$WORK/call-trampoline-vm.lua" "$WORK/call-trampoline.lua" \
+    --build-log "$WORK/call-trampoline-build.log" \
+    --bytecode-listing "$WORK/call-trampoline-bytecode.txt"
+python3 tests/dynamic_loader_guard.py "$WORK/call-trampoline-vm.lua" "$WORK/call-trampoline.lua"
+run_executor "$WORK/call-trampoline.lua" > "$WORK/call-trampoline.out"
+cmp "$WORK/call-trampoline-baseline.out" "$WORK/call-trampoline.out"
+echo "PASS CALL B/C, SELF, loader-chain, multiple-result and direct TAILCALL semantics"
+
 # Repeat randomized prototype keys, opcode maps, schema orders and dispatcher
 # control-flow templates. Each generated VM is parsed structurally before it is
 # executed, so template diversity never replaces semantic validation.
@@ -546,6 +565,7 @@ fragment_records = []
 micro_limits = []
 table_order_profiles = []
 fused_member_profiles = []
+call_trampoline_profiles = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
     micro = re.search(r"Synthetic micro-block limit: ([3-6])\.", log)
@@ -575,6 +595,18 @@ for index in range(1, runs + 1):
     if not member_tokens:
         raise SystemExit(f"missing fused member-token profile for build {index}")
     fused_member_profiles.append((int(member_tokens.group(1)), int(member_tokens.group(2)), member_tokens.group(3)))
+    call_trampoline = re.search(
+        r"Call trampolines: modes=(\d+); phases=(\d+); frame=([1-4](?:,[1-4]){3}); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not call_trampoline:
+        raise SystemExit(f"missing CALL trampoline profile for build {index}")
+    call_trampoline_profiles.append((
+        int(call_trampoline.group(1)),
+        int(call_trampoline.group(2)),
+        tuple(map(int, call_trampoline.group(3).split(","))),
+        call_trampoline.group(4),
+    ))
     semantic = re.search(
         r"Semantic lowering: writes=([0-9,]+); raw-stack-reads=(\d+); raw-environment-reads=(\d+)\.",
         log,
@@ -683,6 +715,13 @@ if any(profile[0] != record[0] or profile[1] < profile[0] * 2
     raise SystemExit(f"fused member-token coverage is inconsistent: {fused_member_profiles}")
 if len({profile[2] for profile in fused_member_profiles}) != runs:
     raise SystemExit("a fused member-token program was reused across builds")
+if any(profile[0] != 19 or profile[1] != 92 or sorted(profile[2]) != [1, 2, 3, 4]
+       for profile in call_trampoline_profiles):
+    raise SystemExit(f"CALL trampoline coverage/layout is invalid: {call_trampoline_profiles}")
+if len({profile[3] for profile in call_trampoline_profiles}) != runs:
+    raise SystemExit("a CALL trampoline token/state program was reused across builds")
+if len({profile[2] for profile in call_trampoline_profiles}) < 6:
+    raise SystemExit(f"CALL frame layout diversity is insufficient: {call_trampoline_profiles}")
 write_totals = tuple(sum(record[0][index] for record in semantic_records) for index in range(6))
 if min(write_totals) <= 0:
     raise SystemExit(f"not all six semantic write lowerings were emitted: {write_totals}")
@@ -801,6 +840,7 @@ print(
     f"payload carriers={sorted(carrier_topologies)}, assemblies={sorted(assembly_topologies)}, "
     f"segments={sorted(segment_counts)}, "
     f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, member-token-programs={len({profile[2] for profile in fused_member_profiles})}, "
+    f"call-token-programs={len({profile[3] for profile in call_trampoline_profiles})}, call-frame-layouts={len({profile[2] for profile in call_trampoline_profiles})}, "
     f"semantic writes={write_totals}, raw reads={sum(record[1] for record in semantic_records)}/{sum(record[2] for record in semantic_records)}, "
     f"similarity dispatcher={max_similarity:.3f}/{mean_similarity:.3f}, "
     f"slot-ABI={max_slot_similarity:.3f}/{mean_slot_similarity:.3f}, "
@@ -1052,9 +1092,10 @@ set -e
 grep -q 'ERROR IN IRONBREW SCRIPT \[LINE 3\]' "$WORK/line-runtime.stderr"
 echo "PASS VM-internal line reporting with payload error disabled"
 
-# Every CALL/TAILCALL leaf validates a saved loadstring reference immediately
-# before invocation. Positive compilation succeeds; replacing the environment
-# binding after startup causes the saved alias call to enter the silent sink.
+# The shared CALL/TAILCALL trampoline validates its saved local callee between
+# target acquisition and argument-window acquisition. Positive compilation
+# succeeds; replacing the environment binding after startup causes the saved
+# alias call to enter the silent sink.
 rm -rf temp out.lua
 "$DOTNET" "$CLI" tests/dynamic_loader.lua > "$WORK/dynamic-loader-build.log"
 mv out.lua "$WORK/dynamic-loader.lua"

@@ -33,6 +33,33 @@ namespace IronBrew2.Obfuscator
 		D,
 		StepCount
 	}
+
+	// CALL B/C semantics are represented by build-random tokens rather than by
+	// distinct, self-contained Lua call expressions in terminal opcode leaves.
+	// Keep this order synchronized with Generator's call trampoline plans.
+	public enum CallMode
+	{
+		FixedArgumentsFixedResults,
+		SingleArgumentFixedResults,
+		TopArgumentsFixedResults,
+		NoArgumentsFixedResults,
+		FixedArgumentsVariableResults,
+		SingleArgumentVariableResults,
+		FixedArgumentsDiscardResults,
+		SingleArgumentDiscardResults,
+		TopArgumentsVariableResults,
+		TopArgumentsDiscardResults,
+		NoArgumentsVariableResults,
+		NoArgumentsDiscardResults,
+		FixedArgumentsSingleResult,
+		SingleArgumentSingleResult,
+		TopArgumentsSingleResult,
+		NoArgumentsSingleResult,
+		TailFixedArguments,
+		TailTopArguments,
+		TailNoArguments,
+		ModeCount
+	}
 	
 	public class ObfuscationContext
 	{
@@ -52,6 +79,7 @@ namespace IronBrew2.Obfuscator
 		public int MaxBlockInstructions;
 		public uint[] TableWriteTokens;
 		public uint[] TableCommitTokens;
+		public uint[] CallModeTokens;
 
 		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|attestation token)，
 		// 序列化头部只写盐，VM 端严格探针成功后才派生同一种子。

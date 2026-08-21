@@ -9,34 +9,29 @@ namespace IronBrew2.Obfuscator.Opcodes
 			instruction.OpCode == Opcode.TailCall && instruction.B > 1;
 
 		public override string GetObfuscated(ObfuscationContext context) =>
-			@"
-local A = Inst[OP_A];
-do return Stk[A](Unpack(Stk, A + 1, Inst[OP_B])) end;";
+			"do return HandlerCall(" + context.CallModeTokens[(int)CallMode.TailFixedArguments] + ",Inst,Top);end;";
 
 		public override void Mutate(Instruction instruction)
 		{
 			instruction.B += instruction.A - 1;
 		}
 	}
-	
+
 	public class OpTailCallB0 : VOpcode
 	{
 		public override bool IsInstruction(Instruction instruction) =>
 			instruction.OpCode == Opcode.TailCall && instruction.B == 0;
 
 		public override string GetObfuscated(ObfuscationContext context) =>
-			@"
-local A = Inst[OP_A];
-do return Stk[A](Unpack(Stk, A + 1, Top)) end;
-";
+			"do return HandlerCall(" + context.CallModeTokens[(int)CallMode.TailTopArguments] + ",Inst,Top);end;";
 	}
-	
+
 	public class OpTailCallB1 : VOpcode
 	{
 		public override bool IsInstruction(Instruction instruction) =>
 			instruction.OpCode == Opcode.TailCall && instruction.B == 1;
 
 		public override string GetObfuscated(ObfuscationContext context) =>
-			"do return Stk[Inst[OP_A]](); end;";
+			"do return HandlerCall(" + context.CallModeTokens[(int)CallMode.TailNoArguments] + ",Inst,Top);end;";
 	}
 }
