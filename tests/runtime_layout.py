@@ -95,7 +95,7 @@ def _arithmetic_value(expression: str) -> int:
     return left * right
 
 
-def derive_runtime_layout(source: str) -> dict[str, object]:
+def derive_runtime_layout(source: str, include_attack_details: bool = False) -> dict[str, object]:
     if "invalid protected payload" in source:
         raise ValueError("stable protected-payload diagnostic leaked into generated VM")
     domains = extract_build_domains(source)
@@ -349,8 +349,21 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         accesses = list(re.finditer(rf"\b{re.escape(frame_name)}\s*\[\s*(\d+)\s*\]", wrap_body))
         if not accesses:
             raise ValueError("a declared VM state frame is unused")
+        if include_attack_details:
+            # Minification can reuse a frame's short spelling inside later
+            # lexical scopes. Invocation-role initialization is still the first
+            # single-`=` assignment to each slot in the returned closure.
+            initialization_accesses = []
+            for access in accesses:
+                tail = wrap_body[access.end():]
+                assignment = re.match(r"\s*=", tail)
+                if assignment and not re.match(r"\s*==", tail):
+                    initialization_accesses.append(access)
+            accesses_for_layout = initialization_accesses
+        else:
+            accesses_for_layout = accesses
         first_by_slot: dict[int, int] = {}
-        for access in accesses:
+        for access in accesses_for_layout:
             slot = int(access.group(1))
             first_by_slot.setdefault(slot, access.start())
         frame_size = max(first_by_slot)
@@ -362,7 +375,9 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         frame_slot_orders.append(order)
         for slot, position in first_by_slot.items():
             access_tail = wrap_body[position:]
-            if not re.match(rf"{re.escape(frame_name)}\s*\[\s*{slot}\s*\]\s*=", access_tail):
+            if not include_attack_details and not re.match(
+                rf"{re.escape(frame_name)}\s*\[\s*{slot}\s*\]\s*=", access_tail
+            ):
                 raise ValueError("a VM state frame is read before its role is initialized")
             first_accesses.append((position, frame_index, slot))
 
@@ -390,6 +405,10 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     role_slots = {
         role: {"frame": frame_index + 1, "slot": slot}
         for role, (_position, frame_index, slot) in zip(state_role_order, first_accesses)
+    }
+    role_accessors = {
+        role: frame_names[placement["frame"] - 1] + f"[{placement['slot']}]"
+        for role, placement in role_slots.items()
     }
     flow_position = role_slots["Flow"]
     flow_accessor = frame_names[flow_position["frame"] - 1] + f"[{flow_position['slot']}]"
@@ -554,11 +573,23 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     fault_zero_assignments = list(re.finditer(
         rf"\b{re.escape(guard_fault)}\s*=\s*0\s*;", source
     ))
-    if len(fault_zero_assignments) != 1:
-        raise ValueError("sticky guard fault word does not have one initialization")
-    fault_init = fault_zero_assignments[0]
-    if not re.search(rf"local\s+[^;]*\b{re.escape(guard_fault)}\b[^;]*;", source[:fault_init.start()]):
-        raise ValueError("sticky guard fault word is not held in a private local")
+    if include_attack_details:
+        # LuaSrcDiet may reuse the same short spelling in unrelated lexical
+        # scopes. Select the initialization preceding the periodic VM probe;
+        # strict production-layout tests still require global uniqueness below.
+        eligible_fault_inits = [
+            match for match in fault_zero_assignments
+            if match.start() < periodic_calls[0].start()
+        ]
+        if not eligible_fault_inits:
+            raise ValueError("sticky guard fault word has no pre-loop initialization")
+        fault_init = eligible_fault_inits[-1]
+    else:
+        if len(fault_zero_assignments) != 1:
+            raise ValueError("sticky guard fault word does not have one initialization")
+        fault_init = fault_zero_assignments[0]
+        if not re.search(rf"local\s+[^;]*\b{re.escape(guard_fault)}\b[^;]*;", source[:fault_init.start()]):
+            raise ValueError("sticky guard fault word is not held in a private local")
     fault_assignments = [
         int(match.group(1))
         for match in re.finditer(rf"\b{re.escape(guard_fault)}\s*=\s*(\d+)\s*;", source)
@@ -566,8 +597,11 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     ]
     # Rejection is intentionally decentralized across several build-local tight
     # sinks. Each sink may seed the same continuation fault word before entering
-    # its non-yielding state mixer; no live path may reset it.
-    if not 1 <= len(fault_assignments) <= 4 or len(set(fault_assignments)) != 1:
+    # its non-yielding state mixer; no live path may reset it. In attacker mode,
+    # unrelated minified locals with the same spelling are ignored.
+    if not include_attack_details and (
+        not 1 <= len(fault_assignments) <= 4 or len(set(fault_assignments)) != 1
+    ):
         raise ValueError(f"distributed guard fault word assignments are invalid: {fault_assignments}")
     if fault_init.start() >= periodic_calls[0].start():
         raise ValueError("sticky guard fault word is declared after periodic probing")
@@ -616,6 +650,7 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
     transition_lanes: dict[int, int] = {}
     update_orders: set[str] = set()
     terminals: set[int] = set()
+    terminal_bodies: dict[int, str] = {}
     for index, match in enumerate(node_matches):
         token = node_tokens[index]
         end = node_matches[index + 1].start() if index + 1 < len(node_matches) else len(loop_body)
@@ -639,6 +674,7 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
             update_orders.add("".join(label for _position, label in components))
         elif terminal_match:
             terminals.add(token)
+            terminal_bodies[token] = segment[:terminal_match.start()]
         else:
             raise ValueError("continuation node has neither a transition nor a terminal handler")
 
@@ -791,6 +827,23 @@ def derive_runtime_layout(source: str) -> dict[str, object]:
         "entry_tokens": entry_tokens,
         "shape_sequence": shape_sequence,
     }
+    if include_attack_details:
+        # Final-output-only attacker support. These values are intentionally not
+        # emitted by the normal runtime-layout CLI; they expose the public
+        # selector/continuation program so an adapted static analyzer can map a
+        # canonical virtual opcode ID to its terminal handler body.
+        continuation["attack_details"] = {
+            "selector": selector,
+            "transitions": transitions,
+            "terminal_bodies": terminal_bodies,
+            "dispatch_state": dispatch_state,
+            "dispatch_lane": dispatch_lane,
+            "dispatch_u32": dispatch_u32,
+            "dispatch_xor": dispatch_xor,
+            "dispatch_mask": dispatch_mask,
+            "enum_accessor": role_accessors["Enum"],
+            "role_accessors": role_accessors,
+        }
     return {
         "domains": domains.as_dict(),
         "chunk": chunk_map,

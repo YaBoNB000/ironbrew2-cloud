@@ -102,6 +102,8 @@ python3 tests/streaming_carrier.py "$WORK/fixed.lua"
 python3 tests/static_attack_baseline.py "$WORK/fixed.lua" \
     --expect-string constants --expect-string closure --expect-string nested \
     --require-current-baseline --report "$WORK/static-attack-baseline.json"
+python3 tests/static_decompiler.py "$WORK/fixed.lua" \
+    --report "$WORK/static-decompiler-baseline.json"
 run_executor "$WORK/fixed.lua" > "$WORK/fixed.out"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
@@ -454,6 +456,8 @@ python3 tests/call_trampoline.py "$WORK/call-trampoline-vm.lua" "$WORK/call-tram
     --build-log "$WORK/call-trampoline-build.log" \
     --bytecode-listing "$WORK/call-trampoline-bytecode.txt"
 python3 tests/dynamic_loader_guard.py "$WORK/call-trampoline-vm.lua" "$WORK/call-trampoline.lua"
+python3 tests/static_decompiler.py "$WORK/call-trampoline.lua" --require-call-chain \
+    --report "$WORK/static-decompiler-call-report.json"
 run_executor "$WORK/call-trampoline.lua" > "$WORK/call-trampoline.out"
 cmp "$WORK/call-trampoline-baseline.out" "$WORK/call-trampoline.out"
 echo "PASS CALL B/C, SELF, loader-chain, multiple-result and direct TAILCALL semantics"
