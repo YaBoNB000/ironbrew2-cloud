@@ -1,6 +1,8 @@
 # IronBrew2 加固计划（参考 Luraph 的架构思路）
 
 > 目标不是复制 Luraph 私有实现，而是吸收已观察到的架构特征：多层数据恢复、按原型变化、状态相关 opcode、常量延迟恢复、VM 多态和完整性耦合。
+>
+> 2026-08-21 对 Luraph v15 与当前最终文件攻击基线完成重新审查后的后续路线，见 [`docs/vm-hardening-plan-luraph-v15.md`](docs/vm-hardening-plan-luraph-v15.md)。该文档已删除会弱化认证、Lua 5.1 语义、micro-block、reentrancy 或只增加固定 fingerprint 的候选方案，应作为下一阶段实施依据。
 
 ## 2026-08-19 静态攻击路线（进行中）
 
