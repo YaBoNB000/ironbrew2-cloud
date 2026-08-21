@@ -34,11 +34,13 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			public int Destination { get; init; }
 			public uint WrappedEntryState { get; init; }
 			public uint WrappedChunkState { get; init; }
+			public uint WrappedMode { get; init; }
 		}
 
 		private readonly ObfuscationContext _context;
 		private readonly ObfuscationSettings _settings;
 		private readonly BuildRandom _random;
+		private int _dialectAssignmentCounter;
 		private readonly Encoding _luaEncoding = Encoding.GetEncoding(28591);
 
 		public Serializer(ObfuscationContext context, ObfuscationSettings settings)
@@ -337,6 +339,26 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private uint FlowVerifier(uint entryState, int blockStart, ushort k1, ushort k2, ushort k3, uint binding) =>
 			FlowKey(entryState, blockStart, blockStart ^ _context.Domains.FlowVerifierMask, k1, k2, k3, binding);
 
+		private uint InitialDialectModeKey(uint entryState, uint chunkState, int blockStart,
+			ushort k1, ushort k2, ushort k3, uint binding) =>
+			unchecked(InitialFlowKey(k1, k2, k3, binding) ^ entryState ^ Rotate16(chunkState)
+			          ^ (uint)blockStart * 65537u ^ 0xD1A1EC7u);
+
+		private uint DialectModeKey(uint sourceEntryState, uint sourceChunkState, uint targetEntryState,
+			uint targetChunkState, int fromPc, int toPc, ushort k1, ushort k2, ushort k3, uint binding) =>
+			unchecked(FlowKey(sourceEntryState, fromPc, toPc, k1, k2, k3, binding)
+			          ^ ChunkChainKey(sourceChunkState, sourceEntryState, fromPc, toPc,
+				          k1, k2, k3, binding, _settings.AntiDump ? _context.Binder.PayloadBinding : _context.XorSeed)
+			          ^ Rotate16(targetEntryState) ^ targetChunkState ^ 0x91E10DA5u);
+
+		private uint NextDialectMode()
+		{
+			uint token = _context.DialectModeTokens[
+				_dialectAssignmentCounter++ % _context.DialectModeTokens.Length];
+			_context.DialectModesUsed.Add(token);
+			return token;
+		}
+
 		private uint ChunkState(uint entryState, int blockStart, int count, ushort k1, ushort k2, ushort k3,
 			uint binding, uint attestation)
 		{
@@ -490,8 +512,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		}
 
 		private uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
-			uint routeToken, IReadOnlyList<int> constantReferences, uint verifier,
-			IReadOnlyList<ChunkSuccessor> successors, ushort k1, ushort k2, ushort k3, uint binding)
+			uint routeToken, IReadOnlyList<int> constantReferences, IReadOnlyList<uint> acceptedModes,
+			uint verifier, IReadOnlyList<ChunkSuccessor> successors,
+			ushort k1, ushort k2, ushort k3, uint binding)
 		{
 			uint domain = _context.Domains.BlockIntegrityDomain;
 			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
@@ -513,6 +536,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			         })
 				Absorb(word);
 			foreach (int constantIndex in constantReferences) Absorb((uint)constantIndex);
+			Absorb((uint)acceptedModes.Count);
+			foreach (uint mode in acceptedModes) Absorb(mode);
 			Absorb(verifier);
 			Absorb((uint)successors.Count);
 			foreach (ChunkSuccessor successor in successors)
@@ -520,6 +545,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				Absorb((uint)successor.Destination);
 				Absorb(successor.WrappedEntryState);
 				Absorb(successor.WrappedChunkState);
+				Absorb(successor.WrappedMode);
 			}
 			Absorb((uint)body.Length);
 			foreach (byte value in body) Absorb(value);
@@ -980,6 +1006,28 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				block => block,
 				block => ChunkState(blockStates[block], block.Start + 1, block.Count, k1, k2, k3,
 					_context.XorSeed, payloadAttestation));
+			uint initialDialectMode = NextDialectMode();
+			// Distinct predecessors cycle through the complete build-local token bank
+			// for each target. This creates edge-local modes without cloning a block.
+			var edgeDialectModes = new Dictionary<(ControlFlowBlock Source, ControlFlowBlock Target), uint>();
+			var blockAcceptedModes = instructionBlocks.ToDictionary(
+				block => block, _ => new HashSet<uint>());
+			blockAcceptedModes[controlFlow.EntryBlock].Add(initialDialectMode);
+			foreach (ControlFlowBlock target in instructionBlocks)
+			{
+				var targetModes = new HashSet<uint>();
+				ControlFlowBlock[] predecessors = target.Predecessors.OrderBy(value => value.Start).ToArray();
+				for (int predecessor = 0; predecessor < predecessors.Length; predecessor++)
+				{
+					uint token;
+					if (targetModes.Count < _context.DialectModeCount)
+						do token = NextDialectMode(); while (!targetModes.Add(token));
+					else
+						token = NextDialectMode();
+					edgeDialectModes[(predecessors[predecessor], target)] = token;
+					blockAcceptedModes[target].Add(token);
+				}
+			}
 
 			// Eligible prototypes receive unrelated route tokens. A token is never a
 			// valid linear PC, so each cross-block transfer must be resolved by the VM's
@@ -1099,6 +1147,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 						// Store the first route under the attestation-derived binding. In the
 						// non-dispatcher case seed^seed decodes back to the zero sentinel.
 						WriteUInt32Local((dispatcherFlattened ? blockRoutes[controlFlow.EntryBlock] : 0u) ^ _context.XorSeed);
+						WriteUInt32Local(initialDialectMode ^ InitialDialectModeKey(
+							blockStates[controlFlow.EntryBlock], blockChunkStates[controlFlow.EntryBlock],
+							controlFlow.EntryBlock.Start + 1, k1, k2, k3, _context.XorSeed));
 						foreach (ControlFlowBlock block in instructionBlocks)
 						{
 							int start = block.Start;
@@ -1188,16 +1239,23 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								uint wrappedChunkState = blockChunkStates[successor] ^ ChunkChainKey(
 									sourceChunkState, entryState, block.EndExclusive, successorStart, k1, k2, k3,
 									_context.XorSeed, payloadAttestation);
+								uint wrappedMode = edgeDialectModes[(block, successor)] ^ DialectModeKey(
+									entryState, sourceChunkState, blockStates[successor], blockChunkStates[successor],
+									block.EndExclusive, successorStart, k1, k2, k3, _context.XorSeed);
 								successorRecords.Add(new ChunkSuccessor
 								{
 									Destination = successorStart,
 									WrappedEntryState = wrappedState,
-									WrappedChunkState = wrappedChunkState
+									WrappedChunkState = wrappedChunkState,
+									WrappedMode = wrappedMode
 								});
 							}
+							if (blockAcceptedModes[block].Count == 0)
+								blockAcceptedModes[block].Add(NextDialectMode());
+							List<uint> acceptedModes = blockAcceptedModes[block].OrderBy(value => value).ToList();
 							byte[] encodedBlockBody = blockBody.ToArray();
 							uint blockTag = ComputeBlockIntegrity(encodedBlockBody, entryState, start + 1, count,
-								routeToken, constantReferences, verifier, successorRecords, k1, k2, k3,
+								routeToken, constantReferences, acceptedModes, verifier, successorRecords, k1, k2, k3,
 								_context.XorSeed);
 
 							WriteUInt32Local((uint)(start + 1));
@@ -1206,6 +1264,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							WriteUInt32Local((uint)constantReferences.Count);
 							foreach (int constantIndex in constantReferences)
 								WriteUInt32Local((uint)constantIndex);
+							WriteUInt32Local((uint)acceptedModes.Count);
+							foreach (uint mode in acceptedModes) WriteUInt32Local(mode);
 							WriteUInt32Local(verifier);
 							WriteUInt32Local(blockTag);
 							WriteUInt32Local((uint)successorRecords.Count);
@@ -1214,6 +1274,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								WriteUInt32Local((uint)successor.Destination);
 								WriteUInt32Local(successor.WrappedEntryState);
 								WriteUInt32Local(successor.WrappedChunkState);
+								WriteUInt32Local(successor.WrappedMode);
 							}
 
 							WriteUInt32Local((uint)encodedBlockBody.Length);

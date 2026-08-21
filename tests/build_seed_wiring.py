@@ -40,6 +40,7 @@ expected = {
     "payload.serializer",
     "payload.carrier",
     "runtime.guard",
+    "vm.dialect",
     "vm.generator",
     "vm.layout",
 }

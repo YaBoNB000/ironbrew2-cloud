@@ -27,7 +27,7 @@ def verify(path: Path) -> None:
     for _path, proto in walk(info.root):
         length = proto.end - proto.start
         chunk_layouts.append(tuple(payload.derive_permutation(
-            16, proto.k1, proto.k2, proto.k3,
+            17 if payload.DIALECT_MODE_FORMAT else 16, proto.k1, proto.k2, proto.k3,
             (payload.SCHEMA_DOMAIN + length * 257) & MASK32,
         )))
         for block in proto.blocks:

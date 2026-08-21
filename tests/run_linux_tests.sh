@@ -104,7 +104,7 @@ python3 tests/static_attack_baseline.py "$WORK/fixed.lua" \
     --require-current-baseline --report "$WORK/static-attack-baseline.json"
 python3 tests/static_decompiler.py "$WORK/fixed.lua" \
     --report "$WORK/static-decompiler-baseline.json"
-python3 tests/static_state_model.py "$WORK/fixed.lua"
+python3 tests/static_state_model.py "$WORK/fixed.lua" --require-dialects
 python3 tests/static_state_model.py "$ROOT/test_obf.txt" --uploaded-loader
 run_executor "$WORK/fixed.lua" > "$WORK/fixed.out"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
@@ -134,7 +134,7 @@ echo "PASS entropy record modification, deletion and reordering rejection after 
 # Each case leaves exactly the named prototype, complete block-manifest,
 # authenticated instruction-record parser/consumption, or block-local
 # capsule-integrity layer as the first rejecting boundary.
-for payload_case in prototype-tag initial-chunk-state successor-chunk-state block-manifest column-framing column-consumption capsule-integrity; do
+for payload_case in prototype-tag initial-chunk-state initial-dialect-mode successor-chunk-state successor-dialect-mode block-dialect-manifest block-manifest column-framing column-consumption capsule-integrity; do
     payload_file="$WORK/payload-$payload_case.lua"
     "$LUAC" -p "$payload_file"
     set +e
@@ -474,6 +474,21 @@ mv out.lua "$WORK/vm-chain-fusion.lua"
 python3 tests/call_inclusive_fusion.py "$WORK/vm-chain-fusion.lua" \
     --build-log "$WORK/vm-chain-fusion-build.log"
 
+# P1: one final VM carries 3–5 authenticated dialect modes. Different
+# predecessors enter one target block through distinct wrapped mode tokens, and
+# every mode owns an independently transformed selector/handler path family.
+"$LUA" tests/dialect_modes.lua > "$WORK/dialect-modes-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/dialect_modes.lua > "$WORK/dialect-modes-build.log"
+mv out.lua "$WORK/dialect-modes.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/dialect-modes-vm.lua"
+"$LUAC" -p "$WORK/dialect-modes.lua"
+python3 tests/dialect_modes.py "$WORK/dialect-modes.lua" "$WORK/dialect-modes-vm.lua" \
+    --build-log "$WORK/dialect-modes-build.log"
+run_executor "$WORK/dialect-modes.lua" > "$WORK/dialect-modes.out"
+cmp "$WORK/dialect-modes-baseline.out" "$WORK/dialect-modes.out"
+echo "PASS block/edge-local authenticated dialect mode semantics"
+
 # Repeat randomized prototype keys, opcode maps, schema orders and dispatcher
 # control-flow templates. Each generated VM is parsed structurally before it is
 # executed, so template diversity never replaces semantic validation.
@@ -583,6 +598,7 @@ table_order_profiles = []
 fused_member_profiles = []
 call_inclusive_profiles = []
 call_trampoline_profiles = []
+dialect_profiles = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
     micro = re.search(r"Synthetic micro-block limit: ([3-6])\.", log)
@@ -632,6 +648,16 @@ for index in range(1, runs + 1):
         int(call_trampoline.group(2)),
         tuple(map(int, call_trampoline.group(3).split(","))),
         call_trampoline.group(4),
+    ))
+    dialect = re.search(
+        r"Dialect lattice: modes=(\d+); used=(\d+); paths=(\d+); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not dialect:
+        raise SystemExit(f"missing dialect lattice profile for build {index}")
+    dialect_profiles.append((
+        int(dialect.group(1)), int(dialect.group(2)),
+        int(dialect.group(3)), dialect.group(4),
     ))
     semantic = re.search(
         r"Semantic lowering: writes=([0-9,]+); raw-stack-reads=(\d+); raw-environment-reads=(\d+)\.",
@@ -750,6 +776,13 @@ if len({profile[3] for profile in call_trampoline_profiles}) != runs:
     raise SystemExit("a CALL trampoline token/state program was reused across builds")
 if len({profile[2] for profile in call_trampoline_profiles}) < 6:
     raise SystemExit(f"CALL frame layout diversity is insufficient: {call_trampoline_profiles}")
+if any(not 3 <= profile[0] <= 5 or profile[1] < 3 or profile[2] != profile[0] * count
+       for profile, count in zip(dialect_profiles, counts)):
+    raise SystemExit(f"dialect lattice coverage/path count is invalid: {dialect_profiles}")
+if {profile[0] for profile in dialect_profiles} != {3, 4, 5}:
+    raise SystemExit(f"dialect mode-count diversity is incomplete: {dialect_profiles}")
+if len({profile[3] for profile in dialect_profiles}) != runs:
+    raise SystemExit("a dialect token/selector/handler program was reused across builds")
 write_totals = tuple(sum(record[0][index] for record in semantic_records) for index in range(6))
 if min(write_totals) <= 0:
     raise SystemExit(f"not all six semantic write lowerings were emitted: {write_totals}")
@@ -869,6 +902,7 @@ print(
     f"segments={sorted(segment_counts)}, "
     f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, member-phase-programs={len({profile[3] for profile in fused_member_profiles})}, "
     f"call-inclusive-folds={min(profile[1] for profile in call_inclusive_profiles)}..{max(profile[1] for profile in call_inclusive_profiles)}, "
+    f"dialect-modes={sorted({profile[0] for profile in dialect_profiles})}, dialect-programs={len({profile[3] for profile in dialect_profiles})}, "
     f"call-token-programs={len({profile[3] for profile in call_trampoline_profiles})}, call-frame-layouts={len({profile[2] for profile in call_trampoline_profiles})}, "
     f"semantic writes={write_totals}, raw reads={sum(record[1] for record in semantic_records)}/{sum(record[2] for record in semantic_records)}, "
     f"similarity dispatcher={max_similarity:.3f}/{mean_similarity:.3f}, "

@@ -22,6 +22,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 		private sealed class ContinuationNode
 		{
 			public int OpcodeIndex;
+			public int DialectMode;
 			public int Depth;
 			public int Lane;
 			public uint Token;
@@ -1056,12 +1057,12 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"Body","BodyPosition","FragmentCount","FragmentOrder","FragmentSpans","LogicalSlot","MinimumLength","ReadFragment","TargetSlot","Record","ReferenceSlots","HeaderWords","HeaderIndex",
 				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","BeginConstantChain","AdvanceConstantChain","ConstantChainState","StringShardState","DecodeConstantCapsule","StoredTag","EncodedBody","RawParts","Raw","Cons","StringParts","ShardCount","ShardOrder","ShardIndex","ShardOffset","ShardLength","ShardPosition","ShardByte","ExpectedShardLength","PreviousReference","Reference","ResolvedConstants","ResolvedConstantFlags",
 				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root","Blocks","BlockMap",
-				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
+				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","AcceptedModeCount","AcceptedModes","AcceptedModeIndex","PreviousAcceptedMode","Offset","ConstCache",
 				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier","CurrentChunkState",
-				"InstructionDigest","BeginInstructionState","AdvanceInstructionState","InstructionStateSeal","PreviousInstructionState","CurrentInstructionState","CurrentInstructionSeal","Digest",
-				"BeginOpcodeState","AdvanceOpcodeState","OpcodeStateKey","OpcodeStateSeal","PreviousOpcodeState","CurrentOpcodeState","CurrentOpcodeSeal",
+				"InstructionDigest","BeginInstructionState","AdvanceInstructionState","InstructionStateSeal","InstructionSeal","PreviousInstructionState","CurrentInstructionState","CurrentInstructionSeal","Digest",
+				"BeginOpcodeState","AdvanceOpcodeState","OpcodeStateKey","OpcodeStateSeal","OpcodeSeal","PreviousOpcodeState","CurrentOpcodeState","CurrentOpcodeSeal",
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
-				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
+				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","WrappedMode","WrappedChunkRecord","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
 				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched","HandlerReadStack","HandlerReadEnvironment","HandlerWriteStack","HandlerTableWrite","HandlerTableAcquireKey","HandlerTableAcquireValue","HandlerTableCommit","HandlerTableCommitA","HandlerTableCommitB","HandlerTableCommitC","HandlerTableCommitD","HandlerTableCommitMode","HandlerTableSlot","HandlerTableResult","HandlerTableFresh","HandlerTableDecoyKey","HandlerTableDecoyValue","HandlerTableTarget","HandlerTableKey","HandlerTableValue","HandlerTableMode","HandlerBinary","HandlerUnary","HandlerPc","HandlerFragmentIndex","HandlerFragmentValue","HandlerFragmentMode","HandlerFragmentLeft","HandlerFragmentRight","HandlerFragmentCurrent","HandlerFragmentTarget",
 				"HandlerCall","HandlerCallAcquireTarget","HandlerCallValidateTarget","HandlerCallAcquireArguments","HandlerCallInvoke","HandlerCallInvokeA","HandlerCallInvokeB","HandlerCallInvokeC","HandlerCallInvokeD","HandlerCallTailInvoke","HandlerCallTailInvokeA","HandlerCallTailInvokeB","HandlerCallTailInvokeC","HandlerCallTailInvokeD","HandlerCallForward","HandlerCallMode","HandlerCallInstruction","HandlerCallTop","HandlerCallFrame","HandlerCallArgumentMode","HandlerCallResultMode","HandlerCallInvokeMode","HandlerCallState","HandlerCallSteps","HandlerCallResults","HandlerCallResultCount","HandlerCallA","HandlerCallFirst","HandlerCallLast","HandlerCallTarget","HandlerCallIndex","HandlerCallResultIndex","HandlerCallNewTop",
@@ -1112,7 +1113,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"SourceRead8","SourceReadBytes","ActiveSourceLength","SourceIsPaged","ActivePrototypeHash","ActivePrototypeRight","ActivePrototypeCounter","PrototypeAbsorb","FinalizePrototypeIntegrity","TrackPrototypeByte","FramedLength","EncodedParts","EncodedPage",
 				"PageByteIndex","FramingIndex","MaskState","InnerKey","OuterKey","NestedByte","PlainByte","RawLength","Multiplier","SavedSourceLength","SavedSourceMode",
 				"CipherByte","KeyByte","EnvelopeReadWidth","Width","FieldIndex","LengthOffset","EncodedIndex","Left","Right","Counter","Word","Mixed","Absorb","PipelineState","PipelineIndex","TransformedByte","EncodedPartIndex",
-				"ChunkState","InitialChunkKey","ChunkChainKey","SourceChunkState","SourceEntryState","CurrentChunkState","WrappedChunkState","ChunkSuccessors",
+				"ChunkState","InitialChunkKey","ChunkChainKey","SourceChunkState","SourceEntryState","CurrentChunkState","WrappedChunkState","ChunkSuccessors","InitialDialectModeKey","DialectModeKey","DialectModeSlot","DialectModeCacheSlot","DialectModeSeal","DialectModeValid","DialectModeAccepted","ResolveDialectMode","CurrentDialectMode","DialectEnum",
 				"TargetIndex","TargetInstruction","ReferencedConstants","ResolveConstant","ReferenceSlot","PreviousCapsule","BeginPrototypeIntegrity","Words","WordIndex","Word",
 				"LayoutFrameA","LayoutFrameB","LayoutFrameC"
 				};
@@ -1427,6 +1428,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					["__IB2_FLOW_VERIFIER_MASK__"] = domains.FlowVerifierMask.ToString(),
 					["__IB2_ENTROPY_RECORD_KIND__"] = domains.EntropyRecordKind.ToString(),
 					["__IB2_DATA_RECORD_KIND__"] = domains.DataRecordKind.ToString(),
+					["__IB2_DIALECT_MODE_COUNT__"] = _context.DialectModeCount.ToString(),
 					["__IB2_OUTER_HEAD_OFFSET__"] = (format.OuterHeadOffset + 1).ToString(),
 					["__IB2_OUTER_TAG_OFFSET__"] = (format.OuterIntegrityOffset + 1).ToString(),
 					["__IB2_OUTER_FLAGS_OFFSET__"] = (format.OuterFlagsOffset + 1).ToString(),
@@ -1446,7 +1448,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				};
 				foreach (KeyValuePair<string, string> replacement in replacements)
 					code = code.Replace(replacement.Key, replacement.Value);
-				if (Regex.IsMatch(code, @"__IB2_(?:DOMAIN|BLOCK_FIELD|FLOW_VERIFIER|ENTROPY_RECORD|DATA_RECORD|OUTER_|ENVELOPE_|RECORD_|PAGE_|STREAM_)"))
+				if (Regex.IsMatch(code, @"__IB2_(?:DOMAIN|BLOCK_FIELD|FLOW_VERIFIER|ENTROPY_RECORD|DATA_RECORD|DIALECT_MODE|OUTER_|ENVELOPE_|RECORD_|PAGE_|STREAM_)"))
 					throw new InvalidOperationException("A per-build runtime layout or domain placeholder was not replaced.");
 				return code;
 			}
@@ -2309,6 +2311,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
         Chunk[12] = gBits32();
         Chunk[16] = gBits32();
         InitialRouteToken = U32(BitXOR(gBits32(), OuterSeed));
+        Chunk[17] = gBits32();
 	        for BlockIndex = 1, BlockCount do
 	            local BlockStart = gBits32();
 	            local Count = gBits32();
@@ -2322,6 +2325,16 @@ namespace IronBrew2.Obfuscator.VM_Generation
 	                if Reference <= PreviousReference then error('invalid protected payload', 0); end;
 	                References[ReferenceIndex], PreviousReference = Reference, Reference;
 	            end;
+	            local AcceptedModeCount = gBits32();
+	            local AcceptedModes = {};
+	            local PreviousAcceptedMode = 0;
+	            if AcceptedModeCount < 1 or AcceptedModeCount > __IB2_DIALECT_MODE_COUNT__ then error('invalid protected payload', 0); end;
+	            for AcceptedModeIndex = 1, AcceptedModeCount do
+	                local CurrentDialectMode = gBits32();
+	                if CurrentDialectMode <= PreviousAcceptedMode then error('invalid protected payload', 0); end;
+	                AcceptedModes[AcceptedModeIndex], PreviousAcceptedMode = CurrentDialectMode, CurrentDialectMode;
+	            end;
+	            References[0] = AcceptedModes;
 	            local Verifier = gBits32();
 	            local BlockTag = gBits32();
 	            local SuccessorCount = gBits32();
@@ -2333,10 +2346,11 @@ namespace IronBrew2.Obfuscator.VM_Generation
 	                local SuccessorStart = gBits32();
 	                local WrappedState = gBits32();
 	                local WrappedChunkState = gBits32();
+	                local WrappedMode = gBits32();
 	                if SuccessorStart <= PreviousSuccessor then error('invalid protected payload', 0); end;
 	                Successors[SuccessorStart] = WrappedState;
-	                ChunkSuccessors[SuccessorStart] = WrappedChunkState;
-	                SuccessorRecords[SuccessorIndex] = {SuccessorStart, WrappedState, WrappedChunkState};
+	                ChunkSuccessors[SuccessorStart] = {WrappedChunkState, WrappedMode};
+	                SuccessorRecords[SuccessorIndex] = {SuccessorStart, WrappedState, WrappedChunkState, WrappedMode};
 	                PreviousSuccessor = SuccessorStart;
 	            end;
 	            local Length = gBits32();
@@ -2768,6 +2782,47 @@ local function SelectMaterializerEnum(Chunk, Stage)
     else return __IB2_MATERIALIZER_OPCODE_3__; end;
 end;
 
+local function DialectModeSlot(Chunk)
+    return 1047291 + ((Chunk[5] * 911 + Chunk[6] * 257 + Chunk[7]
+        + __IB2_DOMAIN_FLOW__) % 104729);
+end;
+
+local function DialectModeValid(Value)
+    __IB2_DIALECT_MODE_VALID__
+end;
+
+local function DialectModeAccepted(Block, Value)
+    local AcceptedModes = Block[4][0];
+    if type(AcceptedModes) ~= 'table' then return false; end;
+    for AcceptedModeIndex = 1, #AcceptedModes do
+        if RawEqual(AcceptedModes[AcceptedModeIndex], Value) then return true; end;
+    end;
+    return false;
+end;
+
+local function DialectModeSeal(Value, InstructionSeal, OpcodeSeal, Index, EntryState,
+    CurrentChunkState, Block, K1, K2, K3)
+    local Mixed = U32(BitXOR(BitXOR(BitXOR(Value, InstructionSeal), OpcodeSeal),
+        U32(BitXOR(EntryState, PayloadRotate16(CurrentChunkState)))));
+    return (U32Mul(Mixed, 65599) + Index * 257 + Block[7]
+        + K1 * 251 + K2 * 17 + K3 + __IB2_DOMAIN_FLOW__) % 4294967296;
+end;
+
+local function ResolveDialectMode(Chunk, Flow, Index)
+    local FlowCache = Flow[4];
+    local Block = Flow[2];
+    local DialectModeCacheSlot = DialectModeSlot(Chunk);
+    if not FlowCache or not Block then error('invalid protected payload', 0); end;
+    local CurrentDialectMode = FlowCache[DialectModeCacheSlot];
+    if not DialectModeValid(CurrentDialectMode)
+    or DialectModeSeal(CurrentDialectMode, FlowCache[5], FlowCache[7], Index,
+        FlowCache[2], FlowCache[3], Block, Chunk[5], Chunk[6], Chunk[7])
+        ~= FlowCache[DialectModeCacheSlot + 1] then
+        error('invalid protected payload', 0);
+    end;
+    return CurrentDialectMode;
+end;
+
 local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     local BlockMap = Chunk[10];
     local Block = BlockMap and BlockMap[Index];
@@ -2788,11 +2843,16 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     local MaterializeFusedSlot = MaterializeIndexSlot + 837832;
     local MaterializeFreshTableSlot = MaterializeIndexSlot + 942561;
     local FlowCache = Flow[4];
+    local DialectModeCacheSlot = DialectModeSlot(Chunk);
     if AllowMaterializer and FlowCache and FlowCache[MaterializeIndexSlot] == Index then
         local MaterializeStage = FlowCache[MaterializeStageSlot];
         if type(MaterializeStage) ~= 'number' or MaterializeStage < 1 or MaterializeStage > 4
         or Flow[1] ~= Index - 1 or Flow[2] ~= Block
-        or FlowCache[1] ~= Block or FlowCache[2] ~= Flow[3] then
+        or FlowCache[1] ~= Block or FlowCache[2] ~= Flow[3]
+        or not DialectModeValid(FlowCache[DialectModeCacheSlot])
+        or DialectModeSeal(FlowCache[DialectModeCacheSlot], FlowCache[5], FlowCache[7],
+            Index, FlowCache[2], FlowCache[3], Block, Chunk[5], Chunk[6], Chunk[7])
+            ~= FlowCache[DialectModeCacheSlot + 1] then
             error('invalid protected payload', 0);
         end;
         Flow[1] = Index;
@@ -2823,42 +2883,61 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     local CurrentChunkState;
     local PreviousInstructionState;
     local PreviousOpcodeState;
+    local CurrentDialectMode;
     if not CurrentBlock then
         if Index ~= 1 then error('invalid protected payload', 0); end;
         __IB2_FIRST_BLOCK_CHECK__
         EntryState = U32(BitXOR(Chunk[12], InitialFlowKey(Chunk[5], Chunk[6], Chunk[7])));
         CurrentChunkState = U32(BitXOR(Chunk[16], InitialChunkKey(Chunk[5], Chunk[6], Chunk[7])));
+        CurrentDialectMode = U32(BitXOR(Chunk[17], InitialDialectModeKey(
+            EntryState, CurrentChunkState, Block[1], Chunk[5], Chunk[6], Chunk[7])));
         PreviousInstructionState = BeginInstructionState(CurrentChunkState, EntryState, Block[1], Block[7], Chunk[5], Chunk[6], Chunk[7]);
         PreviousOpcodeState = BeginOpcodeState(CurrentChunkState, EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]);
     elseif CurrentBlock ~= Block or Index ~= LastIndex + 1 then
         if Index ~= Block[1] or not FlowCache or FlowCache[1] ~= CurrentBlock
         or FlowCache[2] ~= Flow[3]
         or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5]
-        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7] then
+        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7]
+        or not DialectModeValid(FlowCache[DialectModeCacheSlot])
+        or DialectModeSeal(FlowCache[DialectModeCacheSlot], FlowCache[5], FlowCache[7],
+            LastIndex, FlowCache[2], FlowCache[3], CurrentBlock, Chunk[5], Chunk[6], Chunk[7])
+            ~= FlowCache[DialectModeCacheSlot + 1] then
             error('invalid protected payload', 0);
         end;
         local WrappedState = CurrentBlock[5][Block[1]];
-        local WrappedChunkState = CurrentBlock[10][Block[1]];
-        if not WrappedState or not WrappedChunkState then error('invalid protected payload', 0); end;
+        local WrappedChunkRecord = CurrentBlock[10][Block[1]];
+        if not WrappedState or type(WrappedChunkRecord) ~= 'table' then error('invalid protected payload', 0); end;
+        local WrappedChunkState, WrappedMode = WrappedChunkRecord[1], WrappedChunkRecord[2];
+        if not WrappedChunkState or not WrappedMode then error('invalid protected payload', 0); end;
         EntryState = U32(BitXOR(WrappedState, FlowKey(Flow[3], LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
         CurrentChunkState = U32(BitXOR(WrappedChunkState, ChunkChainKey(
             FlowCache[3], Flow[3], LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
+        CurrentDialectMode = U32(BitXOR(WrappedMode, DialectModeKey(
+            Flow[3], FlowCache[3], EntryState, CurrentChunkState,
+            LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
         PreviousInstructionState = BeginInstructionState(CurrentChunkState, EntryState, Block[1], Block[7], Chunk[5], Chunk[6], Chunk[7]);
         PreviousOpcodeState = BeginOpcodeState(CurrentChunkState, EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]);
     else
         if not FlowCache or FlowCache[1] ~= CurrentBlock or FlowCache[2] ~= Flow[3]
         or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5]
-        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7] then
+        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7]
+        or not DialectModeValid(FlowCache[DialectModeCacheSlot])
+        or DialectModeSeal(FlowCache[DialectModeCacheSlot], FlowCache[5], FlowCache[7],
+            LastIndex, FlowCache[2], FlowCache[3], CurrentBlock, Chunk[5], Chunk[6], Chunk[7])
+            ~= FlowCache[DialectModeCacheSlot + 1] then
             error('invalid protected payload', 0);
         end;
         EntryState = Flow[3];
         CurrentChunkState = FlowCache[3];
+        CurrentDialectMode = FlowCache[DialectModeCacheSlot];
         PreviousInstructionState = FlowCache[4];
         PreviousOpcodeState = FlowCache[6];
     end;
 
     if FlowVerifier(EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]) ~= Block[6]
-    or ChunkState(EntryState, Block[1], Block[2], Chunk[5], Chunk[6], Chunk[7]) ~= CurrentChunkState then
+    or ChunkState(EntryState, Block[1], Block[2], Chunk[5], Chunk[6], Chunk[7]) ~= CurrentChunkState
+    or not DialectModeValid(CurrentDialectMode)
+    or not DialectModeAccepted(Block, CurrentDialectMode) then
         error('invalid protected payload', 0);
     end;
 
@@ -2875,6 +2954,10 @@ local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     FlowCache = {};
     FlowCache[1], FlowCache[2], FlowCache[3], FlowCache[4], FlowCache[5], FlowCache[6], FlowCache[7] =
         Block, EntryState, CurrentChunkState, CurrentInstructionState, CurrentInstructionSeal, CurrentOpcodeState, CurrentOpcodeSeal;
+    FlowCache[DialectModeCacheSlot] = CurrentDialectMode;
+    FlowCache[DialectModeCacheSlot + 1] = DialectModeSeal(CurrentDialectMode,
+        CurrentInstructionSeal, CurrentOpcodeSeal, Index, EntryState, CurrentChunkState,
+        Block, Chunk[5], Chunk[6], Chunk[7]);
     Flow[1], Flow[2], Flow[3], Flow[4] = Index, Block, EntryState, FlowCache;
     local MaterializeEnum;
     if AllowMaterializer then
@@ -2944,6 +3027,9 @@ end;";
 					materializerOpcodes[mode].VIndex.ToString());
 			if (Regex.IsMatch(blockRuntime, @"__IB2_MATERIALIZER_OPCODE_\d+__"))
 				throw new InvalidOperationException("A materializer opcode placeholder was not replaced.");
+			string dialectModeValidation = "return " + string.Join(" or ",
+				_context.DialectModeTokens.Select(token => "Value==" + ScrambleUInt(token))) + ";";
+			blockRuntime = blockRuntime.Replace("__IB2_DIALECT_MODE_VALID__", dialectModeValidation);
 			vm += T(ApplyBuildDomains(blockRuntime));
 
 			string loopRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2);
@@ -3012,21 +3098,24 @@ end;";
 				return token;
 			}
 
+			int ChainKey(int dialectMode, int opcodeIndex) =>
+				dialectMode * virtuals.Count + opcodeIndex;
 			var continuationChains = new Dictionary<int, List<ContinuationNode>>();
 			var allContinuationNodes = new List<ContinuationNode>();
 			int[] firstLaneCoverage = Enumerable.Range(0, laneCount).ToArray();
 			firstLaneCoverage.Shuffle(r);
+			for (int dialectMode = 0; dialectMode < _context.DialectModeCount; dialectMode++)
 			for (int opcodeIndex = 0; opcodeIndex < virtuals.Count; opcodeIndex++)
 			{
+				bool firstPath = dialectMode == 0 && opcodeIndex == 0;
 				int nodeCount = 3 + r.Next(3);
-				if (opcodeIndex == 0)
-					nodeCount = Math.Max(nodeCount, laneCount);
+				if (firstPath) nodeCount = Math.Max(nodeCount, laneCount);
 				var chain = new List<ContinuationNode>();
 				int previousLane = -1;
 				for (int depth = 0; depth < nodeCount; depth++)
 				{
 					int lane;
-					if (opcodeIndex == 0 && depth < laneCount)
+					if (firstPath && depth < laneCount)
 						lane = firstLaneCoverage[depth];
 					else
 					{
@@ -3036,6 +3125,7 @@ end;";
 					var node = new ContinuationNode
 					{
 						OpcodeIndex = opcodeIndex,
+						DialectMode = dialectMode,
 						Depth = depth,
 						Lane = lane,
 						Token = NewContinuationToken()
@@ -3054,7 +3144,7 @@ end;";
 				if (settings.Noise)
 					handler += AntiDumpGenerator.GenerateHandlerNoise(guardRandom);
 				chain[chain.Count - 1].Handler = handler;
-				continuationChains[opcodeIndex] = chain;
+				continuationChains[ChainKey(dialectMode, opcodeIndex)] = chain;
 			}
 
 			string dispatchMaskName = T("DispatchMask");
@@ -3068,6 +3158,22 @@ end;";
 			string bitXorName = T("BitXOR");
 			string u32Name = T("U32");
 			string enumName = T("Enum");
+			string currentDialectName = T("CurrentDialectMode");
+			string dialectEnumName = T("DialectEnum");
+			int Gcd(int left, int right)
+			{
+				while (right != 0) (left, right) = (right, left % right);
+				return Math.Abs(left);
+			}
+			var dialectMultipliers = new int[_context.DialectModeCount];
+			var dialectAddends = new int[_context.DialectModeCount];
+			for (int mode = 0; mode < _context.DialectModeCount; mode++)
+			{
+				int multiplier;
+				do multiplier = r.Next(1, virtuals.Count + 1); while (Gcd(multiplier, virtuals.Count) != 1);
+				dialectMultipliers[mode] = multiplier;
+				dialectAddends[mode] = r.Next(virtuals.Count);
+			}
 			DispatcherTemplate dispatcherTemplate = DispatcherTemplateSelector.Select(dispatcherRandom);
 			// State updates have three dependency-safe orders. This varies the def-use
 			// shape even when two builds select the same outer dispatcher template.
@@ -3076,44 +3182,46 @@ end;";
 			string EncodedState(uint token, string mask) =>
 				u32Name + "(" + bitXorName + "(" + ScrambleUInt(token) + "," + mask + "))";
 
-			string EntryAssignment(int opcodeIndex)
+			string EntryAssignment(int dialectMode, int opcodeIndex)
 			{
-				ContinuationNode entry = continuationChains[opcodeIndex][0];
+				ContinuationNode entry = continuationChains[ChainKey(dialectMode, opcodeIndex)][0];
 				string state = dispatchStateName + "=" + EncodedState(entry.Token, dispatchMaskName) + ";";
 				string lane = dispatchLaneName + "=" + ScrambleNumber(entry.Lane) + ";";
 				return transitionLayout == 1 ? lane + state : state + lane;
 			}
 
-			string BuildOpcodeSelector(List<int> opcodes)
+			int DialectSelectorValue(int dialectMode, int opcodeIndex) =>
+				(virtuals[opcodeIndex].VIndex * dialectMultipliers[dialectMode]
+				 + dialectAddends[dialectMode]) % virtuals.Count;
+
+			string BuildOpcodeSelector(int dialectMode, List<int> opcodes)
 			{
 				if (opcodes.Count == 1)
-					return EntryAssignment(opcodes[0]);
+					return EntryAssignment(dialectMode, opcodes[0]);
 				if (opcodes.Count == 2)
 				{
 					int first = opcodes[0];
 					int second = opcodes[1];
-					string firstValue = ScrambleNumber(virtuals[first].VIndex);
+					string firstValue = ScrambleNumber(DialectSelectorValue(dialectMode, first));
 					switch (r.Next(3))
 					{
 						case 0:
-							return "if " + enumName + "==" + firstValue + " then " + EntryAssignment(first) + "else " + EntryAssignment(second) + "end;";
+							return "if " + dialectEnumName + "==" + firstValue + " then " + EntryAssignment(dialectMode, first) + "else " + EntryAssignment(dialectMode, second) + "end;";
 						case 1:
-							return "if " + enumName + "~=" + firstValue + " then " + EntryAssignment(second) + "else " + EntryAssignment(first) + "end;";
+							return "if " + dialectEnumName + "~=" + firstValue + " then " + EntryAssignment(dialectMode, second) + "else " + EntryAssignment(dialectMode, first) + "end;";
 						default:
-							return "if " + enumName + ">" + firstValue + " then " + EntryAssignment(second) + "else " + EntryAssignment(first) + "end;";
+							return "if " + dialectEnumName + ">" + firstValue + " then " + EntryAssignment(dialectMode, second) + "else " + EntryAssignment(dialectMode, first) + "end;";
 					}
 				}
 
-				// Every threshold and leaf comparison is expressed in virtual-opcode
-				// space. Sorting by the source list index would silently misroute a
-				// randomized VIndex permutation.
-				List<int> ordered = opcodes.OrderBy(opcode => virtuals[opcode].VIndex).ToList();
+				List<int> ordered = opcodes
+					.OrderBy(opcode => DialectSelectorValue(dialectMode, opcode)).ToList();
 				int middle = ordered.Count / 2;
 				List<int> left = ordered.Take(middle).ToList();
 				List<int> right = ordered.Skip(middle).ToList();
-				int threshold = virtuals[left.Last()].VIndex;
-				return "if " + enumName + "<=" + ScrambleNumber(threshold) + " then " +
-				       BuildOpcodeSelector(left) + "else " + BuildOpcodeSelector(right) + "end;";
+				int threshold = DialectSelectorValue(dialectMode, left.Last());
+				return "if " + dialectEnumName + "<=" + ScrambleNumber(threshold) + " then " +
+				       BuildOpcodeSelector(dialectMode, left) + "else " + BuildOpcodeSelector(dialectMode, right) + "end;";
 			}
 
 			string DecodedState() => settings.AntiDump
@@ -3172,6 +3280,25 @@ end;";
 				return result.ToString();
 			}
 
+			string DialectNodeChain(IEnumerable<ContinuationNode> nodes, bool inlineLane)
+			{
+				List<ContinuationNode> available = nodes.ToList();
+				int[] modes = available.Select(node => node.DialectMode).Distinct().ToArray();
+				modes.Shuffle(r);
+				var result = new StringBuilder();
+				for (int index = 0; index < modes.Length; index++)
+				{
+					int mode = modes[index];
+					result.Append(index == 0 ? "if " : "elseif ")
+						.Append(currentDialectName).Append("==")
+						.Append(ScrambleUInt(_context.DialectModeTokens[mode])).Append(" then ")
+						.Append(NodeChain(available.Where(node => node.DialectMode == mode)
+							.OrderBy(_ => r.Next()), inlineLane));
+				}
+				result.Append("end;");
+				return result.ToString();
+			}
+
 			uint dispatchSaltFactor = (uint)(1 + r.Next(1, 32768) * 2);
 			uint dispatchSaltAddend = unchecked((uint)r.NextInt64(1L, 4294967296L));
 			vm += "local " + dispatchMaskName + "=" + u32Name + "(" + bitXorName + "(" + bitXorName + "(" + T("Flow") + "[3]," +
@@ -3182,7 +3309,21 @@ end;";
 			      ScrambleUInt(dispatchSaltAddend) + ")%4294967296;";
 			vm += "local " + dispatchStateName + "," + dispatchLaneName + "," + dispatchStepMaskName + ";" +
 			      "local " + dispatchActiveName + "=true;local " + dispatchStepsName + "=0;local " + dispatchMatchedName + ";";
-			vm += BuildOpcodeSelector(Enumerable.Range(0, virtuals.Count).ToList());
+			vm += "local " + currentDialectName + "=" + T("ResolveDialectMode") + "(" +
+			      T("Chunk") + "," + T("Flow") + "," + T("InstrPoint") + ");" +
+			      "local " + dialectEnumName + ";";
+			int[] dialectOrder = Enumerable.Range(0, _context.DialectModeCount).ToArray();
+			dialectOrder.Shuffle(r);
+			for (int dialectIndex = 0; dialectIndex < dialectOrder.Length; dialectIndex++)
+			{
+				int dialectMode = dialectOrder[dialectIndex];
+				vm += (dialectIndex == 0 ? "if " : "elseif ") + currentDialectName + "==" +
+				      ScrambleUInt(_context.DialectModeTokens[dialectMode]) + " then " +
+				      dialectEnumName + "=(" + enumName + "*" + ScrambleNumber(dialectMultipliers[dialectMode]) +
+				      "+" + ScrambleNumber(dialectAddends[dialectMode]) + ")%" + ScrambleNumber(virtuals.Count) + ";" +
+				      BuildOpcodeSelector(dialectMode, Enumerable.Range(0, virtuals.Count).ToList());
+			}
+			vm += "else error('invalid protected payload',0);end;";
 
 			int maximumDepth = continuationChains.Values.Max(chain => chain.Count - 1);
 			string depthGuard = "if " + dispatchStepsName + ">" + ScrambleNumber(maximumDepth) + " then error('invalid protected payload',0);end;";
@@ -3207,7 +3348,7 @@ end;";
 				{
 					int lane = laneOrder[laneOrderIndex];
 					vm += (laneOrderIndex == 0 ? "if " : "elseif ") + dispatchLaneName + "==" + ScrambleNumber(lane) + " then ";
-					vm += NodeChain(allContinuationNodes.Where(node => node.Lane == lane).OrderBy(_ => r.Next()), false);
+					vm += DialectNodeChain(allContinuationNodes.Where(node => node.Lane == lane), false);
 				}
 				vm += "end;if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;end;";
 			}
@@ -3216,7 +3357,7 @@ end;";
 				// Template B: token and lane checks share one flat threaded state chain.
 				// A repeat terminator replaces the active-condition loop header.
 				vm += "repeat " + loopPrefix;
-				vm += NodeChain(allContinuationNodes.OrderBy(_ => r.Next()), true);
+				vm += DialectNodeChain(allContinuationNodes, true);
 				vm += "if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;until not " + dispatchActiveName + ";";
 			}
 			else
@@ -3237,7 +3378,7 @@ end;";
 					{
 						int lane = depthLanes[laneIndex];
 						vm += (laneIndex == 0 ? "if " : "elseif ") + dispatchLaneName + "==" + ScrambleNumber(lane) + " then ";
-						vm += NodeChain(allContinuationNodes.Where(node => node.Depth == depth && node.Lane == lane).OrderBy(_ => r.Next()), false);
+						vm += DialectNodeChain(allContinuationNodes.Where(node => node.Depth == depth && node.Lane == lane), false);
 					}
 					vm += "end;";
 				}
@@ -3308,7 +3449,7 @@ return Wrap(Root, {}, DisabledGlobalEnvironment);";
 			// Build-wide runtime ABI randomization. All table constructors above use
 			// explicit keyed assignments, so these independent permutations cover every
 			// Chunk/Block/Flow/cache access, including opcode handlers after T().
-			int[] chunkSlots = GenerateRuntimeSlotPermutation(16);
+			int[] chunkSlots = GenerateRuntimeSlotPermutation(17);
 			int[] blockSlots = GenerateRuntimeSlotPermutation(10);
 			int[] flowSlots = GenerateRuntimeSlotPermutation(4);
 			int[] flowCacheSlots = GenerateRuntimeSlotPermutation(7);
@@ -3336,6 +3477,17 @@ return Wrap(Root, {}, DisabledGlobalEnvironment);";
 				+ "; phases=" + callPhaseOrder.Count
 				+ "; frame=" + string.Join(",", callFrameSlots)
 				+ "; signature=" + callTrampolineSignature.ToString("x8") + ".");
+			uint dialectSignature = 2166136261u;
+			for (int mode = 0; mode < _context.DialectModeCount; mode++)
+			{
+				dialectSignature = (dialectSignature ^ _context.DialectModeTokens[mode]) * 16777619u;
+				dialectSignature = (dialectSignature ^ (uint)dialectMultipliers[mode]) * 16777619u;
+				dialectSignature = (dialectSignature ^ (uint)dialectAddends[mode]) * 16777619u;
+			}
+			Console.WriteLine("Dialect lattice: modes=" + _context.DialectModeCount
+				+ "; used=" + _context.DialectModesUsed.Count
+				+ "; paths=" + continuationChains.Count
+				+ "; signature=" + dialectSignature.ToString("x8") + ".");
 
 			return vm;
 		}

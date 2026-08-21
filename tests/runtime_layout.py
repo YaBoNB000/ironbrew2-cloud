@@ -112,7 +112,7 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
         rf"local\s+({IDENT})\s*=\s*\5\(\);\s*"
         rf"local\s+({IDENT})\s*=\s*\5\(\);\s*"
         rf"local\s+{IDENT}\s*=\s*{IDENT}\(\);\s*"
-        rf"local\s+({IDENT})\s*=\s*{IDENT}\(\s*16\s*,\s*\4\s*,\s*\6\s*,\s*\7\s*,[^;]+\);\s*"
+        rf"local\s+({IDENT})\s*=\s*{IDENT}\(\s*(?:16|17)\s*,\s*\4\s*,\s*\6\s*,\s*\7\s*,[^;]+\);\s*"
         rf"\8\[(\d+)\]\s*=\s*\1;\s*"
         rf"\8\[(\d+)\]\s*=\s*\2;\s*"
         rf"\8\[(\d+)\]\s*=\s*\3;",
@@ -120,6 +120,7 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
         "could not recover prototype-local Chunk initialization",
     )
     instrs, functions, lines = init.group(1, 2, 3)
+    chunk_slot_count = 17 if re.search(r"\(\s*17\s*,", init.group(0)) else 16
     k1, k2, k3, chunk = init.group(4, 6, 7, 8)
     chunk_map: dict[int, int] = {1: int(init.group(9)), 2: int(init.group(10)), 4: int(init.group(11))}
     key_match = _expect(
@@ -168,6 +169,13 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
         "could not recover Chunk block-count/initial flow/chunk-state slots",
     )
     chunk_map.update({11: int(counts.group(1)), 12: int(counts.group(2)), 16: int(counts.group(4))})
+    if chunk_slot_count == 17:
+        initial_mode = _expect(
+            rf"{re.escape(chunk)}\[(\d+)\]\s*=\s*{IDENT}\(\s*\)\s*;",
+            source[counts.end():],
+            "could not recover Chunk initial dialect-mode slot",
+        )
+        chunk_map[17] = int(initial_mode.group(1))
 
     dispatcher_init = _expect(
         rf"local\s+({IDENT})\s*=\s*\{{\}};\s*local\s+{IDENT}\s*=\s*0;\s*"
@@ -185,8 +193,8 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
     chunk_map.update({13: int(dispatcher_pair.group(1)), 14: int(dispatcher_pair.group(2))})
 
     # Params is the sole remaining Chunk semantic after all keyed fields above.
-    remaining_old = set(range(1, 17)) - set(chunk_map)
-    remaining_new = set(range(1, 17)) - set(chunk_map.values())
+    remaining_old = set(range(1, chunk_slot_count + 1)) - set(chunk_map)
+    remaining_new = set(range(1, chunk_slot_count + 1)) - set(chunk_map.values())
     if len(remaining_old) != 1 or len(remaining_new) != 1 or remaining_old != {3}:
         raise ValueError("could not infer the remaining Chunk parameter slot")
     chunk_map[3] = remaining_new.pop()
@@ -231,6 +239,7 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
         rf"\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*"
         rf"\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*=\s*"
         rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT};\s*"
+        rf"(?:\1\[[^\]]+\]\s*=\s*[^;]+;\s*){{0,2}}"
         rf"{re.escape(flow_name)}\[[^\]]+\]\s*,\s*{re.escape(flow_name)}\[[^\]]+\]\s*,\s*"
         rf"{re.escape(flow_name)}\[[^\]]+\]\s*,\s*{re.escape(flow_name)}\[{flow_map[4]}\]\s*=\s*"
         rf"{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*,\s*\1;",
@@ -266,7 +275,7 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
     if len(set(guard_bind.groups())) != 6:
         raise ValueError("runtime Guard state inputs are not independent locals")
 
-    _permutation(chunk_map, 16, "Chunk")
+    _permutation(chunk_map, chunk_slot_count, "Chunk")
     _permutation(block_map_slots, 10, "Block")
     _permutation(flow_map, 4, "Flow")
     _permutation(flow_cache_map, 7, "FlowCache")
@@ -557,10 +566,62 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
     for match in re.finditer(lane_entry + rf"\s*" + state_entry, selector):
         entries.append((match.start(), _arithmetic_value(match.group(2)), _arithmetic_value(match.group(1))))
     entries.sort()
-    entry_tokens = [token for _position, token, _lane in entries]
-    entry_lanes = [lane for _position, _token, lane in entries]
-    if len(entry_tokens) != opcode_count or len(set(entry_tokens)) != opcode_count:
-        raise ValueError(f"opcode selector exposed {len(entry_tokens)} non-unique entries for {opcode_count} opcodes")
+
+    # P1 mode lattice: one authenticated edge-local mode selects an independent
+    # affine selector bank and continuation path family. Legacy uploaded samples
+    # have no mode wrapper and remain one implicit mode 0.
+    enum_accessor = role_accessors["Enum"]
+    mode_header = re.compile(
+        rf"(?:if|elseif)\s+({IDENT})\s*==\s*({arithmetic_raw})\s*then\s*"
+        rf"({IDENT})\s*=\s*\(\s*{re.escape(enum_accessor)}\s*\*\s*({arithmetic_raw})"
+        rf"\s*\+\s*({arithmetic_raw})\s*\)\s*%\s*({arithmetic_raw})\s*;"
+    )
+    mode_headers = list(mode_header.finditer(selector))
+    dialect_modes: list[dict[str, object]] = []
+    if mode_headers:
+        mode_name = mode_headers[0].group(1)
+        dialect_enum_name = mode_headers[0].group(3)
+        if any(match.group(1) != mode_name or match.group(3) != dialect_enum_name for match in mode_headers):
+            raise ValueError("dialect selector wrappers use inconsistent state locals")
+        for mode_index, header in enumerate(mode_headers):
+            end = mode_headers[mode_index + 1].start() if mode_index + 1 < len(mode_headers) else len(selector)
+            selected = [entry for entry in entries if header.end() <= entry[0] < end]
+            if len(selected) != opcode_count:
+                raise ValueError(
+                    f"dialect mode exposes {len(selected)} opcode entries, expected {opcode_count}"
+                )
+            dialect_modes.append({
+                "token": _arithmetic_value(header.group(2)),
+                "multiplier": _arithmetic_value(header.group(4)),
+                "addend": _arithmetic_value(header.group(5)),
+                "modulus": _arithmetic_value(header.group(6)),
+                "selector": selector[header.end():end],
+                "entry_tokens": [token for _position, token, _lane in selected],
+                "entry_lanes": [lane for _position, _token, lane in selected],
+            })
+        if len({int(mode["token"]) for mode in dialect_modes}) != len(dialect_modes):
+            raise ValueError("dialect mode tokens are not unique")
+    else:
+        mode_name = ""
+        dialect_enum_name = enum_accessor
+        dialect_modes.append({
+            "token": 0,
+            "multiplier": 1,
+            "addend": 0,
+            "modulus": opcode_count,
+            "selector": selector,
+            "entry_tokens": [token for _position, token, _lane in entries],
+            "entry_lanes": [lane for _position, _token, lane in entries],
+        })
+
+    entry_tokens = [token for mode in dialect_modes for token in mode["entry_tokens"]]
+    entry_lanes = [lane for mode in dialect_modes for lane in mode["entry_lanes"]]
+    expected_entries = opcode_count * len(dialect_modes)
+    if len(entry_tokens) != expected_entries or len(set(entry_tokens)) != expected_entries:
+        raise ValueError(
+            f"opcode selectors exposed {len(entry_tokens)} non-unique entries for "
+            f"{opcode_count} opcodes x {len(dialect_modes)} modes"
+        )
 
     fault_use = _expect(
         rf"{re.escape(dispatch_u32)}\(\s*{re.escape(dispatch_xor)}\(\s*"
@@ -679,8 +740,9 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
             raise ValueError("continuation node has neither a transition nor a terminal handler")
 
     terminal_count = len(terminals)
-    if terminal_count != opcode_count:
-        raise ValueError(f"expected {opcode_count} terminal handlers, found {terminal_count}")
+    expected_terminals = opcode_count * len(dialect_modes)
+    if terminal_count != expected_terminals:
+        raise ValueError(f"expected {expected_terminals} dialect terminal handlers, found {terminal_count}")
     if re.search(rf"\b{re.escape(dispatch_active)}\s*=\s*false;", selector):
         raise ValueError("opcode selector still contains a terminal handler marker")
     if len(node_tokens) != len(transitions) + terminal_count:
@@ -793,7 +855,10 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
               if re.search(rf"{re.escape(dispatch_matched)}\s*=\s*false;", prefix) else -1),
     }
     prefix_order = "".join(label for label, position in sorted(prefix_positions.items(), key=lambda item: item[1]) if position >= 0)
-    shape_sequence = [f"T:{dispatcher_template}", f"P:{prefix_order}", f"U:{update_order}"]
+    shape_sequence = [
+        f"T:{dispatcher_template}", f"P:{prefix_order}", f"U:{update_order}",
+        f"M:{len(dialect_modes)}",
+    ]
     shape_sequence.extend(f"D:{value}" for value in depth_branches)
     shape_sequence.extend(f"B:{value}" for value in lane_branches)
     shape_sequence.extend(
@@ -809,6 +874,7 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
     structure_material = "|".join(shape_sequence)
     continuation = {
         "opcodes": opcode_count,
+        "dialect_modes": len(dialect_modes),
         "reject_paths": len(reject_paths),
         "lanes": len(lanes),
         "entries": len(entry_tokens),
@@ -842,6 +908,9 @@ def derive_runtime_layout(source: str, include_attack_details: bool = False) -> 
             "dispatch_xor": dispatch_xor,
             "dispatch_mask": dispatch_mask,
             "enum_accessor": role_accessors["Enum"],
+            "mode_accessor": mode_name,
+            "dialect_enum_accessor": dialect_enum_name,
+            "dialect_modes": dialect_modes,
             "role_accessors": role_accessors,
         }
     return {

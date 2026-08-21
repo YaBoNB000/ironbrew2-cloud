@@ -177,6 +177,46 @@ generation / replay_depth / selector_lane / column_state
 - 删除/替换 mode transition、交换 edge mode 或用错误 mode 解码均触发现有 silent rejection；
 - Lua 5.1 CALL/TAILCALL、closure、vararg、SETLIST C=0 全部保持。
 
+#### P1 完成记录与重读审查（2026-08-21）
+
+状态：**已完成**。
+
+已实现：
+
+1. 每个 build 生成 3–5 个独立随机 32-bit dialect mode tokens；
+2. prototype 初始入口携带 wrapped initial mode；
+3. 每条 successor record 携带绑定 source/target entry state、chunk state、from/to PC 和 prototype keys 的 wrapped edge mode；
+4. 每个 target block manifest 保存并认证 `AcceptedModes`，运行时同时验证全局合法 token 和目标 block 接受集合；
+5. mode 与 mode seal 只保存在 invocation-local FlowCache 派生槽，递归调用不共享；
+6. dispatcher 执行前立即重验 mode seal，防止 GetInstruction 与 handler selector 之间被替换；
+7. 每个 mode 使用独立 affine selector family、独立 continuation paths 和重新 lowering 的 handler recipe；
+8. continuation loop 再按当前 mode 分区，不扫描或执行其他 mode 的 node family；
+9. Chunk runtime ABI 从 16 槽扩展为 17 槽并继续执行 build-wide + prototype-local permutation；
+10. 最终文件攻击器已适配 mode selector、edge mode、target manifest、mode-specific handler，并把 reachable modes 和 transitions 写入 execution-state report。
+
+新增专项：
+
+```text
+tests/dialect_modes.lua
+tests/dialect_modes.py
+```
+
+专项确认同一 target block 从两个 predecessor 接收不同 authenticated modes；模式数、used modes、path 数、handler recipe 差异和最终 attacker mode recovery 全部自动验证。tamper suite 新增：
+
+```text
+initial-dialect-mode
+successor-dialect-mode
+block-dialect-manifest
+```
+
+三种变体都在重算外层、prototype 和相应 block tag 后仍被运行时拒绝。
+
+重读本 MD 后作出一项必要澄清：VM 始终生成 3–5 个完整且可执行的 mode families；拥有足够 block/edge entry sites 的 material fixture 与 20-build semantic matrix 必须实际使用至少 3 个。极小脚本若只有一至两个真实入口，不为凑计数注入伪 CFG block，因此 payload-reachable mode 数可以小于 3；生成日志分别报告 `modes` 和 `used`，攻击报告只计算真实 reachable modes。这避免违反 R5/R6/R8，也不降低 material P1 验收。
+
+P1 未引入共享 mutable instruction array、固定四模式、连续 opcode 区间、巨型 root table或 Luau-only 语法；CALL/TAILCALL/Top、synthetic micro-block、10-member fusion、manifest authentication 和 reentrancy 生命周期均保留。wire 字段 generation 和 selector lane migration 没有提前混入，仍属于 P2/P3。
+
+完整 `IB2_RANDOM_RUNS=20` 已通过；aggregate mode counts 覆盖 3/4/5，20 个 dialect programs 全部唯一。下一步是 P2，并在 P2 完成后再次完整重读本 MD。
+
 ### P2：invocation-local authenticated writable column generations（批准，第二优先级）
 
 吸收 Luraph 的“可写 instruction columns + same-PC replay”，但不允许修改 authenticated payload 或共享 instruction table。

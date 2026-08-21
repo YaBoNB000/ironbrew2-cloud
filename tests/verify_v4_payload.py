@@ -56,6 +56,7 @@ BINDER_MULTIPLIER = 0
 BINDER_INCREMENT = 0
 BINDER_INITIAL = 0
 BINDER_FINAL_XOR = 0
+DIALECT_MODE_FORMAT = False
 
 
 def activate_domains(domains: BuildDomains) -> None:
@@ -153,10 +154,12 @@ class Block:
     count: int
     route_token: int
     references: list[int]
+    accepted_modes: list[int]
+    accepted_mode_offsets: list[int]
     verifier: int
     tag: int
     tag_offset: int
-    successors: list[tuple[int, int, int]]
+    successors: list[tuple[int, int, int, int]]
     successor_offsets: list[int]
     body_start: int
     body_end: int
@@ -170,6 +173,7 @@ class Block:
     capsules: dict[int, Capsule] = field(default_factory=dict)
     final_instruction_state: int = 0
     final_instruction_seal: int = 0
+    successor_modes: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -188,6 +192,9 @@ class Prototype:
     initial_wrapped_chunk_state: int = 0
     initial_wrapped_chunk_offset: int = 0
     initial_route: int = 0
+    initial_wrapped_mode_offset: int = 0
+    initial_wrapped_mode: int = 0
+    initial_mode: int = 0
     capsules: list[Capsule] = field(default_factory=list)
     blocks: list[Block] = field(default_factory=list)
     children: list["Prototype"] = field(default_factory=list)
@@ -1158,6 +1165,40 @@ def chunk_chain_key(
     return (value * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
 
 
+def initial_dialect_mode_key(
+    entry_state: int, current_chunk_state: int, block_start: int, prototype: Prototype,
+) -> int:
+    return (
+        (((prototype.k1 * 65537 + prototype.k2 * 257 + prototype.k3
+            + FLOW_DOMAIN + prototype.binding) & MASK32)
+         * LCG_MULTIPLIER + LCG_INCREMENT) & MASK32
+        ^ entry_state
+        ^ rotate16(current_chunk_state)
+        ^ ((block_start * 65537) & MASK32)
+        ^ 0x0D1A1EC7
+    ) & MASK32
+
+
+def dialect_mode_key(
+    source_entry_state: int,
+    source_chunk_state: int,
+    target_entry_state: int,
+    target_chunk_state: int,
+    from_pc: int,
+    to_pc: int,
+    prototype: Prototype,
+) -> int:
+    return (
+        flow_key(source_entry_state, from_pc, to_pc, prototype)
+        ^ chunk_chain_key(
+            source_chunk_state, source_entry_state, from_pc, to_pc, prototype
+        )
+        ^ rotate16(target_entry_state)
+        ^ target_chunk_state
+        ^ 0x91E10DA5
+    ) & MASK32
+
+
 def recover_entry_state(verifier: int, block_start: int, prototype: Prototype) -> int:
     to_pc = block_start ^ FLOW_VERIFIER_MASK
     value = ((verifier - LCG_INCREMENT) * LCG_INVERSE) & MASK32
@@ -1195,12 +1236,18 @@ def block_integrity(data: bytes | bytearray, prototype: Prototype, block: Block)
         absorb(word)
     for index in block.references:
         absorb(index)
+    if DIALECT_MODE_FORMAT:
+        absorb(len(block.accepted_modes))
+        for mode in block.accepted_modes:
+            absorb(mode)
     absorb(block.verifier)
     absorb(len(block.successors))
-    for destination, wrapped_state, wrapped_chunk_state in block.successors:
+    for destination, wrapped_state, wrapped_chunk_state, wrapped_mode in block.successors:
         absorb(destination)
         absorb(wrapped_state)
         absorb(wrapped_chunk_state)
+        if DIALECT_MODE_FORMAT:
+            absorb(wrapped_mode)
     encoded_body = bytes(data[block.body_start:block.body_end])
     absorb(len(encoded_body))
     for value in encoded_body:
@@ -1261,6 +1308,9 @@ def parse_prototype(
             prototype.initial_wrapped_chunk_offset = cursor.position
             prototype.initial_wrapped_chunk_state = cursor.u32()
             prototype.initial_route = cursor.u32() ^ binding
+            if DIALECT_MODE_FORMAT:
+                prototype.initial_wrapped_mode_offset = cursor.position
+                prototype.initial_wrapped_mode = cursor.u32()
             if prototype.instruction_count < 1 or block_count < 1 or block_count > prototype.instruction_count:
                 raise ValueError("invalid block/instruction count")
             for _ in range(block_count):
@@ -1269,15 +1319,28 @@ def parse_prototype(
                 route = cursor.u32()
                 reference_count = cursor.u32()
                 references = [cursor.u32() for _ in range(reference_count)]
+                accepted_mode_offsets: list[int] = []
+                if DIALECT_MODE_FORMAT:
+                    accepted_mode_count = cursor.u32()
+                    accepted_modes = []
+                    for _ in range(accepted_mode_count):
+                        accepted_mode_offsets.append(cursor.position)
+                        accepted_modes.append(cursor.u32())
+                else:
+                    accepted_modes = [0]
                 verifier = cursor.u32()
                 tag_offset = cursor.position
                 tag = cursor.u32()
                 successor_count = cursor.u32()
-                successors: list[tuple[int, int, int]] = []
+                successors: list[tuple[int, int, int, int]] = []
                 successor_offsets: list[int] = []
                 for _ in range(successor_count):
                     successor_offsets.append(cursor.position)
-                    successors.append((cursor.u32(), cursor.u32(), cursor.u32()))
+                    destination, wrapped_state, wrapped_chunk_state = (
+                        cursor.u32(), cursor.u32(), cursor.u32()
+                    )
+                    wrapped_mode = cursor.u32() if DIALECT_MODE_FORMAT else 0
+                    successors.append((destination, wrapped_state, wrapped_chunk_state, wrapped_mode))
                 body_length = cursor.u32()
                 body_start = cursor.position
                 cursor.take(body_length)
@@ -1285,6 +1348,9 @@ def parse_prototype(
                     raise ValueError("invalid block range")
                 if references != sorted(set(references)):
                     raise ValueError("invalid ordered constant references")
+                if (not 1 <= len(accepted_modes) <= 5
+                        or accepted_modes != sorted(set(accepted_modes))):
+                    raise ValueError("invalid authenticated block dialect-mode manifest")
                 destinations = [item[0] for item in successors]
                 if destinations != sorted(set(destinations)):
                     raise ValueError("invalid ordered successor records")
@@ -1292,7 +1358,7 @@ def parse_prototype(
                 if flow_key(entry_state, start_pc, start_pc ^ FLOW_VERIFIER_MASK, prototype) != verifier:
                     raise ValueError("flow verifier inversion mismatch")
                 prototype.blocks.append(
-                    Block(start_pc, count, route, references, verifier, tag, tag_offset, successors,
+                    Block(start_pc, count, route, references, accepted_modes, accepted_mode_offsets, verifier, tag, tag_offset, successors,
                           successor_offsets, body_start, cursor.position, entry_state)
                 )
         elif step == 3:
@@ -1321,13 +1387,13 @@ def parse_prototype(
             if occupied[pc]:
                 raise ValueError("overlapping instruction blocks")
             occupied[pc] = True
-        if any(destination not in starts for destination, _, _ in block.successors):
+        if any(destination not in starts for destination, _, _, _ in block.successors):
             raise ValueError("successor does not name a block start")
         if block_integrity(data, prototype, block) != block.tag:
             raise ValueError("complete block manifest authentication mismatch")
         validate_block_fragments(data, prototype, block)
         source_chunk_state = chunk_state(block.entry_state, block.start_pc, block.count, prototype)
-        for destination, wrapped_state, wrapped_chunk_state in block.successors:
+        for destination, wrapped_state, wrapped_chunk_state, wrapped_mode in block.successors:
             destination_block = next(item for item in prototype.blocks if item.start_pc == destination)
             recovered = wrapped_state ^ flow_key(
                 block.entry_state, block.start_pc + block.count - 1, destination, prototype
@@ -1349,6 +1415,19 @@ def parse_prototype(
             )
             if recovered_chunk_state != expected_chunk_state:
                 raise ValueError("attestation-bound wrapped successor chunk-state mismatch")
+            if DIALECT_MODE_FORMAT:
+                recovered_mode = wrapped_mode ^ dialect_mode_key(
+                    block.entry_state, source_chunk_state,
+                    destination_block.entry_state, expected_chunk_state,
+                    block.start_pc + block.count - 1, destination, prototype,
+                )
+                if recovered_mode == 0:
+                    raise ValueError("wrapped successor dialect mode is zero")
+                if recovered_mode not in destination_block.accepted_modes:
+                    raise ValueError("successor dialect mode is absent from target manifest")
+                block.successor_modes[destination] = recovered_mode
+            else:
+                block.successor_modes[destination] = 0
     if not prototype.blocks or not all(occupied[1:]):
         raise ValueError("instruction blocks do not cover the prototype")
     entry = next((block for block in prototype.blocks if block.start_pc == 1), None)
@@ -1362,6 +1441,16 @@ def parse_prototype(
     expected_initial_chunk_state = chunk_state(entry.entry_state, entry.start_pc, entry.count, prototype)
     if recovered_initial_chunk_state != expected_initial_chunk_state:
         raise ValueError("attestation-bound initial chunk-state mismatch")
+    if DIALECT_MODE_FORMAT:
+        prototype.initial_mode = prototype.initial_wrapped_mode ^ initial_dialect_mode_key(
+            entry.entry_state, expected_initial_chunk_state, entry.start_pc, prototype
+        )
+        if prototype.initial_mode == 0:
+            raise ValueError("initial dialect mode is zero")
+        if prototype.initial_mode not in entry.accepted_modes:
+            raise ValueError("initial dialect mode is absent from entry manifest")
+    else:
+        prototype.initial_mode = 0
     routed = [block for block in prototype.blocks if block.route_token != 0]
     if prototype.initial_route:
         if len(routed) != len(prototype.blocks) or entry.route_token != prototype.initial_route:
@@ -1420,8 +1509,17 @@ def pipeline_forward(data: bytes, layout: PayloadLayout, seed: int, nonce: int, 
 
 
 def parse_and_verify(path: Path) -> PayloadInfo:
-    global PAYLOAD_ATTESTATION
+    global PAYLOAD_ATTESTATION, DIALECT_MODE_FORMAT
     source = path.read_text("latin1")
+    chunk_candidates = list(re.finditer(
+        r"local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\s*17\s*,\s*"
+        r"[A-Za-z_]\w*\s*,\s*[A-Za-z_]\w*\s*,\s*[A-Za-z_]\w*\s*,[^;]+\);",
+        source,
+    ))
+    DIALECT_MODE_FORMAT = any(
+        len(re.findall(rf"\b{re.escape(match.group(1))}\s*\[", source[match.end():match.end() + 400])) >= 3
+        for match in chunk_candidates
+    )
     domains = extract_build_domains(source)
     activate_domains(domains)
     literals, payload = extract_payload(source)
@@ -1758,6 +1856,12 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
     patch_u32(initial_chunk_variant, info.root.tag_offset, prototype_integrity(initial_chunk_variant, info.root))
     write_body_variant(info, output_dir, "initial-chunk-state", initial_chunk_variant)
 
+    if DIALECT_MODE_FORMAT:
+        initial_mode_variant = bytearray(info.body)
+        initial_mode_variant[info.root.initial_wrapped_mode_offset] ^= 1
+        patch_u32(initial_mode_variant, info.root.tag_offset, prototype_integrity(initial_mode_variant, info.root))
+        write_body_variant(info, output_dir, "initial-dialect-mode", initial_mode_variant)
+
     # Successor chunk state: alter one wrapped chain edge while repairing both
     # its block manifest and the root prototype tag. Flow wrapping remains valid,
     # leaving the attestation/VM-state chunk chain as the rejecting boundary.
@@ -1766,13 +1870,15 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
         raise ValueError("root prototype has no successor edge for chunk-chain tamper")
     successor_chain_variant = bytearray(info.body)
     original_successors = list(chain_block.successors)
-    for successor_index, (destination, wrapped_state, wrapped_chunk_state) in enumerate(original_successors):
+    for successor_index, (destination, wrapped_state, wrapped_chunk_state, wrapped_mode) in enumerate(original_successors):
         patch_u32(
             successor_chain_variant,
             chain_block.successor_offsets[successor_index] + 8,
             wrapped_chunk_state ^ 1,
         )
-        chain_block.successors[successor_index] = (destination, wrapped_state, wrapped_chunk_state ^ 1)
+        chain_block.successors[successor_index] = (
+            destination, wrapped_state, wrapped_chunk_state ^ 1, wrapped_mode
+        )
     patch_u32(
         successor_chain_variant,
         chain_block.tag_offset,
@@ -1781,6 +1887,52 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
     chain_block.successors[:] = original_successors
     patch_u32(successor_chain_variant, info.root.tag_offset, prototype_integrity(successor_chain_variant, info.root))
     write_body_variant(info, output_dir, "successor-chunk-state", successor_chain_variant)
+
+    if DIALECT_MODE_FORMAT:
+        successor_mode_variant = bytearray(info.body)
+        for successor_index, (destination, wrapped_state, wrapped_chunk_state, wrapped_mode) in enumerate(original_successors):
+            patch_u32(
+                successor_mode_variant,
+                chain_block.successor_offsets[successor_index] + 12,
+                wrapped_mode ^ 1,
+            )
+            chain_block.successors[successor_index] = (
+                destination, wrapped_state, wrapped_chunk_state, wrapped_mode ^ 1
+            )
+        patch_u32(
+            successor_mode_variant,
+            chain_block.tag_offset,
+            block_integrity(successor_mode_variant, info.root, chain_block),
+        )
+        chain_block.successors[:] = original_successors
+        patch_u32(successor_mode_variant, info.root.tag_offset, prototype_integrity(successor_mode_variant, info.root))
+        write_body_variant(info, output_dir, "successor-dialect-mode", successor_mode_variant)
+
+        mode_manifest_block = next(
+            (block for block in info.root.blocks if block.accepted_mode_offsets), None
+        )
+        if mode_manifest_block is None:
+            raise ValueError("root prototype has no authenticated dialect-mode manifest")
+        accepted_mode_variant = bytearray(info.body)
+        original_modes = list(mode_manifest_block.accepted_modes)
+        patch_u32(
+            accepted_mode_variant,
+            mode_manifest_block.accepted_mode_offsets[0],
+            original_modes[0] ^ 1,
+        )
+        mode_manifest_block.accepted_modes[0] ^= 1
+        patch_u32(
+            accepted_mode_variant,
+            mode_manifest_block.tag_offset,
+            block_integrity(accepted_mode_variant, info.root, mode_manifest_block),
+        )
+        mode_manifest_block.accepted_modes[:] = original_modes
+        patch_u32(
+            accepted_mode_variant,
+            info.root.tag_offset,
+            prototype_integrity(accepted_mode_variant, info.root),
+        )
+        write_body_variant(info, output_dir, "block-dialect-manifest", accepted_mode_variant)
 
     # Block manifest: alter the first block's opaque body, then repair the root
     # prototype tag. Outer/envelope/prototype checks pass; the complete block tag

@@ -9,7 +9,7 @@ import re
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from runtime_layout import _code_only
+from runtime_layout import _code_only, derive_runtime_layout
 
 IDENT = r"[A-Za-z_]\w*"
 PROFILE = re.compile(
@@ -30,6 +30,7 @@ def verify(vm_path: Path, final_path: Path | None, build_log: Path) -> None:
 
     source = vm_path.read_text("latin1")
     code = _code_only(source)
+    dialect_count = int(derive_runtime_layout(source)["continuation"]["dialect_modes"])
     machines = list(re.finditer(
         rf"local\s+({IDENT})\s*=\s*(\d+)\s*;\s*(?:do\s+)?local\s+({IDENT})\s*=\s*0\s*;\s*"
         rf"(?:do\s+)?while\s+\1\s*~=\s*0\s+do\s*if\s+\3\s*>\s*(\d+)\s+then.*?end\s*;"
@@ -37,8 +38,11 @@ def verify(vm_path: Path, final_path: Path | None, build_log: Path) -> None:
         code,
         re.S,
     ))
-    if len(machines) != operators:
-        raise ValueError(f"member-token state-machine count mismatch: {len(machines)} != {operators}")
+    expected_machines = operators * dialect_count
+    if len(machines) != expected_machines:
+        raise ValueError(
+            f"member-token state-machine count mismatch: {len(machines)} != {operators} x {dialect_count}"
+        )
     tokens: list[int] = []
     for machine in machines:
         pc = machine.group(1)
@@ -50,8 +54,8 @@ def verify(vm_path: Path, final_path: Path | None, build_log: Path) -> None:
         if len(branches) != expected_width or len(set(branches)) != expected_width:
             raise ValueError(f"fusion member branches are incomplete: {branches}/{expected_width}")
         tokens.extend(branches)
-    if len(tokens) != phases or len(set(tokens)) != phases:
-        raise ValueError("fused member select/execute tokens were reused across handlers")
+    if len(tokens) != phases * dialect_count or len(set(tokens)) != phases:
+        raise ValueError("fused member select/execute token reuse does not match dialect replication")
 
     root = Path(__file__).resolve().parents[1]
     opcode = (root / "IronBrew2/Obfuscator/Opcodes/OpSuperOperator.cs").read_text()
@@ -70,7 +74,7 @@ def verify(vm_path: Path, final_path: Path | None, build_log: Path) -> None:
 
     print(
         "PASS fused member tokens: "
-        f"operators={operators}, members={members}, phases={phases}, "
+        f"operators={operators}, members={members}, phases={phases}, dialects={dialect_count}, "
         f"unique-tokens={len(set(tokens))}, signature={signature}"
     )
 

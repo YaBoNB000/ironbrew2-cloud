@@ -42,7 +42,9 @@ class AttackExecutionState:
     prototype: tuple[int, ...]
     block_start: int
     predecessors: tuple[int, ...]
+    predecessor_modes: tuple[tuple[int, int], ...]
     mode: int
+    reachable_modes: tuple[int, ...]
     physical_pc: int
     generation: int
     replay_depth: int
@@ -159,13 +161,25 @@ def _evaluate_condition(condition: str, enum_accessor: str, value: int) -> bool:
     }[operator]
 
 
-def _evaluate_selector(details: dict[str, Any], canonical: int) -> int:
-    selector = details["selector"]
+def _evaluate_selector(details: dict[str, Any], canonical: int, mode_token: int | None = None) -> int:
     state = details["dispatch_state"]
     u32 = details["dispatch_u32"]
     xor = details["dispatch_xor"]
     mask = details["dispatch_mask"]
-    enum_accessor = details["enum_accessor"]
+    dialects = details.get("dialect_modes") or []
+    if dialects and mode_token is not None:
+        dialect = next((item for item in dialects if int(item["token"]) == mode_token), None)
+        if dialect is None:
+            raise ValueError(f"unknown dialect mode token {mode_token}")
+        selector = str(dialect["selector"])
+        enum_accessor = details["dialect_enum_accessor"]
+        selector_value = (
+            canonical * int(dialect["multiplier"]) + int(dialect["addend"])
+        ) % int(dialect["modulus"])
+    else:
+        selector = details["selector"]
+        enum_accessor = details["enum_accessor"]
+        selector_value = canonical
 
     def evaluate(branch: str) -> int:
         token = _entry_token(branch, state, u32, xor, mask)
@@ -175,30 +189,44 @@ def _evaluate_selector(details: dict[str, Any], canonical: int) -> int:
         if not first_if:
             raise ValueError("opcode selector leaf has no entry assignment")
         condition, yes, no, _end = _parse_if(branch, first_if.start())
-        return evaluate(yes if _evaluate_condition(condition, enum_accessor, canonical) else no)
+        return evaluate(yes if _evaluate_condition(condition, enum_accessor, selector_value) else no)
 
     return evaluate(selector)
 
 
-def recover_handler_bodies(source: str) -> tuple[dict[int, str], dict[str, Any]]:
+def recover_dialect_handler_bodies(
+    source: str,
+) -> tuple[dict[int, dict[int, str]], dict[str, Any]]:
     layout = derive_runtime_layout(source, include_attack_details=True)
     continuation = layout["continuation"]
     details = continuation["attack_details"]
     transitions = {int(key): int(value) for key, value in details["transitions"].items()}
     terminal_bodies = {int(key): value for key, value in details["terminal_bodies"].items()}
-    handlers: dict[int, str] = {}
-    for canonical in range(int(continuation["opcodes"])):
-        token = _evaluate_selector(details, canonical)
-        seen: set[int] = set()
-        while token in transitions:
-            if token in seen:
-                raise ValueError("continuation path cycles while mapping handlers")
-            seen.add(token)
-            token = transitions[token]
-        if token not in terminal_bodies:
-            raise ValueError(f"canonical opcode {canonical} has no terminal handler")
-        handlers[canonical] = terminal_bodies[token]
-    return handlers, layout
+    mode_tokens = [int(item["token"]) for item in details.get("dialect_modes") or []] or [0]
+    dialect_handlers: dict[int, dict[int, str]] = {}
+    for mode_token in mode_tokens:
+        handlers: dict[int, str] = {}
+        for canonical in range(int(continuation["opcodes"])):
+            token = _evaluate_selector(details, canonical, mode_token)
+            seen: set[int] = set()
+            while token in transitions:
+                if token in seen:
+                    raise ValueError("continuation path cycles while mapping handlers")
+                seen.add(token)
+                token = transitions[token]
+            if token not in terminal_bodies:
+                raise ValueError(
+                    f"canonical opcode {canonical} in dialect {mode_token} has no terminal handler"
+                )
+            handlers[canonical] = terminal_bodies[token]
+        dialect_handlers[mode_token] = handlers
+    return dialect_handlers, layout
+
+
+def recover_handler_bodies(source: str) -> tuple[dict[int, str], dict[str, Any]]:
+    dialect_handlers, layout = recover_dialect_handler_bodies(source)
+    primary_mode = next(iter(dialect_handlers))
+    return dialect_handlers[primary_mode], layout
 
 
 def _decoded_columns(
@@ -814,9 +842,34 @@ def _operand_value(operand: DecodedOperand, registers: dict[int, Any]) -> Any:
 def _prototype_predecessors(prototype: payload.Prototype) -> dict[int, tuple[int, ...]]:
     predecessors: dict[int, set[int]] = {block.start_pc: set() for block in prototype.blocks}
     for source in prototype.blocks:
-        for successor_start, _wrapped_state, _wrapped_chunk_state in source.successors:
+        for successor_start, _wrapped_state, _wrapped_chunk_state, _wrapped_mode in source.successors:
             predecessors.setdefault(successor_start, set()).add(source.start_pc)
     return {start: tuple(sorted(sources)) for start, sources in predecessors.items()}
+
+
+def _prototype_modes(
+    prototype: payload.Prototype,
+) -> dict[int, tuple[tuple[int, ...], tuple[tuple[int, int], ...]]]:
+    incoming: dict[int, list[tuple[int, int]]] = {
+        block.start_pc: [] for block in prototype.blocks
+    }
+    for source in prototype.blocks:
+        for destination, mode in source.successor_modes.items():
+            incoming.setdefault(destination, []).append((source.start_pc, mode))
+    result: dict[int, tuple[tuple[int, ...], tuple[tuple[int, int], ...]]] = {}
+    for block in prototype.blocks:
+        predecessor_modes = tuple(sorted(incoming.get(block.start_pc, [])))
+        modes = {mode for _predecessor, mode in predecessor_modes}
+        if block.start_pc == 1:
+            modes.add(prototype.initial_mode or 0)
+        if not modes:
+            modes.update(block.accepted_modes)
+        if modes != set(block.accepted_modes):
+            raise ValueError(
+                f"block {block.start_pc} reachable modes disagree with authenticated manifest"
+            )
+        result[block.start_pc] = (tuple(sorted(modes)), predecessor_modes)
+    return result
 
 
 def _column_state_fingerprint(
@@ -837,12 +890,14 @@ def _column_state_fingerprint(
 def recover_logical_instructions(
     info: payload.PayloadInfo,
     handlers: dict[int, str],
-    classifications: dict[int, list[dict[str, Any]]],
+    dialect_classifications: dict[int, dict[int, list[dict[str, Any]]]],
+    primary_mode: int,
 ) -> list[LogicalInstruction]:
     instructions: list[LogicalInstruction] = []
     virtual_count = len(handlers)
     for proto_path, prototype in baseline.prototypes(info.root):
         predecessors = _prototype_predecessors(prototype)
+        block_modes = _prototype_modes(prototype)
         opcode_rows = {
             row["pc"]: row
             for row in baseline.decode_opcodes(info, prototype, proto_path, virtual_count)
@@ -856,7 +911,30 @@ def recover_logical_instructions(
                 canonical = int(opcode_rows[pc]["canonical_id"])
                 members = decode_instruction_members(info, prototype, block, offset)
                 column_state = _column_state_fingerprint(info, prototype, block, offset)
-                semantics = classifications[canonical]
+                reachable_modes, predecessor_modes = block_modes[block.start_pc]
+                available_modes = tuple(
+                    mode for mode in reachable_modes if mode in dialect_classifications
+                )
+                if not available_modes:
+                    available_modes = (primary_mode,)
+                alternatives = [
+                    dialect_classifications[mode][canonical] for mode in available_modes
+                ]
+                widths = {len(items) for items in alternatives}
+                if len(widths) != 1:
+                    raise ValueError(f"dialect handler widths disagree at {proto_path}:{pc}")
+                semantics: list[dict[str, Any]] = []
+                for member_index in range(next(iter(widths))):
+                    candidates = [items[member_index] for items in alternatives]
+                    known = {item["semantic"] for item in candidates if item["semantic"] != "UNKNOWN"}
+                    if len(known) > 1:
+                        raise ValueError(
+                            f"dialect classifier found conflicting semantics at {proto_path}:{pc}.{member_index}: {known}"
+                        )
+                    selected = next(
+                        (item for item in candidates if item["semantic"] != "UNKNOWN"), candidates[0]
+                    )
+                    semantics.append(selected)
                 if len(members) != len(semantics):
                     raise ValueError(
                         f"fused handler width mismatch at {proto_path}:{pc}: "
@@ -880,11 +958,16 @@ def recover_logical_instructions(
                             prototype=proto_path,
                             block_start=block.start_pc,
                             predecessors=predecessors.get(block.start_pc, ()),
-                            mode=0,
+                            predecessor_modes=predecessor_modes,
+                            mode=available_modes[0],
+                            reachable_modes=available_modes,
                             physical_pc=pc,
                             generation=0,
                             replay_depth=0,
-                            selector_lane="canonical-opcode",
+                            selector_lane=(
+                                "canonical-opcode" if available_modes == (0,)
+                                else f"dialect-affine:{available_modes[0]}"
+                            ),
                             column_state=column_state,
                         ),
                         prototype=proto_path,
@@ -1001,12 +1084,23 @@ def render_dataflow(instructions: list[LogicalInstruction]) -> tuple[list[str], 
 
 def analyze_decompiler(path: Path) -> DecompilerReport:
     info = payload.parse_and_verify(path)
-    handlers, layout = recover_handler_bodies(info.source)
+    dialect_handlers, layout = recover_dialect_handler_bodies(info.source)
+    primary_mode = next(iter(dialect_handlers))
+    handlers = dialect_handlers[primary_mode]
     code = _code_only(info.source)
     call_name, call_modes = recover_call_modes(code, handlers, layout)
     fragments = recover_fragment_names(code, handlers, layout, call_name)
-    classifications, fused_programs = classify_handlers(handlers, layout, fragments, call_modes)
-    instructions = recover_logical_instructions(info, handlers, classifications)
+    dialect_classifications: dict[int, dict[int, list[dict[str, Any]]]] = {}
+    fused_programs = 0
+    for mode_token, mode_handlers in dialect_handlers.items():
+        mode_classifications, mode_fused = classify_handlers(
+            mode_handlers, layout, fragments, call_modes
+        )
+        dialect_classifications[mode_token] = mode_classifications
+        fused_programs = max(fused_programs, mode_fused)
+    instructions = recover_logical_instructions(
+        info, handlers, dialect_classifications, primary_mode
+    )
     rendered, counts = render_dataflow(instructions)
     recovered_string_set: set[str] = set()
     for _prototype_path, prototype in baseline.prototypes(info.root):
@@ -1017,18 +1111,26 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
     recovered_strings = sorted(recovered_string_set)
 
     unique_states: dict[tuple[Any, ...], AttackExecutionState] = {}
+    recovered_modes: set[int] = set()
+    recovered_selector_lanes: set[str] = set()
+    mode_edges: set[tuple[tuple[int, ...], int, int, int]] = set()
     for instruction in instructions:
         state = instruction.state
-        key = (
-            state.prototype, state.block_start, state.mode, state.physical_pc,
-            state.generation, state.selector_lane, state.column_state,
-        )
-        unique_states.setdefault(key, state)
+        recovered_modes.update(state.reachable_modes)
+        for predecessor, target_mode in state.predecessor_modes:
+            if target_mode != 0:
+                mode_edges.add((state.prototype, predecessor, state.block_start, target_mode))
+        for mode in state.reachable_modes:
+            recovered_selector_lanes.add(
+                "canonical-opcode" if mode == 0 else f"dialect-affine:{mode}"
+            )
+            key = (
+                state.prototype, state.block_start, mode, state.physical_pc,
+                state.generation, state.selector_lane, state.column_state,
+            )
+            unique_states.setdefault(key, state)
     ordered_states = list(unique_states.values())
-    mode_transitions = sum(
-        left.prototype == right.prototype and left.mode != right.mode
-        for left, right in zip(ordered_states, ordered_states[1:])
-    )
+    mode_transitions = len(mode_edges)
     replay_transitions = sum(
         left.prototype == right.prototype
         and left.physical_pc == right.physical_pc
@@ -1057,12 +1159,12 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
         classified_instructions=classified,
         unknown_instructions=len(instructions) - classified,
         block_predecessor_edges=len(predecessor_edges),
-        dialect_modes=sorted({state.mode for state in ordered_states}),
+        dialect_modes=sorted(recovered_modes),
         mode_transitions=mode_transitions,
         generations=sorted({state.generation for state in ordered_states}),
         max_generation=max((state.generation for state in ordered_states), default=0),
         replay_transitions=replay_transitions,
-        selector_lanes=sorted({state.selector_lane for state in ordered_states}),
+        selector_lanes=sorted(recovered_selector_lanes),
         fused_programs=fused_programs,
         fused_members=sum(instruction.fused for instruction in instructions),
         calls=counts["calls"],

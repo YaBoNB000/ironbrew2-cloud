@@ -80,6 +80,12 @@ namespace IronBrew2.Obfuscator
 		public uint[] TableWriteTokens;
 		public uint[] TableCommitTokens;
 		public uint[] CallModeTokens;
+		// P1 dialect lattice: all modes coexist in one generated VM. Blocks/edges
+		// carry authenticated wrapped tokens; the dispatcher emits independent
+		// continuation/handler recipes for every token.
+		public int DialectModeCount;
+		public uint[] DialectModeTokens;
+		public HashSet<uint> DialectModesUsed = new HashSet<uint>();
 
 		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|attestation token)，
 		// 序列化头部只写盐，VM 端严格探针成功后才派生同一种子。
@@ -109,6 +115,18 @@ namespace IronBrew2.Obfuscator
 
 			BuildRandom schemaRandom = Seed.GetStream("bytecode.schema");
 			MaxBlockInstructions = 3 + schemaRandom.Next(4);
+
+			BuildRandom dialectRandom = Seed.GetStream("vm.dialect");
+			DialectModeCount = 3 + dialectRandom.Next(3);
+			DialectModeTokens = new uint[DialectModeCount];
+			var dialectTokens = new HashSet<uint>();
+			for (int index = 0; index < DialectModeTokens.Length; index++)
+			{
+				uint token;
+				do token = dialectRandom.NextUInt32(); while (token == 0 || !dialectTokens.Add(token));
+				DialectModeTokens[index] = token;
+			}
+
 			InstructionSteps1 = Enumerable.Range(0, (int) InstructionStep1.StepCount).Select(i => (InstructionStep1) i).ToArray();
 			InstructionSteps1.Shuffle(schemaRandom);
 			

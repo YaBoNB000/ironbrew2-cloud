@@ -537,6 +537,19 @@ local function ChunkChainKey(SourceChunkState, SourceEntryState, FromPC, ToPC, K
     return (U32Mul(Value, 1664525) + 1013904223) % 4294967296;
 end;
 
+local function InitialDialectModeKey(EntryState, CurrentChunkState, BlockStart, K1, K2, K3)
+    return U32(BitXOR(BitXOR(BitXOR(BitXOR(InitialFlowKey(K1, K2, K3), EntryState),
+        PayloadRotate16(CurrentChunkState)), (BlockStart * 65537) % 4294967296), 219815623));
+end;
+
+local function DialectModeKey(SourceEntryState, SourceChunkState, TargetEntryState,
+    TargetChunkState, FromPC, ToPC, K1, K2, K3)
+    return U32(BitXOR(BitXOR(BitXOR(BitXOR(
+        FlowKey(SourceEntryState, FromPC, ToPC, K1, K2, K3),
+        ChunkChainKey(SourceChunkState, SourceEntryState, FromPC, ToPC, K1, K2, K3)),
+        PayloadRotate16(TargetEntryState)), TargetChunkState), 2447445413));
+end;
+
 local function BlockFieldKey(EntryState, I, Slot, K1, K2, K3)
     local Low = EntryState % 65536;
     local High = (EntryState - Low) / 65536;
@@ -706,10 +719,13 @@ local function ComputeBlockIntegrity(Body, EntryState, BlockStart, Count, RouteT
     local HeaderWords = {BlockStart, Count, K1, K2, K3, RouteToken, #References};
     for HeaderIndex = 1, #HeaderWords do Absorb(HeaderWords[HeaderIndex]); end;
     for ReferenceIndex = 1, #References do Absorb(References[ReferenceIndex]); end;
+    local AcceptedModes = References[0] or {};
+    Absorb(#AcceptedModes);
+    for AcceptedModeIndex = 1, #AcceptedModes do Absorb(AcceptedModes[AcceptedModeIndex]); end;
     Absorb(Verifier); Absorb(#SuccessorRecords);
     for SuccessorIndex = 1, #SuccessorRecords do
         local SuccessorRecord = SuccessorRecords[SuccessorIndex];
-        Absorb(SuccessorRecord[1]); Absorb(SuccessorRecord[2]); Absorb(SuccessorRecord[3]);
+        Absorb(SuccessorRecord[1]); Absorb(SuccessorRecord[2]); Absorb(SuccessorRecord[3]); Absorb(SuccessorRecord[4]);
     end;
     Absorb(#Body);
     for I = 1, #Body do Absorb(Byte(Body, I, I)); end;
@@ -806,7 +822,7 @@ local function Deserialize()
     local K2 = gBits16();
     local K3 = gBits16();
     local PrototypeTag = gBits32();
-    local Chunk = NewPrototypeRecord(16, K1, K2, K3, PrototypeLength);
+    local Chunk = NewPrototypeRecord(17, K1, K2, K3, PrototypeLength);
     Chunk[1] = Instrs;
     Chunk[2] = Functions;
     Chunk[4] = Lines;
