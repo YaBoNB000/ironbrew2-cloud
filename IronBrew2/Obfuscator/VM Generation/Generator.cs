@@ -118,6 +118,86 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			public int CarrierTopology { get; init; }
 			public int AssemblyTopology { get; init; }
 			public int[] StageCounts { get; init; }
+			public string[] EncodedSegments { get; init; }
+		}
+
+		private static string RewriteExecutableLuaSpans(string code, Func<string, string> rewriteCode)
+		{
+			if (code == null) throw new ArgumentNullException(nameof(code));
+			if (rewriteCode == null) throw new ArgumentNullException(nameof(rewriteCode));
+
+			var rewritten = new StringBuilder(code.Length);
+			int plainStart = 0;
+			int index = 0;
+
+			int LongBracketLevel(int at)
+			{
+				if (at >= code.Length || code[at] != '[') return -1;
+				int cursor = at + 1;
+				while (cursor < code.Length && code[cursor] == '=') cursor++;
+				return cursor < code.Length && code[cursor] == '[' ? cursor - at - 1 : -1;
+			}
+
+			int LongBracketEnd(int at, int level)
+			{
+				string close = "]" + new string('=', level) + "]";
+				int contentStart = at + level + 2;
+				int closeAt = code.IndexOf(close, contentStart, StringComparison.Ordinal);
+				return closeAt < 0 ? code.Length : closeAt + close.Length;
+			}
+
+			void Preserve(int start, int end)
+			{
+				rewritten.Append(rewriteCode(code.Substring(plainStart, start - plainStart)));
+				rewritten.Append(code, start, end - start);
+				plainStart = end;
+				index = end;
+			}
+
+			while (index < code.Length)
+			{
+				char current = code[index];
+				if (current == '\'' || current == '"')
+				{
+					char quote = current;
+					int end = index + 1;
+					while (end < code.Length)
+					{
+						if (code[end] == '\\')
+						{
+							end = Math.Min(code.Length, end + 2);
+							continue;
+						}
+						if (code[end++] == quote) break;
+					}
+					Preserve(index, end);
+					continue;
+				}
+
+				if (current == '-' && index + 1 < code.Length && code[index + 1] == '-')
+				{
+					int commentBody = index + 2;
+					int level = LongBracketLevel(commentBody);
+					int end = level >= 0 ? LongBracketEnd(commentBody, level) : code.IndexOf('\n', commentBody);
+					if (end < 0) end = code.Length;
+					Preserve(index, end);
+					continue;
+				}
+
+				if (current == '[')
+				{
+					int level = LongBracketLevel(index);
+					if (level >= 0)
+					{
+						Preserve(index, LongBracketEnd(index, level));
+						continue;
+					}
+				}
+				index++;
+			}
+
+			rewritten.Append(rewriteCode(code.Substring(plainStart)));
+			return rewritten.ToString();
 		}
 
 		internal static string[] SplitDataSegs(string data, Random r)
@@ -300,7 +380,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				SegmentCount = count,
 				CarrierTopology = carrierTopology,
 				AssemblyTopology = assemblyTopology,
-				StageCounts = stageCounts
+				StageCounts = stageCounts,
+				EncodedSegments = segments
 			};
 		}
 
@@ -1170,81 +1251,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 						: match.Value;
 				});
 
-				// Do not let an identifier-looking sequence inside a base91 payload,
-				// watermark, quoted literal, long string or comment mutate protected data.
-				// Only executable Lua spans are eligible for numeric ABI rewriting.
-				var rewritten = new StringBuilder(code.Length);
-				int plainStart = 0;
-				int index = 0;
-
-				int LongBracketLevel(int at)
-				{
-					if (at >= code.Length || code[at] != '[') return -1;
-					int cursor = at + 1;
-					while (cursor < code.Length && code[cursor] == '=') cursor++;
-					return cursor < code.Length && code[cursor] == '[' ? cursor - at - 1 : -1;
-				}
-
-				int LongBracketEnd(int at, int level)
-				{
-					string close = "]" + new string('=', level) + "]";
-					int contentStart = at + level + 2;
-					int closeAt = code.IndexOf(close, contentStart, StringComparison.Ordinal);
-					return closeAt < 0 ? code.Length : closeAt + close.Length;
-				}
-
-				void Preserve(int start, int end)
-				{
-					rewritten.Append(RewriteCode(code.Substring(plainStart, start - plainStart)));
-					rewritten.Append(code, start, end - start);
-					plainStart = end;
-					index = end;
-				}
-
-				while (index < code.Length)
-				{
-					char current = code[index];
-					if (current == '\'' || current == '"')
-					{
-						char quote = current;
-						int end = index + 1;
-						while (end < code.Length)
-						{
-							if (code[end] == '\\')
-							{
-								end = Math.Min(code.Length, end + 2);
-								continue;
-							}
-							if (code[end++] == quote) break;
-						}
-						Preserve(index, end);
-						continue;
-					}
-
-					if (current == '-' && index + 1 < code.Length && code[index + 1] == '-')
-					{
-						int commentBody = index + 2;
-						int level = LongBracketLevel(commentBody);
-						int end = level >= 0 ? LongBracketEnd(commentBody, level) : code.IndexOf('\n', commentBody);
-						if (end < 0) end = code.Length;
-						Preserve(index, end);
-						continue;
-					}
-
-					if (current == '[')
-					{
-						int level = LongBracketLevel(index);
-						if (level >= 0)
-						{
-							Preserve(index, LongBracketEnd(index, level));
-							continue;
-						}
-					}
-					index++;
-				}
-
-				rewritten.Append(RewriteCode(code.Substring(plainStart)));
-				return rewritten.ToString();
+				// ABI rewriting is executable-code-only. Payload, watermark and other
+				// quoted or commented bytes must remain byte-for-byte stable.
+				return RewriteExecutableLuaSpans(code, RewriteCode);
 			}
 
 			string ApplyVMLayout(string code, VMLayout layout)
@@ -3598,10 +3607,13 @@ return Wrap(Root, {}, DisabledGlobalEnvironment);";
 			vm += T(finalRuntime);
 			vm = RewritePayloadRejects(vm);
 
-			vm = vm.Replace("OP_ENUM", "1")
+			// Placeholder lowering must never inspect carrier/string bytes: Base91 can
+			// naturally contain OP_A/OP_B/OP_C, and a global Replace corrupts the
+			// authenticated payload before it reaches the runtime decoder.
+			vm = RewriteExecutableLuaSpans(vm, segment => segment.Replace("OP_ENUM", "1")
 				.Replace("OP_A", "2")
 				.Replace("OP_B", "3")
-				.Replace("OP_C", "4");
+				.Replace("OP_C", "4"));
 
 			// Build-wide runtime ABI randomization. All table constructors above use
 			// explicit keyed assignments, so these independent permutations cover every
@@ -3653,6 +3665,18 @@ return Wrap(Root, {}, DisabledGlobalEnvironment);";
 				+ "-" + _context.GenerationMaximum
 				+ "; families=" + generationFamilies
 				+ "; signature=" + _context.GenerationProgramSignature.ToString("x8") + ".");
+
+			// Fail the build rather than ship a carrier damaged by any future source-
+			// wide rewrite. Exact literals must survive in their authenticated order.
+			int encodedSegmentCursor = 0;
+			foreach (string segment in payloadCarrier.EncodedSegments)
+			{
+				string literal = "'" + segment + "'";
+				int found = vm.IndexOf(literal, encodedSegmentCursor, StringComparison.Ordinal);
+				if (found < 0)
+					throw new InvalidOperationException("Payload carrier bytes changed during VM source rewriting.");
+				encodedSegmentCursor = found + literal.Length;
+			}
 
 			return vm;
 		}

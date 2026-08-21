@@ -22,6 +22,7 @@ def verify(generated: Path, generated_vm: Path | None, require_chain: bool = Fal
     multi_shard = 0
     shard_counts: set[int] = set()
     chained_strings = 0
+    short_chain_collisions = 0
     for _, proto in prototypes(info.root):
         tags = payload.derive_permutation(
             4, proto.k1, proto.k2, proto.k3, payload.CONSTANT_TAG_DOMAIN
@@ -44,8 +45,15 @@ def verify(generated: Path, generated_vm: Path | None, require_chain: bool = Fal
                 independent_capsule = replace(capsule, chain_state=initial_chain)
                 independent, _ = payload.decode_string_shards(raw, capsule.index, proto, independent_capsule)
                 if independent == decoded:
-                    raise ValueError("a chained string still decodes from its capsule independently")
-                chained_strings += 1
+                    # A one-to-three-byte string has only 0–24 observable mask bits,
+                    # so two distinct 32-bit chain states can legitimately collide.
+                    # Treat a longer equality as a broken chain, while the fixture-
+                    # level requirement below still demands a real dependent decode.
+                    if len(decoded) >= 4:
+                        raise ValueError("a chained multi-byte string still decodes from its capsule independently")
+                    short_chain_collisions += 1
+                else:
+                    chained_strings += 1
             shard_counts.add(shard_count)
             if len(decoded) > 1:
                 multi_shard += 1
@@ -99,6 +107,7 @@ def verify(generated: Path, generated_vm: Path | None, require_chain: bool = Fal
     print(
         "PASS sharded string capsules: "
         f"strings={strings}, multi-shard={multi_shard}, chained={chained_strings}, "
+        f"short-chain-collisions={short_chain_collisions}, "
         f"shard-counts={sorted(shard_counts)}, outer-unmask=inner-ciphertext"
     )
 

@@ -272,6 +272,8 @@ generation-program payload tamper
 
 重读本 MD 后确认：P2 没有弱化 block/prototype/capsule authentication，没有把 payload 改成共享可写状态，没有恢复固定四阶段 replay，也没有提前实施 selector lane migration或 capability graph。为避免 Lua 5.1 signed/AsBx、RK handle 和 NaN 精度倒退，本阶段只改写共同安全的 16-bit opcode/A carrier；B/C、descriptor-role 与 fused-view rewrite 保留为后续可选 family，只有建立对应宽度/类型证明后才能加入。四种 family 都进入真实 generation seal/data dependency，不是纯 MBA decoy。
 
+P2 收尾稳定性复核还定位并删除了一条会破坏上述 immutable payload 边界的既有全局重写：payload carrier 注入后，最终 `OP_A/OP_B/OP_C/OP_ENUM` lowering 曾对整份 Lua source 执行字符串替换；随机 Base91 carrier 一旦自然包含同名字节序列，payload 会在 outer tag 检查前被改坏。现统一使用只改写 Lua executable spans 的词法扫描器，单/双引号、转义字符串、long string、行注释和 long comment 均原样保留，并加入确定性 collision 回归。该修复只消除生成器自损坏路径，不把随机 build failure 当防护收益，也没有增加新 magic、共享状态或 plaintext lifetime。
+
 完整 `IB2_RANDOM_RUNS=20` 已通过；20 个 generation programs 全部唯一，所有 build 覆盖 2–5 generations 和 families 0/1/2/3。下一步是 P3；完成后再次重读本 MD。
 
 ### P3：mode-dependent selector lane migration（批准，与 P2 同一里程碑交付）
