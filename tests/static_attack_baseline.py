@@ -198,7 +198,9 @@ def decode_opcodes(
                         "fused_members": block.fused_counts[offset],
                         "logical_width": 1 + block.fused_counts[offset],
                         "generation_count": len(generation_program),
-                        "generation_families": [family for family, _mask in generation_program],
+                        "generation_families": [record[0] for record in generation_program],
+                        "selector_lane_program": [record[2] for record in generation_program],
+                        "selector_recipe_tokens": [record[3] for record in generation_program],
                         "generation_trace": [list(values) for values in generation_trace],
                     }
                 )

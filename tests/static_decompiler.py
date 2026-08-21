@@ -50,6 +50,7 @@ class AttackExecutionState:
     replay_depth: int
     generation_trace: tuple[str, ...]
     selector_lane: str
+    selector_lane_trace: tuple[str, ...]
     column_state: str
 
 
@@ -87,6 +88,7 @@ class DecompilerReport:
     max_generation: int
     replay_transitions: int
     selector_lanes: list[str]
+    selector_lane_transitions: int
     fused_programs: int
     fused_members: int
     calls: int
@@ -892,6 +894,25 @@ def _column_state_fingerprint(
     return hashlib.sha256(material).hexdigest()[:16]
 
 
+SELECTOR_LANE_NAMES = {
+    0: "opcode-carrier",
+    1: "descriptor-digest",
+    2: "supplemental-operands",
+    3: "mode-synthetic",
+}
+
+
+def _selector_lane_trace(generation_trace: list[list[int]], mode: int) -> tuple[str, ...]:
+    if len(generation_trace) <= 1:
+        return ("canonical-opcode" if mode == 0 else f"dialect-affine:{mode}",)
+    lanes = [SELECTOR_LANE_NAMES[0]]
+    for values in generation_trace[1:]:
+        raw_lane = int(values[2])
+        effective_lane = 1 + ((raw_lane - 1 + mode % 3) % 3)
+        lanes.append(SELECTOR_LANE_NAMES[effective_lane])
+    return tuple(lanes)
+
+
 def recover_logical_instructions(
     info: payload.PayloadInfo,
     handlers: dict[int, str],
@@ -920,7 +941,8 @@ def recover_logical_instructions(
                 column_state = _column_state_fingerprint(info, prototype, block, offset)
                 generation_fingerprints = tuple(
                     hashlib.sha256(
-                        f"{column_state}:{values[0]}:{values[1]}".encode("ascii")
+                        f"{column_state}:".encode("ascii")
+                        + ":".join(map(str, values)).encode("ascii")
                     ).hexdigest()[:16]
                     for values in generation_trace
                 )
@@ -931,6 +953,7 @@ def recover_logical_instructions(
                 )
                 if not available_modes:
                     available_modes = (primary_mode,)
+                selector_lane_trace = _selector_lane_trace(generation_trace, available_modes[0])
                 alternatives = [
                     dialect_classifications[mode][canonical] for mode in available_modes
                 ]
@@ -979,10 +1002,8 @@ def recover_logical_instructions(
                             generation=int(opcode_row.get("generation_count", 0)),
                             replay_depth=int(opcode_row.get("generation_count", 0)),
                             generation_trace=generation_fingerprints or (column_state,),
-                            selector_lane=(
-                                "canonical-opcode" if available_modes == (0,)
-                                else f"dialect-affine:{available_modes[0]}"
-                            ),
+                            selector_lane=selector_lane_trace[-1],
+                            selector_lane_trace=selector_lane_trace,
                             column_state=column_state,
                         ),
                         prototype=proto_path,
@@ -1130,6 +1151,7 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
     recovered_selector_lanes: set[str] = set()
     recovered_generations: set[int] = set()
     replay_transitions = 0
+    selector_lane_transitions = 0
     replay_bases: set[tuple[tuple[int, ...], int, int]] = set()
     mode_edges: set[tuple[tuple[int, ...], int, int, int]] = set()
     for instruction in instructions:
@@ -1138,21 +1160,24 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
         for predecessor, target_mode in state.predecessor_modes:
             if target_mode != 0:
                 mode_edges.add((state.prototype, predecessor, state.block_start, target_mode))
+        recovered_selector_lanes.update(state.selector_lane_trace)
         for mode in state.reachable_modes:
-            recovered_selector_lanes.add(
-                "canonical-opcode" if mode == 0 else f"dialect-affine:{mode}"
-            )
             for generation, generation_state in enumerate(state.generation_trace):
                 recovered_generations.add(generation)
+                selector_lane = state.selector_lane_trace[min(generation, len(state.selector_lane_trace) - 1)]
                 key = (
                     state.prototype, state.block_start, mode, state.physical_pc,
-                    generation, state.selector_lane, generation_state,
+                    generation, selector_lane, generation_state,
                 )
                 unique_states.setdefault(key, state)
             replay_base = (state.prototype, state.physical_pc, mode)
             if replay_base not in replay_bases:
                 replay_bases.add(replay_base)
                 replay_transitions += max(0, len(state.generation_trace) - 1)
+                selector_lane_transitions += sum(
+                    left != right
+                    for left, right in zip(state.selector_lane_trace, state.selector_lane_trace[1:])
+                )
     ordered_states = list(unique_states.values())
     mode_transitions = len(mode_edges)
     predecessor_edges = {
@@ -1169,7 +1194,7 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
         serialized.append(record)
     return DecompilerReport(
         file=str(path),
-        state_model_version=1,
+        state_model_version=2,
         prototypes=sum(1 for _ in baseline.prototypes(info.root)),
         physical_instructions=sum(prototype.instruction_count for _, prototype in baseline.prototypes(info.root)),
         logical_instructions=len(instructions),
@@ -1183,6 +1208,7 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
         max_generation=max(recovered_generations, default=0),
         replay_transitions=replay_transitions,
         selector_lanes=sorted(recovered_selector_lanes),
+        selector_lane_transitions=selector_lane_transitions,
         fused_programs=fused_programs,
         fused_members=sum(instruction.fused for instruction in instructions),
         calls=counts["calls"],
@@ -1287,6 +1313,7 @@ def main() -> int:
             f"physical/logical={report.physical_instructions}/{report.logical_instructions} "
             f"states={report.execution_states} modes={len(report.dialect_modes)} "
             f"generations={len(report.generations)} replay={report.replay_transitions} "
+            f"selector-migrations={report.selector_lane_transitions} "
             f"classified={report.classified_instructions} fused={report.fused_programs}/{report.fused_members} "
             f"calls={report.calls} self={report.self_calls} tables={report.new_tables}/{report.table_writes} "
             f"discarded={report.discarded_calls} returns={report.returns}"

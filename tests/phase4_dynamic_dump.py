@@ -64,12 +64,14 @@ def instrument(vm_path: Path, payload_path: Path) -> str:
     fetch_declarations = list(re.finditer(
         rf"local\s+function\s+({IDENT})\s*\(([^)]*)\)", code[:cache_assignment.start()]
     ))
-    if not fetch_declarations:
-        fail("could not recover GetInstruction")
-    fetch_decl = fetch_declarations[-1]
-    fetch_params = [value.strip() for value in fetch_decl.group(2).split(",")]
-    if len(fetch_params) != 4:
-        fail("GetInstruction no longer has Chunk/Index/Flow/materializer inputs")
+    fetch_candidates = [
+        (declaration, [value.strip() for value in declaration.group(2).split(",")])
+        for declaration in fetch_declarations
+        if len([value.strip() for value in declaration.group(2).split(",")]) == 4
+    ]
+    if not fetch_candidates:
+        fail("could not recover four-input GetInstruction")
+    fetch_decl, fetch_params = fetch_candidates[-1]
     fetch_end = re.search(
         rf"return\s+({IDENT})(?:\s*,\s*{IDENT})?\s*;\s*end\s*;",
         code[cache_assignment.end():],
@@ -156,6 +158,9 @@ def instrument(vm_path: Path, payload_path: Path) -> str:
         fail("paged payload source cleanup assignment not found")
 
     expected_body = len(info.body)
+    def prototype_count(prototype) -> int:
+        return 1 + sum(prototype_count(child) for child in prototype.children)
+    expected_prototypes = prototype_count(info.root)
     probe = f"""-- Phase 4 test-only dynamic observer; never emitted in out.lua.
 local __p4_native_print=print;
 local __p4_stats={{pages=0,page_bytes=0,max_page=0,instructions=0,max_fields=0,max_constants=0,current_constants=0,current_constant_limit=0,instruction_ready=false,peak_kb=0,post_deserialize_kb=0}};
@@ -227,7 +232,7 @@ local function __p4_finalize(root)
     assert(__p4_stats.pages>=2 and __p4_stats.page_bytes=={expected_body} and __p4_stats.max_page<{expected_body},'complete plaintext payload existed as one page');
     assert(__p4_stats.instructions>0 and live==0,'plaintext instruction record outlived VM execution');
     assert(__p4_stats.max_fields<=7 and __p4_stats.max_constants>=1 and __p4_stats.max_constants<=30,'handler-use constant/fusion/generation material escaped operand lifetime');
-    assert(decoded>=2 and opaque_children>=1,'executing one child recovered sibling Chunks');
+    assert(decoded>=2 and (opaque_children>=1 or decoded=={expected_prototypes}),'executed prototype coverage lost lazy sibling isolation');
     assert(opaque_blocks>=decoded,'normal execution recovered the complete VM buffer');
     assert(total_constants>__p4_stats.max_constants,'constant pool collapsed into one instruction lifetime');
     assert(__p4_stats.peak_kb-final_kb>=32,'paged source/plaintext memory was not released promptly');

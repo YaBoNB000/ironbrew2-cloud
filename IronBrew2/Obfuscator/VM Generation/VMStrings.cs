@@ -887,10 +887,7 @@ local function Wrap(Chunk, Upvalues, Env)
 				while true do
 					__IB2_GUARD_CHECK__
 					InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
-			Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);
-			if Enum == nil then
-				Enum = OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];
-			end;";
+			Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);";
 
 		public static string VMP2_R = @"
 local InternalError = error;
@@ -937,10 +934,7 @@ local function Wrap(Chunk, Upvalues, Env)
 				repeat
 					__IB2_GUARD_CHECK__
 					InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
-			Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);
-			if Enum == nil then
-				Enum = OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];
-			end;";
+			Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);";
 
 		public static string VMP3 = @"
 			InstrPoint	= InstrPoint + 1;
@@ -1011,10 +1005,7 @@ local function Wrap(Chunk, Upvalues, Env)
 			while true do
 				__IB2_GUARD_CHECK__
 				InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
-				Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);
-				if Enum == nil then
-					Enum = OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];
-				end;";
+				Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);";
 		
 		public static string VMP2_LI_R = @"
 local InternalError = error;
@@ -1063,10 +1054,7 @@ local function Wrap(Chunk, Upvalues, Env)
 			repeat
 				__IB2_GUARD_CHECK__
 				InstrPoint = ResolveInstructionPoint(Chunk, InstrPoint, Flow);
-				Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);
-				if Enum == nil then
-					Enum = OpcodeBank[BitXOR(BitXOR(Inst[OP_ENUM], OpcodeKey(InstrPoint, K1, K2, K3)), BlockFieldKey(Flow[3], InstrPoint, 0, K1, K2, K3)) + 1];
-				end;";
+				Inst, Enum	= GetInstruction(Chunk, InstrPoint, Flow, true);";
 		
 		public static string VMP3_LI = @"
 				InstrPoint	= InstrPoint + 1;

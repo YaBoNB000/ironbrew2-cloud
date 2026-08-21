@@ -84,8 +84,9 @@ cp "$ROOT/temp/t2.lua" "$WORK/fixed-vm.lua"
 python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
 python3 tests/materializer_replay.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/selector_lane_migration.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/generation_replay_tamper.py "$WORK/fixed-vm.lua" "$WORK"
-for generation_case in skip duplicate mask reorder; do
+for generation_case in skip duplicate mask reorder lane recipe; do
     generation_file="$WORK/generation-$generation_case.lua"
     "$LUAC" -p "$generation_file"
     set +e
@@ -96,7 +97,7 @@ for generation_case in skip duplicate mask reorder; do
     [[ $generation_code -ne 0 ]]
     [[ ! -s "$WORK/generation-$generation_case.stdout" ]]
 done
-echo "PASS generation skip/duplicate/mask/reorder rejection before payload semantics"
+echo "PASS generation skip/duplicate/mask/reorder/lane/recipe rejection before payload semantics"
 python3 tests/constant_use_materialization.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/handler_fragment_sharing.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/ir_native_fusion.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua"
@@ -613,6 +614,7 @@ call_inclusive_profiles = []
 call_trampoline_profiles = []
 dialect_profiles = []
 generation_profiles = []
+selector_lane_profiles = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
     micro = re.search(r"Synthetic micro-block limit: ([3-6])\.", log)
@@ -684,6 +686,17 @@ for index in range(1, runs + 1):
         int(generations.group(1)), int(generations.group(2)),
         int(generations.group(3)), int(generations.group(4)),
         tuple(map(int, generations.group(5).split(","))), generations.group(6),
+    ))
+    selector_lanes = re.search(
+        r"Selector lane migration: families=([0-3](?:,[0-3]){0,3}); "
+        r"transitions=(\d+); programs=(\d+); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not selector_lanes:
+        raise SystemExit(f"missing selector-lane migration profile for build {index}")
+    selector_lane_profiles.append((
+        tuple(map(int, selector_lanes.group(1).split(","))),
+        int(selector_lanes.group(2)), int(selector_lanes.group(3)), selector_lanes.group(4),
     ))
     semantic = re.search(
         r"Semantic lowering: writes=([0-9,]+); raw-stack-reads=(\d+); raw-environment-reads=(\d+)\.",
@@ -815,6 +828,11 @@ if any(programs < 1 or steps < programs * 2 or minimum != 2 or maximum != 5
     raise SystemExit(f"instruction generation coverage is incomplete: {generation_profiles}")
 if len({profile[5] for profile in generation_profiles}) != runs:
     raise SystemExit("an instruction generation program was reused across builds")
+if any(families != (0, 1, 2, 3) or transitions < programs * 2
+       for families, transitions, programs, _signature in selector_lane_profiles):
+    raise SystemExit(f"selector-lane migration coverage is incomplete: {selector_lane_profiles}")
+if len({profile[3] for profile in selector_lane_profiles}) != runs:
+    raise SystemExit("a selector-lane recipe program was reused across builds")
 write_totals = tuple(sum(record[0][index] for record in semantic_records) for index in range(6))
 if min(write_totals) <= 0:
     raise SystemExit(f"not all six semantic write lowerings were emitted: {write_totals}")
@@ -936,6 +954,7 @@ print(
     f"call-inclusive-folds={min(profile[1] for profile in call_inclusive_profiles)}..{max(profile[1] for profile in call_inclusive_profiles)}, "
     f"dialect-modes={sorted({profile[0] for profile in dialect_profiles})}, dialect-programs={len({profile[3] for profile in dialect_profiles})}, "
     f"generation-programs={len({profile[5] for profile in generation_profiles})}, generation-range=2..5, "
+    f"selector-lane-programs={len({profile[3] for profile in selector_lane_profiles})}, selector-lanes=[0,1,2,3], "
     f"call-token-programs={len({profile[3] for profile in call_trampoline_profiles})}, call-frame-layouts={len({profile[2] for profile in call_trampoline_profiles})}, "
     f"semantic writes={write_totals}, raw reads={sum(record[1] for record in semantic_records)}/{sum(record[2] for record in semantic_records)}, "
     f"similarity dispatcher={max_similarity:.3f}/{mean_similarity:.3f}, "

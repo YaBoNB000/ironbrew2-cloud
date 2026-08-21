@@ -74,15 +74,25 @@ def instrument(source_path: Path, output_dir: Path) -> None:
     reorder_mutation = (
         f"{program_name}[1],{program_name}[2]={program_name}[2],{program_name}[1];"
     )
+    lane_mutation = (
+        f"{program_name}[1][3]={program_name}[1][3]%3+1;"
+    )
+    recipe_mutation = (
+        f"{program_name}[1][4]=({program_name}[1][4]+1)%4294967296;"
+    )
     mask = source[:mutation_point] + mask_mutation + source[mutation_point:]
     reorder = source[:mutation_point] + reorder_mutation + source[mutation_point:]
+    lane = source[:mutation_point] + lane_mutation + source[mutation_point:]
+    recipe = source[:mutation_point] + recipe_mutation + source[mutation_point:]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "generation-skip.lua").write_text(skip, "latin1")
     (output_dir / "generation-duplicate.lua").write_text(duplicate, "latin1")
     (output_dir / "generation-mask.lua").write_text(mask, "latin1")
     (output_dir / "generation-reorder.lua").write_text(reorder, "latin1")
-    print("PASS generated test-only generation skip/duplicate/mask/reorder attacks")
+    (output_dir / "generation-lane.lua").write_text(lane, "latin1")
+    (output_dir / "generation-recipe.lua").write_text(recipe, "latin1")
+    print("PASS generated test-only generation skip/duplicate/mask/reorder/lane/recipe attacks")
 
 
 def main() -> int:

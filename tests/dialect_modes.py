@@ -86,8 +86,12 @@ def verify(generated: Path, vm_path: Path, build_log: Path) -> None:
     report = analyze_decompiler(generated)
     if set(report.dialect_modes) != payload_tokens:
         raise ValueError("attacker execution states missed a reachable payload mode")
-    if report.mode_transitions < 2 or len(report.selector_lanes) != len(payload_tokens):
-        raise ValueError("attacker did not model edge-local modes/selector families")
+    expected_selector_lanes = {
+        "opcode-carrier", "descriptor-digest", "supplemental-operands", "mode-synthetic"
+    }
+    if (report.mode_transitions < 2 or set(report.selector_lanes) != expected_selector_lanes
+            or report.selector_lane_transitions < report.physical_instructions):
+        raise ValueError("attacker did not model edge-local modes and P3 selector migrations")
 
     leaked = re.search(
         r"\b(?:DialectMode(?:Count|Tokens|Slot|Seal|Valid|Key)|CurrentDialectMode|DialectEnum)\b",

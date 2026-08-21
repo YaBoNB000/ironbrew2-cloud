@@ -170,7 +170,7 @@ class Block:
     record_column_spans: list[dict[int, tuple[int, int, int]]] = field(default_factory=list)
     descriptors: list[int] = field(default_factory=list)
     fused_counts: list[int] = field(default_factory=list)
-    generation_programs: list[tuple[tuple[int, int], ...]] = field(default_factory=list)
+    generation_programs: list[tuple[tuple[int, int, int, int], ...]] = field(default_factory=list)
     capsules: dict[int, Capsule] = field(default_factory=dict)
     final_instruction_state: int = 0
     final_instruction_seal: int = 0
@@ -760,10 +760,13 @@ def decode_prototype_column(
 
 
 def apply_generation_program(
-    opcode: int, operand_a: int, program: tuple[tuple[int, int], ...]
-) -> tuple[int, int, tuple[tuple[int, int], ...]]:
-    trace: list[tuple[int, int]] = [(opcode & 0xFFFF, operand_a & 0xFFFF)]
-    for family, mask in program:
+    opcode: int, operand_a: int, program: tuple[tuple[int, int, int, int], ...]
+) -> tuple[int, int, tuple[tuple[int, int, int, int], ...]]:
+    initial_recipe = program[0][3] if program else 0
+    trace: list[tuple[int, int, int, int]] = [
+        (opcode & 0xFFFF, operand_a & 0xFFFF, 0, initial_recipe)
+    ]
+    for family, mask, selector_lane, recipe in program:
         low, high = mask & 0xFFFF, (mask >> 16) & 0xFFFF
         if family == 0:
             opcode ^= low
@@ -779,14 +782,14 @@ def apply_generation_program(
             raise ValueError("unknown generation rewrite family")
         opcode &= 0xFFFF
         operand_a &= 0xFFFF
-        trace.append((opcode, operand_a))
+        trace.append((opcode, operand_a, selector_lane, recipe))
     return opcode, operand_a, tuple(trace)
 
 
 def validate_instruction_record(
     record: bytes, prototype: Prototype, block: Block, offset: int,
     record_start: int, record_end: int,
-) -> tuple[int, int, tuple[tuple[int, int], ...], tuple[int, ...], dict[int, tuple[int, int, int]]]:
+) -> tuple[int, int, tuple[tuple[int, int, int, int], ...], tuple[int, ...], dict[int, tuple[int, int, int]]]:
     order = derive_block_permutation(
         5, block.entry_state, prototype.k1, prototype.k2, prototype.k3, BLOCK_COLUMN_DOMAIN
     )
@@ -813,7 +816,7 @@ def validate_instruction_record(
     descriptor = columns[0][0] ^ (block_field_mask(block.entry_state, pc, 7, prototype) & 0xFF)
     wire_descriptor = descriptor
     fused_count = 0
-    generation_program: tuple[tuple[int, int], ...] = ()
+    generation_program: tuple[tuple[int, int, int, int], ...] = ()
     if descriptor & 1:
         if descriptor != 1 or len(columns[0]) != 1:
             raise ValueError("invalid data-word instruction descriptor")
@@ -854,19 +857,25 @@ def validate_instruction_record(
             generation_count = columns[0][generation_offset]
             if generation_count < 2 or generation_count > 5:
                 raise ValueError("invalid instruction generation count")
-            generation_end = generation_offset + 1 + generation_count * 5
+            generation_end = generation_offset + 1 + generation_count * 10
             if generation_end != len(columns[0]):
                 raise ValueError("instruction generation framing mismatch")
-            generation_values: list[tuple[int, int]] = []
+            generation_values: list[tuple[int, int, int, int]] = []
+            previous_lane = 0
             for generation in range(generation_count):
-                position = generation_offset + 1 + generation * 5
+                position = generation_offset + 1 + generation * 10
                 family = columns[0][position]
                 mask = int.from_bytes(columns[0][position + 1:position + 5], "little")
-                if family > 3 or mask == 0:
-                    raise ValueError("invalid instruction generation record")
-                generation_values.append((family, mask))
+                selector_lane = columns[0][position + 5]
+                recipe = int.from_bytes(columns[0][position + 6:position + 10], "little")
+                if family > 3 or mask == 0 or selector_lane not in (1, 2, 3) or recipe == 0:
+                    raise ValueError("invalid instruction generation/selector-lane record")
+                if selector_lane == previous_lane:
+                    raise ValueError("selector lane did not migrate between generations")
+                previous_lane = selector_lane
+                generation_values.append((family, mask, selector_lane, recipe))
             generation_program = tuple(generation_values)
-            expected[0] += 1 + generation_count * 5
+            expected[0] += 1 + generation_count * 10
     actual = {role: len(value) for role, value in columns.items()}
     if actual != expected:
         raise ValueError(f"instruction record field lengths mismatch: {actual} != {expected}")
@@ -905,7 +914,7 @@ def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) ->
     )
     descriptors: list[int] = []
     fused_counts: list[int] = []
-    generation_programs: list[tuple[tuple[int, int], ...]] = []
+    generation_programs: list[tuple[tuple[int, int, int, int], ...]] = []
     orders: list[tuple[int, ...]] = []
     column_spans: list[dict[int, tuple[int, int, int]]] = []
     for offset in range(block.count):
@@ -1959,18 +1968,20 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
         write_body_variant(info, output_dir, "successor-dialect-mode", successor_mode_variant)
 
         mode_manifest_block = next(
-            (block for block in info.root.blocks if block.accepted_mode_offsets), None
+            (block for block in info.root.blocks
+             if block.start_pc == 1 and block.accepted_mode_offsets), None
         )
-        if mode_manifest_block is None:
-            raise ValueError("root prototype has no authenticated dialect-mode manifest")
+        if mode_manifest_block is None or info.root.initial_mode not in mode_manifest_block.accepted_modes:
+            raise ValueError("root entry block has no live authenticated dialect-mode manifest")
         accepted_mode_variant = bytearray(info.body)
         original_modes = list(mode_manifest_block.accepted_modes)
+        live_mode_index = original_modes.index(info.root.initial_mode)
         patch_u32(
             accepted_mode_variant,
-            mode_manifest_block.accepted_mode_offsets[0],
-            original_modes[0] ^ 1,
+            mode_manifest_block.accepted_mode_offsets[live_mode_index],
+            original_modes[live_mode_index] ^ 1,
         )
-        mode_manifest_block.accepted_modes[0] ^= 1
+        mode_manifest_block.accepted_modes[live_mode_index] ^= 1
         patch_u32(
             accepted_mode_variant,
             mode_manifest_block.tag_offset,

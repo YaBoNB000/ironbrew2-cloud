@@ -5,6 +5,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using IronBrew2.Bytecode_Library.IR;
+using IronBrew2.Extensions;
 using IronBrew2.Obfuscator;
 using IronBrew2.Obfuscator.Control_Flow;
 using IronBrew2.Obfuscator.Opcodes;
@@ -42,6 +43,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private readonly BuildRandom _random;
 		private int _dialectAssignmentCounter;
 		private int _generationFamilyCounter;
+		private int _selectorLaneCounter;
+		private readonly byte[] _selectorLaneOrder;
 		private readonly Encoding _luaEncoding = Encoding.GetEncoding(28591);
 
 		public Serializer(ObfuscationContext context, ObfuscationSettings settings)
@@ -49,6 +52,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			_context = context;
 			_settings = settings;
 			_random = context.Seed.GetStream("payload.serializer");
+			_selectorLaneOrder = new byte[] {1, 2, 3};
+			_selectorLaneOrder.Shuffle(_random);
 		}
 
 		/// <summary>
@@ -851,7 +856,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				int type = (int)instruction.InstructionType;
 				int constantMask = (int)instruction.ConstantMask;
 				int generationCount = 2 + _random.Next(4);
-				var generationProgram = new List<(byte Family, uint Mask)>(generationCount);
+				var generationProgram = new List<(byte Family, uint Mask, byte SelectorLane, uint Recipe)>(generationCount);
+				byte previousSelectorLane = 0;
 				for (int generation = 0; generation < generationCount; generation++)
 				{
 					byte family = (byte)((_generationFamilyCounter++ + generation) % 4);
@@ -859,26 +865,41 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 						family = 0;
 					uint mask;
 					do mask = _random.NextUInt32(); while ((mask & 0xffffu) == 0 || (mask >> 16) == 0);
-					generationProgram.Add((family, mask));
+					// Generation zero always dispatches through the opcode carrier. Every
+					// authenticated rewrite migrates to a different non-zero logical lane;
+					// runtime dialect mode then permutes lanes 1..3 independently.
+					byte selectorLane = _selectorLaneOrder[_selectorLaneCounter++ % _selectorLaneOrder.Length];
+					if (selectorLane == previousSelectorLane)
+						selectorLane = (byte)(1 + (selectorLane % 3));
+					previousSelectorLane = selectorLane;
+					uint recipe;
+					do recipe = _random.NextUInt32(); while (recipe == 0);
+					generationProgram.Add((family, mask, selectorLane, recipe));
 				}
 				_context.GenerationProgramCount++;
 				_context.GenerationStepCount += generationProgram.Count;
 				_context.GenerationMinimum = Math.Min(_context.GenerationMinimum, generationProgram.Count);
 				_context.GenerationMaximum = Math.Max(_context.GenerationMaximum, generationProgram.Count);
-				foreach ((byte family, uint mask) in generationProgram)
+				_context.SelectorLaneTransitionCount += generationProgram.Count;
+				foreach ((byte family, uint mask, byte selectorLane, uint recipe) in generationProgram)
 				{
 					_context.GenerationFamilyMask |= 1 << family;
 					_context.GenerationProgramSignature =
 						(_context.GenerationProgramSignature ^ family) * 16777619u;
 					_context.GenerationProgramSignature =
 						(_context.GenerationProgramSignature ^ mask) * 16777619u;
+					_context.SelectorLaneFamilyMask |= 1 << selectorLane;
+					_context.SelectorLaneProgramSignature =
+						(_context.SelectorLaneProgramSignature ^ selectorLane) * 16777619u;
+					_context.SelectorLaneProgramSignature =
+						(_context.SelectorLaneProgramSignature ^ recipe) * 16777619u;
 				}
 
 				ushort generationOpcode = unchecked((ushort)opcode);
 				ushort generationA = unchecked((ushort)instruction.A);
 				for (int generation = generationProgram.Count - 1; generation >= 0; generation--)
 				{
-					(byte family, uint mask) = generationProgram[generation];
+					(byte family, uint mask, _, _) = generationProgram[generation];
 					ushort low = unchecked((ushort)mask);
 					ushort high = unchecked((ushort)(mask >> 16));
 					switch (family)
@@ -975,10 +996,12 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				}
 
 				descriptors.Add((byte)generationProgram.Count);
-				foreach ((byte family, uint mask) in generationProgram)
+				foreach ((byte family, uint mask, byte selectorLane, uint recipe) in generationProgram)
 				{
 					descriptors.Add(family);
 					WriteUInt32(descriptors, mask);
+					descriptors.Add(selectorLane);
+					WriteUInt32(descriptors, recipe);
 				}
 			}
 

@@ -76,27 +76,34 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     # Recover the operand binder from its final replay call and verify that the
     # resolver is reachable only from __index, with independent decoded flags
     # so a decoded nil is cached correctly.
-    binder_call = re.search(
-        rf"local\s+{IDENT}\s*=\s*({IDENT})\s*\(\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*\)\s*;\s*"
-        rf"{IDENT}\[{IDENT}\]\s*,",
+    binder_calls = list(re.finditer(
+        rf"local\s+{IDENT}\s*=\s*({IDENT})\s*\(\s*{IDENT}\s*,\s*{IDENT}\s*,\s*{IDENT}\s*\)\s*;",
         code,
         re.S,
-    )
-    if not binder_call:
+    ))
+    binder_decl = None
+    binder_region = ""
+    for binder_call in binder_calls:
+        binder = binder_call.group(1)
+        candidate_decl = re.search(
+            rf"local\s+function\s+{re.escape(binder)}\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)",
+            code[:decode.start()],
+        )
+        if not candidate_decl:
+            continue
+        next_function = re.search(
+            rf"local\s+function\s+{IDENT}\s*\(", code[candidate_decl.end():decode.start()]
+        )
+        candidate_end = candidate_decl.end() + (
+            next_function.start() if next_function else decode.start() - candidate_decl.end()
+        )
+        candidate_region = code[candidate_decl.end():candidate_end]
+        if re.search(r"__index\s*=\s*function\s*\(", candidate_region):
+            binder_decl, binder_region = candidate_decl, candidate_region
+            break
+    if binder_decl is None:
         raise ValueError("final replay does not bind a lazy operand proxy")
-    binder = binder_call.group(1)
-    binder_decl = re.search(
-        rf"local\s+function\s+{re.escape(binder)}\s*\(\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*\)",
-        code[:decode.start()],
-    )
-    if not binder_decl:
-        raise ValueError("lazy operand binder declaration was not found")
     raw_fields, lazy_fields, lazy_resolver = binder_decl.groups()
-    next_function = re.search(rf"local\s+function\s+{IDENT}\s*\(", code[binder_decl.end():decode.start()])
-    binder_end = binder_decl.end() + (next_function.start() if next_function else decode.start() - binder_decl.end())
-    binder_region = code[binder_decl.end():binder_end]
-    if not re.search(r"__index\s*=\s*function\s*\(", binder_region):
-        raise ValueError("constant operand binder is not an __index use-point proxy")
     resolver_call = re.search(
         rf"local\s+({IDENT})\s*=\s*{re.escape(lazy_resolver)}\s*\(\s*{IDENT}\s*\)\s*;",
         binder_region,

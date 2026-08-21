@@ -295,6 +295,28 @@ P2 收尾稳定性复核还定位并删除了一条会破坏上述 immutable pay
 - attacker 不能只解析一棵 selector tree；
 - 不得把常量值当 selector，避免 Lua number 精度和 NaN 语义风险。
 
+#### P3 完成记录与重读审查（2026-08-21）
+
+状态：**已完成**。
+
+每条 authenticated generation record 现同时携带 `family / mask / logical selector lane / independent recipe token`。generation-0 固定从 opcode carrier 开始；每个 build 随机排列 1–3 的 logical lane program，每次 rewrite 后必须迁移到不同的非零 logical lane，当前 dialect mode 再对 1–3 做置换，因此同一 physical record 在不同 mode 下也不共享固定物理 lane。三种 post-rewrite carrier 分别吸收完整 descriptor/field digest、B/C 与 fused/fresh supplemental view、以及 mode + entry/chunk state；selector 不读取 constant value。
+
+selector value、有效 lane、recipe、completed generation、final 标志和 seal 只存在于 invocation-local FlowCache 派生槽。`ResolveDialectMode` 在 dialect selector tree 使用 `Enum` 前同时复核：mode seal、generation program commitment、当前 generation guard、lane/recipe 与 program 的对应关系、mode-dependent lane permutation、carrier source、selector seal 和解码结果。最终 selector 通过后立即释放 generation/selector overlay；中间 materializer selector 只释放本代 selector proof，随后 same-PC replay。这样没有为 P3 新增另一个顶层 validator local，避免 Lua 5.1 的 200-local 上限倒退。
+
+最终 semantic selector 不再走稳定的 `Enum == nil → opcode bank` fallback。Closure inline binding 也消费同步重放后返回的 migrated selector，而不是重新从 opcode field 推导。handler continuation entry token 仍由 mode-specific continuation graph 独立生成；generation recipe 只参与 selector carrier 和 synthetic materializer recipe，恢复 lane 不等于恢复 terminal handler recipe。
+
+攻击器状态模型升级为 v2，`AttackExecutionState` 新增逐代 `selector_lane_trace`，report 新增 `selector_lane_transitions`。适配攻击器会先重放 generation，再按 mode 恢复 effective lane，当前 material fixture 明确恢复：
+
+```text
+opcode-carrier / descriptor-digest / supplemental-operands / mode-synthetic
+```
+
+新增 `tests/selector_lane_migration.py`，并把 post-commit lane/recipe mutation 加入 runtime tamper suite。skip、duplicate、mask、reorder、lane 和 recipe 六种变体均在 protected semantics 前拒绝。Phase 4 observer 继续确认 raw fields、lazy constant proxy、selector proof 和 generation overlay 不逃逸 invocation/record 生命周期。
+
+按本 MD 重新执行删除审查后确认：P3 没有引入常量 selector、共享 `Enum` cache、固定 mode 数、共享 mutable instruction array、额外巨型 root table或 P4 capability graph；也没有扩大 fusion 宽度。为保持 P2 的 signed/RK/NaN 边界，B/C 仍只作为 selector carrier 的已认证输入，不被 generation rewrite 改写。所有新增算术都进入 lane source、seal 或实际 dispatch 数据依赖，不是纯 MBA decoy。
+
+完整 `IB2_RANDOM_RUNS=20` 已通过；每个 build 都覆盖 lanes 0/1/2/3，20 个 selector-lane recipe programs 全部唯一，dialect counts 继续覆盖 3/4/5。下一步是 P4；完成后再次完整重读本 MD。
+
 ### P4：continuation-return capability graph（批准，但在 P1–P3 稳定后实施）
 
 将当前容易单函数分类的 shared fragments 改成 2–4 个 build-random capability compartments。

@@ -92,6 +92,13 @@ namespace IronBrew2.Obfuscator
 		public int GenerationMaximum;
 		public int GenerationFamilyMask;
 		public uint GenerationProgramSignature = 2166136261u;
+		// P3 selector migration is generation-local and mode-permuted. Lane zero is
+		// the generation-0 opcode carrier; authenticated rewrite records select one
+		// of three non-constant post-rewrite carrier families plus an independent
+		// recipe token.
+		public int SelectorLaneFamilyMask = 1;
+		public int SelectorLaneTransitionCount;
+		public uint SelectorLaneProgramSignature = 2166136261u;
 
 		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|attestation token)，
 		// 序列化头部只写盐，VM 端严格探针成功后才派生同一种子。
