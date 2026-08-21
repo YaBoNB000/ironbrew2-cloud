@@ -22,6 +22,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 		private sealed class ContinuationNode
 		{
 			public int OpcodeIndex;
+			public int DialectMode;
 			public int Depth;
 			public int Lane;
 			public uint Token;
@@ -29,6 +30,13 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			public int NextLane;
 			public string Handler;
 			public bool Terminal => Handler != null;
+		}
+
+		private sealed class TableWriteOrderStats
+		{
+			public int Groups;
+			public int Writes;
+			public uint Signature = 2166136261u;
 		}
 		
 		public Generator(ObfuscationContext context) =>
@@ -110,6 +118,86 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			public int CarrierTopology { get; init; }
 			public int AssemblyTopology { get; init; }
 			public int[] StageCounts { get; init; }
+			public string[] EncodedSegments { get; init; }
+		}
+
+		private static string RewriteExecutableLuaSpans(string code, Func<string, string> rewriteCode)
+		{
+			if (code == null) throw new ArgumentNullException(nameof(code));
+			if (rewriteCode == null) throw new ArgumentNullException(nameof(rewriteCode));
+
+			var rewritten = new StringBuilder(code.Length);
+			int plainStart = 0;
+			int index = 0;
+
+			int LongBracketLevel(int at)
+			{
+				if (at >= code.Length || code[at] != '[') return -1;
+				int cursor = at + 1;
+				while (cursor < code.Length && code[cursor] == '=') cursor++;
+				return cursor < code.Length && code[cursor] == '[' ? cursor - at - 1 : -1;
+			}
+
+			int LongBracketEnd(int at, int level)
+			{
+				string close = "]" + new string('=', level) + "]";
+				int contentStart = at + level + 2;
+				int closeAt = code.IndexOf(close, contentStart, StringComparison.Ordinal);
+				return closeAt < 0 ? code.Length : closeAt + close.Length;
+			}
+
+			void Preserve(int start, int end)
+			{
+				rewritten.Append(rewriteCode(code.Substring(plainStart, start - plainStart)));
+				rewritten.Append(code, start, end - start);
+				plainStart = end;
+				index = end;
+			}
+
+			while (index < code.Length)
+			{
+				char current = code[index];
+				if (current == '\'' || current == '"')
+				{
+					char quote = current;
+					int end = index + 1;
+					while (end < code.Length)
+					{
+						if (code[end] == '\\')
+						{
+							end = Math.Min(code.Length, end + 2);
+							continue;
+						}
+						if (code[end++] == quote) break;
+					}
+					Preserve(index, end);
+					continue;
+				}
+
+				if (current == '-' && index + 1 < code.Length && code[index + 1] == '-')
+				{
+					int commentBody = index + 2;
+					int level = LongBracketLevel(commentBody);
+					int end = level >= 0 ? LongBracketEnd(commentBody, level) : code.IndexOf('\n', commentBody);
+					if (end < 0) end = code.Length;
+					Preserve(index, end);
+					continue;
+				}
+
+				if (current == '[')
+				{
+					int level = LongBracketLevel(index);
+					if (level >= 0)
+					{
+						Preserve(index, LongBracketEnd(index, level));
+						continue;
+					}
+				}
+				index++;
+			}
+
+			rewritten.Append(rewriteCode(code.Substring(plainStart)));
+			return rewritten.ToString();
 		}
 
 		internal static string[] SplitDataSegs(string data, Random r)
@@ -254,7 +342,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			string assembly;
 			if (assemblyTopology == 0)
 			{
-				assembly = "local ByteString=decompress(" + string.Join("..", references) + ");\n";
+				assembly = "local PayloadCiphertext,PayloadLength=decompress({" + string.Join(",", references) + "});\n";
 			}
 			else if (assemblyTopology == 2)
 			{
@@ -262,9 +350,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				{
 					if (length == 1) return references[start];
 					int left = length / 2;
-					return "(" + Balanced(start, left) + ".." + Balanced(start + left, length - left) + ")";
+					return "{" + Balanced(start, left) + "," + Balanced(start + left, length - left) + "}";
 				}
-				assembly = "local ByteString=decompress(" + Balanced(0, count) + ");\n";
+				assembly = "local PayloadCiphertext,PayloadLength=decompress(" + Balanced(0, count) + ");\n";
 			}
 			else
 			{
@@ -272,16 +360,15 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				slots.Shuffle(random);
 				int[] sourceOrder = Enumerable.Range(0, count).ToArray();
 				sourceOrder.Shuffle(random);
-				var staged = new StringBuilder("local ByteString;do local EncodedParts={};");
+				var staged = new StringBuilder("local PayloadCiphertext,PayloadLength;do local EncodedParts={};");
 				foreach (int index in sourceOrder)
 					staged.Append("EncodedParts[").Append(slots[index]).Append("]=").Append(references[index]).Append(";");
 				string orderedReads = string.Join(",", Enumerable.Range(0, count).Select(index => "EncodedParts[" + slots[index] + "]"));
 				if (assemblyTopology == 1)
-					staged.Append("ByteString=decompress(Concat({").Append(orderedReads).Append("}));end;\n");
+					staged.Append("PayloadCiphertext,PayloadLength=decompress({").Append(orderedReads).Append("});end;\n");
 				else
-					staged.Append("local EncodedPage={").Append(orderedReads).Append("};local EncodedPartIndex=1;local Encoded=EncodedPage[1];")
-						.Append("while EncodedPartIndex<#EncodedPage do EncodedPartIndex=EncodedPartIndex+1;Encoded=Encoded..EncodedPage[EncodedPartIndex];end;")
-						.Append("ByteString=decompress(Encoded);end;\n");
+					staged.Append("local EncodedPage={").Append(orderedReads).Append("};")
+						.Append("PayloadCiphertext,PayloadLength=decompress({EncodedPage});EncodedPage=nil;end;\n");
 				assembly = staged.ToString();
 			}
 
@@ -293,7 +380,8 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				SegmentCount = count,
 				CarrierTopology = carrierTopology,
 				AssemblyTopology = assemblyTopology,
-				StageCounts = stageCounts
+				StageCounts = stageCounts,
+				EncodedSegments = segments
 			};
 		}
 
@@ -433,7 +521,55 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				FoldMutations(mutations, used, _c);
 		}
 
-		private static bool[] BuildSuperOperatorBarrierMap(Chunk chunk)
+		private TableWriteOrderStats RandomizeFreshTableWrites(Chunk chunk, Random random)
+		{
+			var stats = new TableWriteOrderStats();
+			for (int index = 0; index < chunk.Instructions.Count; index++)
+			{
+				Instruction create = chunk.Instructions[index];
+				if (create.OpCode != Opcode.NewTable)
+					continue;
+				var writes = new List<Instruction>();
+				var keys = new HashSet<Constant>();
+				for (int cursor = index + 1; cursor < chunk.Instructions.Count; cursor++)
+				{
+					Instruction write = chunk.Instructions[cursor];
+					if (write.OpCode != Opcode.SetTable || write.A != create.A || write.B <= 255
+					    || write.RefOperands[0] is not Constant key || !keys.Add(key))
+						break;
+					if (write.BackReferences.Count != 0)
+					{ writes.Clear(); break; }
+					writes.Add(write);
+				}
+				if (writes.Count < 3)
+					continue;
+				foreach (Instruction write in writes) write.FreshTableWrite = true;
+				Instruction[] shuffled = writes.ToArray();
+				shuffled.Shuffle(random);
+				if (shuffled.SequenceEqual(writes))
+					(shuffled[0], shuffled[1]) = (shuffled[1], shuffled[0]);
+				for (int offset = 0; offset < shuffled.Length; offset++)
+				{
+					chunk.Instructions[index + 1 + offset] = shuffled[offset];
+					int original = writes.IndexOf(shuffled[offset]);
+					stats.Signature = (stats.Signature ^ (uint)(original + 1 + offset * 17)) * 16777619u;
+				}
+				stats.Groups++;
+				stats.Writes += writes.Count;
+				index += writes.Count;
+			}
+			foreach (Chunk child in chunk.Functions)
+			{
+				TableWriteOrderStats childStats = RandomizeFreshTableWrites(child, random);
+				stats.Groups += childStats.Groups;
+				stats.Writes += childStats.Writes;
+				stats.Signature = (stats.Signature ^ childStats.Signature) * 16777619u;
+			}
+			chunk.UpdateMappings();
+			return stats;
+		}
+
+		private bool[] BuildSuperOperatorBarrierMap(Chunk chunk, bool includeSyntheticCuts = true)
 		{
 			var barriers = new bool[chunk.Instructions.Count + 1];
 			void Mark(int index)
@@ -442,24 +578,29 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					barriers[index] = true;
 			}
 
-			// Treat both semantic CFG entries and serializer-imposed bounded-block cuts
-			// as hard fusion boundaries. Marking the preceding instruction still allows
-			// a new fusion to begin at the destination block.
-			ControlFlowGraph graph = ControlFlowGraph.Build(chunk, DispatcherFlatteningPlanner.MaxBlockInstructions);
+			// Marking the instruction preceding a selected boundary still allows a new
+			// fusion to begin at the destination block. Every fusion observes semantic
+			// CFG entries. Ordinary templates also keep
+			// synthetic micro-block cuts; only explicitly call-inclusive templates may
+			// ignore those later routing boundaries, without crossing a real target.
+			ControlFlowGraph graph = ControlFlowGraph.Build(chunk, includeSyntheticCuts
+				? _context.MaxBlockInstructions
+				: Math.Max(1, chunk.Instructions.Count));
 			foreach (ControlFlowBlock block in graph.Blocks)
 				if (block.Start > 0) Mark(block.Start - 1);
 
 			for (int index = 0; index < chunk.Instructions.Count; index++)
 			{
 				Instruction instruction = chunk.Instructions[index];
-				if (instruction.InstructionType == InstructionType.Data)
+				if (instruction.InstructionType == InstructionType.Data || instruction.FreshTableWrite)
 					Mark(index);
 
 				switch (instruction.OpCode)
 				{
 					case Opcode.Closure:
+					case Opcode.Close:
 						Mark(index);
-						if (instruction.RefOperands.Length > 0 && instruction.RefOperands[0] is Chunk child)
+						if (instruction.OpCode == Opcode.Closure && instruction.RefOperands.Length > 0 && instruction.RefOperands[0] is Chunk child)
 							for (int binding = 1; binding <= child.UpvalueCount; binding++) Mark(index + binding);
 						break;
 					case Opcode.Eq:
@@ -484,6 +625,11 @@ namespace IronBrew2.Obfuscator.VM_Generation
 						Mark(index + 1);
 						Mark(index + instruction.B + 1);
 						break;
+					// Ordinary CALL is intentionally not a barrier. HandlerCall captures
+					// exact B/C/Top semantics and commits result writes to Stk, while the
+					// FusedStack proxy detects those writes before the next member executes.
+					case Opcode.PushStack:
+					case Opcode.VarArg when instruction.B == 0:
 					case Opcode.Return:
 					case Opcode.TailCall:
 						Mark(index);
@@ -497,11 +643,12 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			return barriers;
 		}
 
-		public List<OpSuperOperator> GenerateSuperOperators(Chunk chunk, int maxSize, int minSize = 5)
+		public List<OpSuperOperator> GenerateSuperOperators(
+			Chunk chunk, int maxSize, int minSize = 5, bool includeSyntheticCuts = true)
 		{
 			List<OpSuperOperator> results = new List<OpSuperOperator>();
 
-			bool[] skip = BuildSuperOperatorBarrierMap(chunk);
+			bool[] skip = BuildSuperOperatorBarrierMap(chunk, includeSyntheticCuts);
 
 			int c = 0;
 			while (c < chunk.Instructions.Count)
@@ -541,63 +688,59 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			}
 
 			foreach (var _c in chunk.Functions)
-				results.AddRange(GenerateSuperOperators(_c, maxSize, minSize));
+				results.AddRange(GenerateSuperOperators(_c, maxSize, minSize, includeSyntheticCuts));
 			
 			return results;
 		}
 
 		public void FoldAdditionalSuperOperators(Chunk chunk, List<OpSuperOperator> operators, ref int folded)
 		{
-			bool[] skip = BuildSuperOperatorBarrierMap(chunk);
+			bool[] strictBarriers = BuildSuperOperatorBarrierMap(chunk, true);
+			bool[] semanticBarriers = BuildSuperOperatorBarrierMap(chunk, false);
+			var consumed = new bool[chunk.Instructions.Count];
 
 			int c = 0;
 			while (c < chunk.Instructions.Count)
 			{
-				if (skip[c])
+				if (consumed[c] || semanticBarriers[c])
 				{
 					c++;
 					continue;
 				}
 
 				bool used = false;
-
 				foreach (OpSuperOperator op in operators)
 				{
+					bool[] barriers = op.CallInclusive ? semanticBarriers : strictBarriers;
 					int targetCount = op.SubOpcodes.Length;
-					bool cu = true;
+					bool eligible = true;
 					for (int j = 0; j < targetCount; j++)
 					{
-						if (c + j > chunk.Instructions.Count - 1 || skip[c + j])
+						if (c + j > chunk.Instructions.Count - 1 || consumed[c + j] || barriers[c + j])
 						{
-							cu = false;
+							eligible = false;
 							break;
 						}
 					}
-
-					if (!cu)
-						continue;
-
+					if (!eligible) continue;
 
 					List<Instruction> taken = chunk.Instructions.Skip(c).Take(targetCount).ToList();
 					if (op.IsInstruction(taken))
 					{
 						for (int j = 0; j < targetCount; j++)
 						{
-							skip[c + j] = true;
-							chunk.Instructions[c + j].CustomData.WrittenOpcode = new OpSuperOperator {VIndex = 0};
+							consumed[c + j] = true;
+							chunk.Instructions[c + j].CustomData.FusionContinuation = j != 0;
 						}
-
 						chunk.Instructions[c].CustomData.WrittenOpcode = op;
-
+						chunk.Instructions[c].CustomData.FusedInstructions = taken;
 						used = true;
 						break;
 					}
 				}
 
-				if (!used)
-					c++;
-				else
-					folded++;
+				if (!used) c++;
+				else folded++;
 			}
 
 			foreach (var _c in chunk.Functions)
@@ -844,6 +987,10 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			Random guardRandom = _context.Seed.GetStream("runtime.guard");
 			Random payloadCarrierRandom = _context.Seed.GetStream("payload.carrier");
 			VMLayout vmLayout = VMLayoutSelector.Select(layoutRandom);
+			Console.WriteLine("Synthetic micro-block limit: " + _context.MaxBlockInstructions + ".");
+			TableWriteOrderStats tableWriteOrder = RandomizeFreshTableWrites(_context.HeadChunk, r);
+			Console.WriteLine("Fresh table write order: groups=" + tableWriteOrder.Groups
+				+ "; writes=" + tableWriteOrder.Writes + "; signature=" + tableWriteOrder.Signature.ToString("x8") + ".");
 
 			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
 			                                 .Where(t => t.IsSubclassOf(typeof(VOpcode)))
@@ -869,15 +1016,70 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			
 			if (settings.SuperOperators)
 			{
-				// Short fusions deliberately stay inside straight-line regions. The barrier
+				// IR-native fusions deliberately stay inside straight-line regions. The barrier
 				// map excludes every control-flow edge, CLOSURE binding word and SETLIST
 				// data word, while the small cap prevents giant recognizable handlers.
 				int folded = 0;
 				int operatorLimit = Math.Min(settings.MaxMiniSuperOperators, 24);
-				var shortOperators = GenerateSuperOperators(_context.HeadChunk, 6, 2)
-					.OrderBy(_ => r.Next()).Take(operatorLimit).ToList();
+				bool IsCallSemantic(VOpcode opcode)
+				{
+					if (opcode is OpMutated mutated) return IsCallSemantic(mutated.Mutated);
+					return opcode.GetType().Name.StartsWith("OpCall", StringComparison.Ordinal);
+				}
+				var callOperators = GenerateSuperOperators(_context.HeadChunk, 10, 2, false)
+					.Where(op => op.SubOpcodes.Any(IsCallSemantic)).OrderBy(_ => r.Next()).ToList();
+				foreach (OpSuperOperator callOperator in callOperators) callOperator.CallInclusive = true;
+				var regularOperators = GenerateSuperOperators(_context.HeadChunk, 10, 2, true)
+					.Where(op => !op.SubOpcodes.Any(IsCallSemantic)).ToList();
+				int reservedCallOperators = Math.Min(Math.Min(8, operatorLimit), callOperators.Count);
+				var shortOperators = callOperators.Take(reservedCallOperators)
+					.Concat(regularOperators.OrderBy(_ => r.Next()).Take(operatorLimit - reservedCallOperators))
+					.ToList();
+				var usedMemberTokens = new HashSet<uint>();
+				uint memberTokenSignature = 2166136261u;
+				int memberTokenCount = 0;
+				int memberPhaseCount = 0;
+				foreach (OpSuperOperator superOperator in shortOperators)
+				{
+					int count = superOperator.SubOpcodes.Length;
+					superOperator.MemberTokens = new uint[count];
+					superOperator.MemberExecuteTokens = new uint[count];
+					for (int member = 0; member < count; member++)
+					{
+						uint selectToken, executeToken;
+						do selectToken = unchecked((uint)r.NextInt64(1L, 4294967296L)); while (!usedMemberTokens.Add(selectToken));
+						do executeToken = unchecked((uint)r.NextInt64(1L, 4294967296L)); while (!usedMemberTokens.Add(executeToken));
+						superOperator.MemberTokens[member] = selectToken;
+						superOperator.MemberExecuteTokens[member] = executeToken;
+						memberTokenSignature = (memberTokenSignature ^ selectToken) * 16777619u;
+						memberTokenSignature = (memberTokenSignature ^ executeToken) * 16777619u;
+						memberTokenCount++;
+						memberPhaseCount += 2;
+					}
+					superOperator.MemberOperandSlots = new int[count];
+					superOperator.MemberOperandSlots[0] = 0;
+					int[] supplementalSlots = Enumerable.Range(1, count - 1).ToArray();
+					supplementalSlots.Shuffle(r);
+					for (int member = 1; member < count; member++)
+						superOperator.MemberOperandSlots[member] = supplementalSlots[member - 1];
+					superOperator.MemberBranchOrder = Enumerable.Range(0, count * 2).ToArray();
+					superOperator.MemberBranchOrder.Shuffle(r);
+					foreach (int slot in superOperator.MemberOperandSlots)
+						memberTokenSignature = (memberTokenSignature ^ (uint)(slot + 1)) * 16777619u;
+					foreach (int branch in superOperator.MemberBranchOrder)
+						memberTokenSignature = (memberTokenSignature ^ (uint)(branch + 1)) * 16777619u;
+				}
 				virtuals.AddRange(shortOperators);
 				FoldAdditionalSuperOperators(_context.HeadChunk, shortOperators, ref folded);
+				int CountCallInclusiveFolds(Chunk chunk)
+				{
+					int count = chunk.Instructions.Count(instruction =>
+						instruction.CustomData?.FusedInstructions is {Count: > 1} members &&
+						members.Any(member => member.OpCode == Opcode.Call));
+					foreach (Chunk child in chunk.Functions) count += CountCallInclusiveFolds(child);
+					return count;
+				}
+				int callInclusiveFolds = CountCallInclusiveFolds(_context.HeadChunk);
 				uint structureSignature = 2166136261u;
 				foreach (OpSuperOperator superOperator in shortOperators)
 				{
@@ -891,12 +1093,25 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				}
 				string lengthProfile = string.Join(",", shortOperators.GroupBy(op => op.SubOpcodes.Length)
 					.OrderBy(group => group.Key).Select(group => group.Key + ":" + group.Count()));
-				Console.WriteLine("Created " + shortOperators.Count + " short super operators; folded " + folded
+				Console.WriteLine("Created " + shortOperators.Count + " IR-native super operators; folded " + folded
 					+ " sequences; lengths " + lengthProfile + "; structure " + structureSignature.ToString("x8") + ".");
+				Console.WriteLine("Fused member tokens: operators=" + shortOperators.Count + "; members=" + memberTokenCount
+					+ "; phases=" + memberPhaseCount + "; signature=" + memberTokenSignature.ToString("x8") + ".");
+				Console.WriteLine("Call-inclusive fusion: templates=" + reservedCallOperators
+					+ "; folded=" + callInclusiveFolds + "; max-width=10.");
 			}
 
+			// Four synthetic replay leaves back the invocation-local instruction overlay.
+			// They are never assigned to serialized source instructions; GetInstruction
+			// selects one from prototype keys after materializing the real instruction.
+			var materializerOpcodes = Enumerable.Range(0, 4)
+				.Select(mode => new OpMaterialize {Mode = mode})
+				.ToArray();
+			virtuals.AddRange(materializerOpcodes);
+
 			AddOpcodeAliases(virtuals, r);
-			Console.WriteLine("Added " + _context.VirtualOpcodeAliasCount + " build-local opcode aliases.");
+			Console.WriteLine("Added " + _context.VirtualOpcodeAliasCount + " build-local opcode aliases and "
+				+ materializerOpcodes.Length + " prototype-selectable materializer modes.");
 			virtuals.Shuffle(r);
 			
 			for (int i = 0; i < virtuals.Count; i++)
@@ -908,25 +1123,30 @@ namespace IronBrew2.Obfuscator.VM_Generation
 
 			// ==== P1: 模板标识符随机化(每次混淆生成不同的 VM 结构名)====
 			string[] identKeys = {
-				"ByteString","InstrPoint","GetFEnv","Setmetatable","Getmetatable","RawGet","RawSet","RawEqual","Next","ToNumber","ToString","ConstCount","Deserialize",
-				"Wrap","Upvalues","NewProto","Indexes","Concat","Insert","LDExp","Select","Unpack",
+				"ByteString","InstrPoint","InternalError","Menum","GetFEnv","Setmetatable","Getmetatable","RawGet","RawSet","RawEqual","Next","ToNumber","ToString","ConstCount","Deserialize",
+				"DisabledGlobalFunction","DisabledGlobalEnvironment","DisabledEnvironmentOK","DisabledEnvironmentCandidate","DisabledEnvironmentRead","DisabledEnvironmentValue","DisabledIndexedOK","DisabledIndexedValue","DisabledGlobalTargets","DisableGlobalTarget","DisabledGlobalIndex","DisabledGlobalCandidate","DisabledPrintKey","DisabledErrorKey","DisabledWarnKey","DisabledGetGenVKey","DisabledRootKey","DisabledGetGenV","DisabledGetGenVOK",
+				"PayloadParts","ConsumePayloadPart","PayloadChunks","PayloadLength","EmitPayloadByte","PayloadByteAt","PayloadChunk","PayloadChunkIndex","PayloadChunkOffset",
+				"Wrap","Upvalues","NewProto","NewPrototypeRecord","Layout","Storage","Proxy","Key","Slot","Indexes","Concat","Insert","LDExp","Select","Unpack",
 				"BitXOR","gBits32","gBits8","gBits16","gFloat","gSizet","gString","gInt","Byte","Char","Sub",
 				"gBit","Instrs","Functions","Lines","Consts","ConstCapsules","Capsule","Instr","Proto","Params","Top","Vararg","Args",
 				"PCount","Lupvals","Stk","Inst","Enum","Chunk","decompress","Pos","Xs","Xd","_R","Env",
-				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2","K3","OpcodeKey","FieldKey","FieldKey32","U32","U32Mul",
+				"Varargsz","PCall","Loop","Const","RA","RB","K1","K2","K3","OpcodeKey","FieldKey","FieldKey32","U32","U32Mul","Xi",
+				"OuterIntegrityText","OuterIntegrityState","OuterIntegrityIndex",
 				"DerivePermutation","DeriveBlockPermutation","DeriveCodeDataPermutation","Count","Domain","Values","State","Identity","Schema","StepIndex","Step","ConstTags","InstrCount","OpcodeBank","InstructionCount","ConstantCount","StateValue","SawData","Interleaved",
 				"Columns","ColumnOrder","ColumnPositions","ColumnRead8","ColumnRead16","ColumnRead32","ColumnData","ColumnPosition","PhysicalSlot","Role",
-				"Body","BodyPosition","FragmentCount","FragmentOrder","FragmentSpans","LogicalSlot","MinimumLength","ReadFragment","TargetSlot","Record","ReferenceSlots",
-				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","StoredTag","EncodedBody","RawParts","Raw","Cons","PreviousReference","Reference",
+				"PrototypeDecoderMode","DecodePrototypeColumn","DecoderMode","Output","Shift","Divisor",
+				"Body","BodyPosition","FragmentCount","FragmentOrder","FragmentSpans","LogicalSlot","MinimumLength","ReadFragment","TargetSlot","Record","ReferenceSlots","HeaderWords","HeaderIndex",
+				"ComputePrototypeIntegrity","PrototypeLength","PrototypeTag","ComputeConstantIntegrity","ConstantMaskState","BeginConstantChain","AdvanceConstantChain","ConstantChainState","StringShardState","DecodeConstantCapsule","StoredTag","EncodedBody","RawParts","Raw","Cons","StringParts","ShardCount","ShardOrder","ShardIndex","ShardOffset","ShardLength","ShardPosition","ShardByte","ExpectedShardLength","PreviousReference","Reference","ResolvedConstants","ResolvedConstantFlags",
 				"GetProto","Index","Encoded","Decoded","SavedByteString","SavedPos","Length","Root","Blocks","BlockMap",
-				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","Offset","ConstCache",
+				"BlockCount","BlockIndex","BlockStart","Block","RefCount","References","ReferenceIndex","AcceptedModeCount","AcceptedModes","AcceptedModeIndex","PreviousAcceptedMode","Offset","ConstCache",
 				"Descriptor","Type","Mask","DecodeInstructionBlock","GetInstruction","InitialFlowKey","FlowKey","FlowVerifier","CurrentChunkState",
-				"InstructionDigest","BeginInstructionState","AdvanceInstructionState","InstructionStateSeal","PreviousInstructionState","CurrentInstructionState","CurrentInstructionSeal","Digest",
-				"BeginOpcodeState","AdvanceOpcodeState","OpcodeStateKey","OpcodeStateSeal","PreviousOpcodeState","CurrentOpcodeState","CurrentOpcodeSeal",
+				"InstructionDigest","BeginInstructionState","AdvanceInstructionState","InstructionStateSeal","InstructionSeal","PreviousInstructionState","CurrentInstructionState","CurrentInstructionSeal","Digest",
+				"BeginOpcodeState","AdvanceOpcodeState","OpcodeStateKey","OpcodeStateSeal","OpcodeSeal","PreviousOpcodeState","CurrentOpcodeState","CurrentOpcodeSeal",
 				"BlockFieldKey","BlockFieldKey32","ComputeBlockIntegrity","Flow","EntryState","FromPC","ToPC","Value","Low","High","Hash",
-				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","LastIndex","CurrentBlock",
+				"Verifier","BlockTag","SuccessorCount","Successors","SuccessorRecords","SuccessorRecord","SuccessorBlock","PreviousSuccessor","SuccessorIndex","SuccessorStart","WrappedState","WrappedMode","WrappedChunkRecord","LastIndex","CurrentBlock",
 				"Dispatcher","RouteCount","InitialRouteToken","RouteToken","ResolveInstructionPoint","NextInstructionPoint","Routed","NextBlock",
-				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched",
+				"DispatchMask","DispatchSalt","DispatchState","DispatchLane","DispatchActive","DispatchSteps","DispatchStepMask","DispatchMatched","HandlerReadStack","HandlerReadEnvironment","HandlerWriteStack","HandlerTableWrite","HandlerTableAcquireKey","HandlerTableAcquireValue","HandlerTableCommit","HandlerTableCommitA","HandlerTableCommitB","HandlerTableCommitC","HandlerTableCommitD","HandlerTableCommitMode","HandlerTableSlot","HandlerTableResult","HandlerTableFresh","HandlerTableDecoyKey","HandlerTableDecoyValue","HandlerTableTarget","HandlerTableKey","HandlerTableValue","HandlerTableMode","HandlerBinary","HandlerUnary","HandlerPc","HandlerFragmentIndex","HandlerFragmentValue","HandlerFragmentMode","HandlerFragmentLeft","HandlerFragmentRight","HandlerFragmentCurrent","HandlerFragmentTarget",
+				"HandlerCall","HandlerCallAcquireTarget","HandlerCallValidateTarget","HandlerCallAcquireArguments","HandlerCallInvoke","HandlerCallInvokeA","HandlerCallInvokeB","HandlerCallInvokeC","HandlerCallInvokeD","HandlerCallTailInvoke","HandlerCallTailInvokeA","HandlerCallTailInvokeB","HandlerCallTailInvokeC","HandlerCallTailInvokeD","HandlerCallForward","HandlerCallMode","HandlerCallInstruction","HandlerCallTop","HandlerCallFrame","HandlerCallArgumentMode","HandlerCallResultMode","HandlerCallInvokeMode","HandlerCallState","HandlerCallSteps","HandlerCallResults","HandlerCallResultCount","HandlerCallA","HandlerCallFirst","HandlerCallLast","HandlerCallTarget","HandlerCallIndex","HandlerCallResultIndex","HandlerCallNewTop",
 				"GuardString","GuardTable","GuardMath","GuardDebug","GuardGetInfo","GuardInfo","GuardInspector",
 				"GuardUnpack","GuardTableUnpack","GuardGetFEnvGlobal","GuardEnvOK","GuardEnvironment","GuardEnvironmentRead","GuardGetGenV",
 				"GuardReadEnvironment","GuardReadKey","GuardReadValue","GuardReadOK","GuardIndexedValue","GuardCapOK","GuardCapEnv","GuardCapabilityEnvironment","GuardIsC","GuardIsL","GuardCounter","GuardNextProbe",
@@ -934,12 +1154,14 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardKeyBytes","GuardKeyMeta","GuardKeyCache","GuardKey","GuardKeyRecord","GuardKeyParts","GuardKeyIndex",
 				"GuardPayloadState","GuardPayloadSeal","GuardPayloadActive","GuardPayloadExpectedSeal","GuardBindPayload","GuardPayloadLow","GuardPayloadHigh",
 				"GuardVMState","GuardChunkState","GuardEntryState","GuardInstructionPoint","GuardVMLow","GuardVMHigh","GuardChunkLow","GuardChunkHigh","GuardEntryLow","GuardEntryHigh","GuardOpcodeState","GuardOpcodeSeal","GuardOpcodeLow","GuardOpcodeHigh",
-				"GuardProbe","Force","GuardScore","GuardHeavy",
+				"GuardProbe","GuardValidateCallTarget","GuardDynamicCalls","GuardDynamicChallenge","GuardDynamicSource","GuardDynamicCompileOK","GuardDynamicLoaded","GuardDynamicRunOK","GuardDynamicResult","GuardDynamicConstantsOK","GuardDynamicConstants","GuardCurrentLoader","Force","GuardScore","GuardHeavy",
 				"GuardCurrentIsC","GuardCurrentIsL","GuardNativeMisses","GuardOK1","GuardOK2","GuardOK3","GuardOK4",
 				"GuardC1","GuardC2","GuardC3","GuardC4","GuardL1","GuardL2","GuardL3","GuardLuaOK","GuardLuaIsC","GuardLuaIsL",
 				"GuardKnown","GuardNative","GuardBehaviorOK","GuardBehaviorResult","GuardBehaviorTable","GuardBehaviorMeta",
 				"GuardBehaviorKey","GuardFirstKey","GuardDecoy","GuardValue","GuardIndex","DecodedInstrs","FlowCache","IsSequential",
-				"GuardAttestation","GuardAttested","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
+				"AllowMaterializer","MaterializeIndexSlot","MaterializeOpcodeSlot","MaterializeASlot","MaterializeBSlot","MaterializeCSlot","MaterializeStageSlot","MaterializeConstantFieldsSlot","MaterializeConstantResolverSlot","MaterializeFusedSlot","MaterializeFreshTableSlot","MaterializeGenerationProgramSlot","MaterializeGenerationSealSlot","MaterializeGenerationGuardSlot","MaterializeGenerationProgramSealSlot","MaterializeSelectorLaneSlot","MaterializeSelectorValueSlot","MaterializeSelectorRecipeSlot","MaterializeSelectorCompletedSlot","MaterializeSelectorSealSlot","MaterializeSelectorFinalSlot","MaterializeStage","MaterializeMode","MaterializeEnum","FinalLocalOpcode","SelectMaterializerEnum","MaterializeTarget","MaterializeDelta","MaterializedInstruction","MaterializedFields","MaterializedBindingFields","MaterializedBindingFused","MaterializedBindingMember","MaterializedConstantFields","MaterializedConstantResolver",
+				"BindInstructionOperands","InstructionFields","InstructionConstantFields","InstructionConstantResolver","InstructionDecodedFields","InstructionDecodedValues","InstructionRemainingConstants","InstructionFieldKey","InstructionConstantIndex","GenerationCount","GenerationProgram","GenerationRecord","GenerationIndex","GenerationFamily","GenerationMask","GenerationSeal","GenerationGuard","GenerationCompleted","GenerationProgramSeal","ExpectedGenerationProgramSeal","IgnoredGenerationSeal","GenerationFieldDigest","ApplyGenerationRewrite","BeginGenerationSeal","AdvanceGenerationSeal","ComputeGenerationGuard","SelectorLane","SelectorSource","SelectorMask","SelectorValue","SelectorRecipe","SelectorCompleted","SelectorSeal","SelectorSealValue","SelectorFinal","SelectorRawLane","SelectorTarget","SelectorFused","SelectorField","SelectorB","SelectorC","SelectorDecoded","SelectorRecord","SelectorGenerationSeal","SelectorProgramSeal","SelectorExpectedProgramSeal","ExpectedSelectorLane","ExpectedSelectorRecipe","ExpectedSelectorSeal","PublishSelector","PrepareSelectorLane","ValidateSelectorLane","FusedOperands","FusedHead","FusedProgramCounter","FusedProgramStep","FusedValues","FusedWritten","FusedStack","FusedKey","FusedValue","FusedInstructionFields","FusedConstantFields","FusedInstruction","FusedDescriptor","FusedCount","FusedIndex","FusedType","FusedMask","FusedInstructionConstants","IsFused","IsFreshTableWrite",
+				"GuardEvidenceFold","GuardEvidenceA","GuardEvidenceB","GuardEvidenceC","GuardEvidenceD","GuardCompatibility","GuardAttested","GuardKeyA","GuardKeyB","GuardKeyC","GuardKeyD","GuardPayloadBinding","BinderRotate16","SeedByte","GuardBXor","GuardCBody","GuardCValue","GuardCaller","GuardCallerOK","GuardChangedOK","GuardCheckCaller",
 				"GuardClassOK1","GuardClassOK2","GuardClassOK3","GuardClassOK4","GuardCompileOK","GuardConstantProbe","GuardConstants","GuardConstantsOK",
 				"GuardCurrentEnvOK","GuardCurrentEnvironment","GuardCurrentIdentity","GuardExpected","GuardGame","GuardGetConstants","GuardGetProto","GuardGetProtos",
 				"GuardGetUpvalues","GuardHostOK","GuardHostResult","GuardIdOK1","GuardIdOK2","GuardIdentify","GuardInstance","GuardLaneA","GuardLaneB","GuardLaneC",
@@ -957,22 +1179,23 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				"GuardPersistent","GuardProtoConstants","GuardProtoConstantsOK","GuardProtosValid","GuardReject","GuardRejectA","GuardRejectB","GuardRejectC","GuardRejectD","GuardRepeatEnvironment","GuardRepeatOK","GuardReportOnly","GuardSawInactiveProto","GuardSeparated",
 				"GuardThreadMarker","GuardThreadOld","GuardCanaryOK","GuardCapabilityRestoreOK","GuardThreadRestoreOK","GuardWrappedUpvalues","GuardWrappedUpvaluesOK",
 				"GuardPrimitiveIndex","GuardPrimitives",
-				"PrimitiveEnvironmentReader","PrimitiveEnvironment","PrimitiveRawGet","PrimitiveString","PrimitiveTable","PrimitiveMath","PrimitiveDebug","PrimitiveGlobalUnpack","PrimitiveTableUnpack","PrimitiveBootstrapChar",
+				"PrimitiveEnvironmentReader","PrimitiveEnvironment","PrimitiveEnvironmentLookup","PrimitiveMemberLookup","PrimitiveValue","PrimitiveRawGet","PrimitiveString","PrimitiveTable","PrimitiveMath","PrimitiveDebug","PrimitiveGlobalUnpack","PrimitiveTableUnpack","PrimitiveBootstrapChar",
 				"PrimitiveKeyBytes","PrimitiveKeyMeta","PrimitiveKeyCache","PrimitiveDecode","PrimitiveToken","PrimitiveRecord","PrimitiveText","PrimitiveIndex","PrimitiveLookup","PrimitiveRoot","PrimitiveMember","PrimitiveParent",
 				"PayloadRejectA","PayloadRejectB","PayloadRejectC","PayloadRejectD",
 				"PayloadRejectVoidA","PayloadRejectVoidB","PayloadRejectVoidC","PayloadRejectVoidD",
 				"PayloadRejectCodeA","PayloadRejectCodeB","PayloadRejectCodeC","PayloadRejectCodeD",
 				"PayloadHead","PayloadTag","PayloadFlags","PayloadFeatures","PayloadVersion","OuterSeed","PayloadHash","PayloadIndex","PayloadDecoded","PayloadByte","PayloadKey",
+				"PayloadRotate16","PayloadLow","PayloadAuthA","PayloadAuthB","PayloadMix",
 				"EnvelopePos","EnvelopeRead32","EnvelopeRealLength","EnvelopeEntropyLength","EnvelopeRecordCount","EnvelopeDataCount","EnvelopeEntropyCount","EnvelopeNonce","EnvelopeDigest","EnvelopeTag","EnvelopeExpected",
 				"EnvelopeHash","EnvelopeIndex","EnvelopeDataRecords","EnvelopeEntropyRecords","EnvelopeDataLength","EnvelopeEntropySeenLength","EnvelopeKind","EnvelopeOrdinal","EnvelopeLength","EnvelopeRecord",
 				"EntropyHash","EnvelopeByteIndex","EnvelopeState","EnvelopeBody","EnvelopeBodyIndex","EnvelopeKey",
 				"PayloadCiphertext","PayloadAttestation","EnvelopeCipherPos","EnvelopeCipherState","EnvelopePlainPos","EnvelopeRead8","PayloadPageDescriptors","EntropyDescriptors",
 				"DescriptorState","DescriptorOffset","EnvelopeMaskState","PayloadSourceLength","PageOrdinal","PayloadPageOrdinal","PayloadPage","PayloadPagePosition","LoadPayloadPage",
-				"SourceRead8","SourceReadBytes","ActiveSourceLength","SourceIsPaged","ActivePrototypeHash","TrackPrototypeByte","FramedLength","EncodedParts","EncodedPage",
+				"SourceRead8","SourceReadBytes","ActiveSourceLength","SourceIsPaged","ActivePrototypeHash","ActivePrototypeRight","ActivePrototypeCounter","PrototypeAbsorb","FinalizePrototypeIntegrity","TrackPrototypeByte","FramedLength","EncodedParts","EncodedPage",
 				"PageByteIndex","FramingIndex","MaskState","InnerKey","OuterKey","NestedByte","PlainByte","RawLength","Multiplier","SavedSourceLength","SavedSourceMode",
-				"CipherByte","KeyByte","EnvelopeReadWidth","Width","FieldIndex","LengthOffset","EncodedIndex","Left","Right","PipelineState","PipelineIndex","TransformedByte","EncodedPartIndex",
-				"ChunkState","InitialChunkKey","ChunkChainKey","SourceChunkState","SourceEntryState","CurrentChunkState","WrappedChunkState","ChunkSuccessors",
-				"TargetIndex","TargetInstruction","ReferencedConstants","ResolveConstant","BeginPrototypeIntegrity","Words","WordIndex","Word",
+				"CipherByte","KeyByte","EnvelopeReadWidth","Width","Field","FieldIndex","LengthOffset","EncodedIndex","Left","Right","Counter","Word","Mixed","Absorb","PipelineState","PipelineIndex","TransformedByte","EncodedPartIndex",
+				"ChunkState","InitialChunkKey","ChunkChainKey","SourceChunkState","SourceEntryState","CurrentChunkState","WrappedChunkState","ChunkSuccessors","InitialDialectModeKey","DialectModeKey","DialectModeSlot","DialectModeCacheSlot","DialectModeSeal","DialectModeValid","DialectModeAccepted","ResolveDialectMode","CurrentDialectMode","DialectEnum",
+				"TargetIndex","TargetInstruction","ReferencedConstants","ResolveConstant","ReferenceSlot","PreviousCapsule","BeginPrototypeIntegrity","Words","WordIndex","Word",
 				"LayoutFrameA","LayoutFrameB","LayoutFrameC"
 				};
 			string[] luaKws = {"and","break","do","else","elseif","end","false","for","function","if","in","local","nil","not","or","repeat","return","then","true","until","while"};
@@ -1028,81 +1251,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 						: match.Value;
 				});
 
-				// Do not let an identifier-looking sequence inside a base91 payload,
-				// watermark, quoted literal, long string or comment mutate protected data.
-				// Only executable Lua spans are eligible for numeric ABI rewriting.
-				var rewritten = new StringBuilder(code.Length);
-				int plainStart = 0;
-				int index = 0;
-
-				int LongBracketLevel(int at)
-				{
-					if (at >= code.Length || code[at] != '[') return -1;
-					int cursor = at + 1;
-					while (cursor < code.Length && code[cursor] == '=') cursor++;
-					return cursor < code.Length && code[cursor] == '[' ? cursor - at - 1 : -1;
-				}
-
-				int LongBracketEnd(int at, int level)
-				{
-					string close = "]" + new string('=', level) + "]";
-					int contentStart = at + level + 2;
-					int closeAt = code.IndexOf(close, contentStart, StringComparison.Ordinal);
-					return closeAt < 0 ? code.Length : closeAt + close.Length;
-				}
-
-				void Preserve(int start, int end)
-				{
-					rewritten.Append(RewriteCode(code.Substring(plainStart, start - plainStart)));
-					rewritten.Append(code, start, end - start);
-					plainStart = end;
-					index = end;
-				}
-
-				while (index < code.Length)
-				{
-					char current = code[index];
-					if (current == '\'' || current == '"')
-					{
-						char quote = current;
-						int end = index + 1;
-						while (end < code.Length)
-						{
-							if (code[end] == '\\')
-							{
-								end = Math.Min(code.Length, end + 2);
-								continue;
-							}
-							if (code[end++] == quote) break;
-						}
-						Preserve(index, end);
-						continue;
-					}
-
-					if (current == '-' && index + 1 < code.Length && code[index + 1] == '-')
-					{
-						int commentBody = index + 2;
-						int level = LongBracketLevel(commentBody);
-						int end = level >= 0 ? LongBracketEnd(commentBody, level) : code.IndexOf('\n', commentBody);
-						if (end < 0) end = code.Length;
-						Preserve(index, end);
-						continue;
-					}
-
-					if (current == '[')
-					{
-						int level = LongBracketLevel(index);
-						if (level >= 0)
-						{
-							Preserve(index, LongBracketEnd(index, level));
-							continue;
-						}
-					}
-					index++;
-				}
-
-				rewritten.Append(RewriteCode(code.Substring(plainStart)));
-				return rewritten.ToString();
+				// ABI rewriting is executable-code-only. Payload, watermark and other
+				// quoted or commented bytes must remain byte-for-byte stable.
+				return RewriteExecutableLuaSpans(code, RewriteCode);
 			}
 
 			string ApplyVMLayout(string code, VMLayout layout)
@@ -1286,6 +1437,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					["__IB2_FLOW_VERIFIER_MASK__"] = domains.FlowVerifierMask.ToString(),
 					["__IB2_ENTROPY_RECORD_KIND__"] = domains.EntropyRecordKind.ToString(),
 					["__IB2_DATA_RECORD_KIND__"] = domains.DataRecordKind.ToString(),
+					["__IB2_DIALECT_MODE_COUNT__"] = _context.DialectModeCount.ToString(),
 					["__IB2_OUTER_HEAD_OFFSET__"] = (format.OuterHeadOffset + 1).ToString(),
 					["__IB2_OUTER_TAG_OFFSET__"] = (format.OuterIntegrityOffset + 1).ToString(),
 					["__IB2_OUTER_FLAGS_OFFSET__"] = (format.OuterFlagsOffset + 1).ToString(),
@@ -1305,7 +1457,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				};
 				foreach (KeyValuePair<string, string> replacement in replacements)
 					code = code.Replace(replacement.Key, replacement.Value);
-				if (Regex.IsMatch(code, @"__IB2_(?:DOMAIN|BLOCK_FIELD|FLOW_VERIFIER|ENTROPY_RECORD|DATA_RECORD|OUTER_|ENVELOPE_|RECORD_|PAGE_|STREAM_)"))
+				if (Regex.IsMatch(code, @"__IB2_(?:DOMAIN|BLOCK_FIELD|FLOW_VERIFIER|ENTROPY_RECORD|DATA_RECORD|DIALECT_MODE|OUTER_|ENVELOPE_|RECORD_|PAGE_|STREAM_)"))
 					throw new InvalidOperationException("A per-build runtime layout or domain placeholder was not replaced.");
 				return code;
 			}
@@ -1373,13 +1525,17 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			// 提前解析或 destination 延后解析的数据流。它改变的是 handler 的
 			// def-use graph，而不只是套一层无效控制流。
 			int semanticLocalSerial = 0;
+			int[] semanticWriteVariants = new int[6];
+			int semanticRawStackReads = 0;
+			int semanticRawEnvironmentReads = 0;
 			string ApplySemanticPolymorphism(string code)
 			{
 				const string target = @"Stk\s*\[\s*Inst\s*\[\s*OP_A\s*\]\s*\]";
 				string pattern = @"(?<target>" + target + @")\s*=(?!=)\s*(?<value>[^;]+);";
-				return Regex.Replace(code, pattern, match =>
+				code = Regex.Replace(code, pattern, match =>
 				{
-					int variant = r.Next(4);
+					int variant = r.Next(6);
+					semanticWriteVariants[variant]++;
 					if (variant == 0)
 						return match.Value;
 
@@ -1392,9 +1548,436 @@ namespace IronBrew2.Obfuscator.VM_Generation
 					string destination = "_sd" + serial;
 					if (variant == 2)
 						return "local " + destination + "=Inst[OP_A];local " + result + "=" + value + ";Stk[" + destination + "]=" + result + ";";
-
-					return "local " + result + "=" + value + ";local " + destination + "=Inst[OP_A];Stk[" + destination + "]=" + result + ";";
+					if (variant == 3)
+						return "local " + result + "=" + value + ";local " + destination + "=Inst[OP_A];Stk[" + destination + "]=" + result + ";";
+					if (variant == 4)
+						return "RawSet(Stk,Inst[OP_A]," + value + ");";
+					return "local " + result + "=" + value + ";RawSet(Stk,Inst[OP_A]," + result + ");";
 				});
+
+				// Replace common register/global reads with captured raw accessors. Direct
+				// assignment targets are retained; every other occurrence independently
+				// chooses table syntax or a function-call dataflow.
+				const string stackRead = @"Stk\s*\[\s*Inst\s*\[\s*OP_[ABC]\s*\]\s*\]";
+				code = Regex.Replace(code, stackRead, match =>
+				{
+					int cursor = match.Index + match.Length;
+					while (cursor < code.Length && char.IsWhiteSpace(code[cursor])) cursor++;
+					if (cursor < code.Length && code[cursor] == '=' &&
+					    (cursor + 1 >= code.Length || code[cursor + 1] != '='))
+						return match.Value;
+					Match operand = Regex.Match(match.Value, @"OP_[ABC]");
+					if (r.Next(2) == 0 || !operand.Success)
+						return match.Value;
+					semanticRawStackReads++;
+					return "RawGet(Stk,Inst[" + operand.Value + "])";
+				});
+				code = Regex.Replace(code,
+					@"Env\s*\[\s*Inst\s*\[\s*OP_B\s*\]\s*\]",
+					match =>
+					{
+						int cursor = match.Index + match.Length;
+						while (cursor < code.Length && char.IsWhiteSpace(code[cursor])) cursor++;
+						if (cursor < code.Length && code[cursor] == '=' &&
+						    (cursor + 1 >= code.Length || code[cursor + 1] != '='))
+							return match.Value;
+						if (r.Next(2) == 0) return "Env[Inst[OP_B]]";
+						semanticRawEnvironmentReads++;
+						return "RawGet(Env,Inst[OP_B])";
+					});
+				return code;
+			}
+
+			// Handler fragment sharing: common operand acquisition, arithmetic,
+			// destination writeback and PC transitions are emitted once per dispatch
+			// scope. Terminal leaves retain only a composition of these fragments,
+			// rather than repeating one complete semantic dataflow per virtual opcode.
+			string[] binaryOperators = {"+", "-", "*", "/", "%", "^", ".."};
+			string[] unaryOperators = {"-", "not", "#"};
+			var usedFragmentTokens = new HashSet<uint>();
+			uint NewFragmentToken()
+			{
+				uint token;
+				do token = unchecked((uint)r.NextInt64(1L, 4294967296L));
+				while (!usedFragmentTokens.Add(token));
+				return token;
+			}
+			var binaryFragmentTokens = binaryOperators.ToDictionary(op => op, _ => NewFragmentToken());
+			var unaryFragmentTokens = unaryOperators.ToDictionary(op => op, _ => NewFragmentToken());
+			_context.TableWriteTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
+			_context.TableCommitTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
+			uint[] tableCommitRoute = _context.TableCommitTokens.OrderBy(_ => r.Next()).ToArray();
+			bool[] tableWriteValueFirst = Enumerable.Range(0, 4).Select(_ => r.Next(2) == 0).ToArray();
+
+			// CALL/TAILCALL leaves carry only one build-random mode token. The shared
+			// runtime first resolves that token to a mode-local state path, then splits
+			// target acquisition, loader validation, argument-window acquisition,
+			// invocation and result forwarding across independently tokenized phases.
+			// Every tail path stops before result capture and reaches a direct-return
+			// leaf, preserving Lua 5.1 tail-call and multiple-result behavior.
+			int callModeCount = (int)CallMode.ModeCount;
+			_context.CallModeTokens = Enumerable.Range(0, callModeCount).Select(_ => NewFragmentToken()).ToArray();
+			uint[] callArgumentTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
+			uint[] callResultTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
+			uint[] callInvokeTokens = Enumerable.Range(0, 4).Select(_ => NewFragmentToken()).ToArray();
+			int[] callArgumentKinds =
+			{
+				0, 1, 2, 3, 0, 1, 0, 1, 2, 2, 3, 3, 0, 1, 2, 3, 0, 2, 3
+			};
+			int[] callResultKinds =
+			{
+				0, 0, 0, 0, 1, 1, 2, 2, 1, 2, 1, 2, 3, 3, 3, 3, -1, -1, -1
+			};
+			bool[] callTailModes = Enumerable.Range(0, callModeCount)
+				.Select(index => index >= (int)CallMode.TailFixedArguments).ToArray();
+			if (callArgumentKinds.Length != callModeCount || callResultKinds.Length != callModeCount)
+				throw new InvalidOperationException("CALL trampoline mode table is out of sync.");
+			int[] callInvokeAssignments = Enumerable.Range(0, callModeCount).Select(index => index % 4).ToArray();
+			callInvokeAssignments.Shuffle(r);
+			uint[][] callPhaseTokens = Enumerable.Range(0, callModeCount)
+				.Select(mode => Enumerable.Range(0, callTailModes[mode] ? 4 : 5)
+					.Select(_ => NewFragmentToken()).ToArray()).ToArray();
+			int[] callFrameSlots = GenerateRuntimeSlotPermutation(4);
+			int[] callModeOrder = Enumerable.Range(0, callModeCount).ToArray();
+			callModeOrder.Shuffle(r);
+			var callPhaseOrder = Enumerable.Range(0, callModeCount)
+				.SelectMany(mode => Enumerable.Range(0, callPhaseTokens[mode].Length)
+					.Select(phase => (Mode: mode, Phase: phase))).ToList();
+			callPhaseOrder.Shuffle(r);
+			uint callTrampolineSignature = 2166136261u;
+			void AbsorbCallTrampoline(uint value) =>
+				callTrampolineSignature = (callTrampolineSignature ^ value) * 16777619u;
+			foreach (uint token in _context.CallModeTokens) AbsorbCallTrampoline(token);
+			foreach (uint token in callArgumentTokens) AbsorbCallTrampoline(token);
+			foreach (uint token in callResultTokens) AbsorbCallTrampoline(token);
+			foreach (uint token in callInvokeTokens) AbsorbCallTrampoline(token);
+			foreach (uint[] phases in callPhaseTokens)
+				foreach (uint token in phases) AbsorbCallTrampoline(token);
+			foreach (int slot in callFrameSlots) AbsorbCallTrampoline((uint)slot);
+
+			int handlerFragmentReadCalls = 0;
+			int handlerFragmentEnvironmentCalls = 0;
+			int handlerFragmentWriteCalls = 0;
+			int handlerFragmentBinaryCalls = 0;
+			int handlerFragmentUnaryCalls = 0;
+			int handlerFragmentPcCalls = 0;
+
+			string ApplyHandlerFragmentSharing(string code)
+			{
+				const string instructionField = @"Inst\s*\[\s*OP_[ABC]\s*\]";
+				string stackOperand = @"Stk\s*\[\s*" + instructionField + @"\s*\]";
+				string scalarOperand = "(?:" + stackOperand + "|" + instructionField + ")";
+
+				// Joint operation fragments are selected by build-random 32-bit tokens.
+				// Operand acquisition is fragmented separately in a later pass.
+				string binaryPattern = @"(?<left>" + scalarOperand + @")\s*(?<operator>\.\.|[+\-*/%^])\s*(?<right>" + scalarOperand + ")";
+				code = Regex.Replace(code, binaryPattern, match =>
+				{
+					string op = match.Groups["operator"].Value;
+					if (!binaryFragmentTokens.TryGetValue(op, out uint token))
+						return match.Value;
+					handlerFragmentBinaryCalls++;
+					return "HandlerBinary(" + ScrambleUInt(token) + "," +
+					       match.Groups["left"].Value + "," + match.Groups["right"].Value + ")";
+				});
+				string unaryPattern = @"(?<operator>not\s+|[-#])(?<value>" + scalarOperand + ")";
+				code = Regex.Replace(code, unaryPattern, match =>
+				{
+					string op = match.Groups["operator"].Value.Trim();
+					if (op == "-")
+					{
+						int previous = match.Index - 1;
+						while (previous >= 0 && char.IsWhiteSpace(code[previous])) previous--;
+						if (previous >= 0 && (char.IsLetterOrDigit(code[previous]) ||
+						    code[previous] == '_' || code[previous] == ']' || code[previous] == ')'))
+							return match.Value;
+					}
+					if (!unaryFragmentTokens.TryGetValue(op, out uint token))
+						return match.Value;
+					handlerFragmentUnaryCalls++;
+					return "HandlerUnary(" + ScrambleUInt(token) + "," + match.Groups["value"].Value + ")";
+				});
+
+				string simpleIndex = "(?:" + instructionField + @"|[A-Za-z_]\w*(?:\s*[+\-]\s*\d+)?)";
+				// Restrict regex-based writeback extraction to scalar values. Complex
+				// expressions may contain nested function/table bodies with semicolons;
+				// result-temporary lowering still routes those through this shared sink.
+				string directWriteValue = @"(?:[A-Za-z_]\w*|" + instructionField + @")";
+				string directWrite = @"Stk\s*\[\s*(?<index>" + simpleIndex + @")\s*\]\s*=(?!=)\s*(?<value>" + directWriteValue + @")\s*;";
+				code = Regex.Replace(code, directWrite, match =>
+				{
+					handlerFragmentWriteCalls++;
+					return "HandlerWriteStack(" + match.Groups["index"].Value + "," +
+					       match.Groups["value"].Value.Trim() + "," + ScrambleNumber(r.Next(2)) + ");";
+				});
+				// Only rewrite RawSet forms whose value is already a scalar temporary or
+				// instruction field. A regex must not consume nested call parentheses;
+				// complex direct RawSet forms remain valid and still share read fragments.
+				string rawWriteValue = @"(?:[A-Za-z_]\w*|" + instructionField + @")";
+				string rawWrite = @"RawSet\s*\(\s*Stk\s*,\s*(?<index>" + simpleIndex + @")\s*,\s*(?<value>" + rawWriteValue + @")\s*\)\s*;";
+				code = Regex.Replace(code, rawWrite, match =>
+				{
+					handlerFragmentWriteCalls++;
+					return "HandlerWriteStack(" + match.Groups["index"].Value + "," +
+					       match.Groups["value"].Value.Trim() + "," + ScrambleNumber(r.Next(2)) + ");";
+				});
+
+				string stackRead = @"Stk\s*\[\s*(?<index>" + simpleIndex + @")\s*\]";
+				code = Regex.Replace(code, stackRead, match =>
+				{
+					int cursor = match.Index + match.Length;
+					while (cursor < code.Length && char.IsWhiteSpace(code[cursor])) cursor++;
+					if (cursor < code.Length && code[cursor] == '=' &&
+					    (cursor + 1 >= code.Length || code[cursor + 1] != '='))
+						return match.Value;
+					handlerFragmentReadCalls++;
+					return "HandlerReadStack(" + match.Groups["index"].Value + "," + ScrambleNumber(r.Next(2)) + ")";
+				});
+				string rawStackRead = @"RawGet\s*\(\s*Stk\s*,\s*(?<index>" + simpleIndex + @")\s*\)";
+				code = Regex.Replace(code, rawStackRead, match =>
+				{
+					handlerFragmentReadCalls++;
+					return "HandlerReadStack(" + match.Groups["index"].Value + "," + ScrambleNumber(r.Next(2)) + ")";
+				});
+
+				string environmentRead = @"Env\s*\[\s*(?<index>" + simpleIndex + @")\s*\]";
+				code = Regex.Replace(code, environmentRead, match =>
+				{
+					int cursor = match.Index + match.Length;
+					while (cursor < code.Length && char.IsWhiteSpace(code[cursor])) cursor++;
+					if (cursor < code.Length && code[cursor] == '=' &&
+					    (cursor + 1 >= code.Length || code[cursor + 1] != '='))
+						return match.Value;
+					handlerFragmentEnvironmentCalls++;
+					return "HandlerReadEnvironment(" + match.Groups["index"].Value + "," + ScrambleNumber(r.Next(2)) + ")";
+				});
+				string rawEnvironmentRead = @"RawGet\s*\(\s*Env\s*,\s*(?<index>" + simpleIndex + @")\s*\)";
+				code = Regex.Replace(code, rawEnvironmentRead, match =>
+				{
+					handlerFragmentEnvironmentCalls++;
+					return "HandlerReadEnvironment(" + match.Groups["index"].Value + "," + ScrambleNumber(r.Next(2)) + ")";
+				});
+
+				code = Regex.Replace(code, @"InstrPoint\s*=\s*InstrPoint\s*\+\s*(\d+)\s*;", match =>
+				{
+					handlerFragmentPcCalls++;
+					return "InstrPoint=HandlerPc(InstrPoint," + match.Groups[1].Value + "," + ScrambleNumber(2) + ");";
+				});
+				code = Regex.Replace(code, @"InstrPoint\s*=\s*InstrPoint\s*-\s*(\d+)\s*;", match =>
+				{
+					handlerFragmentPcCalls++;
+					return "InstrPoint=HandlerPc(InstrPoint,-" + match.Groups[1].Value + "," + ScrambleNumber(2) + ");";
+				});
+				code = Regex.Replace(code, @"InstrPoint\s*=\s*Inst\s*\[\s*OP_B\s*\]\s*;", _ =>
+				{
+					handlerFragmentPcCalls++;
+					return "InstrPoint=HandlerPc(InstrPoint,Inst[OP_B]," + ScrambleNumber(1) + ");";
+				});
+				return code;
+			}
+
+			string BuildHandlerFragmentRuntime()
+			{
+				var fragment = new StringBuilder();
+				fragment.Append("local function HandlerReadStack(HandlerFragmentIndex,HandlerFragmentMode)")
+				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0))
+				        .Append(" then return Stk[HandlerFragmentIndex];end;return RawGet(Stk,HandlerFragmentIndex);end;");
+				fragment.Append("local function HandlerReadEnvironment(HandlerFragmentIndex,HandlerFragmentMode)")
+				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0))
+				        .Append(" then return Env[HandlerFragmentIndex];end;local HandlerFragmentValue=RawGet(Env,HandlerFragmentIndex);")
+				        .Append("if HandlerFragmentValue~=nil then return HandlerFragmentValue;end;return Env[HandlerFragmentIndex];end;");
+				fragment.Append("local function HandlerWriteStack(HandlerFragmentIndex,HandlerFragmentValue,HandlerFragmentMode)")
+				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0))
+				        .Append(" then Stk[HandlerFragmentIndex]=HandlerFragmentValue;else RawSet(Stk,HandlerFragmentIndex,HandlerFragmentValue);end;")
+				        .Append("return HandlerFragmentValue;end;");
+
+				fragment.Append("local function HandlerTableAcquireKey(HandlerTableMode,InstructionFields)")
+				        .Append("if HandlerTableMode==").Append(ScrambleUInt(_context.TableWriteTokens[0]))
+				        .Append(" or HandlerTableMode==").Append(ScrambleUInt(_context.TableWriteTokens[2]))
+				        .Append(" then return HandlerReadStack(InstructionFields[3],").Append(ScrambleNumber(r.Next(2))).Append(");end;")
+				        .Append("return InstructionFields[3];end;");
+				fragment.Append("local function HandlerTableAcquireValue(HandlerTableMode,InstructionFields)")
+				        .Append("if HandlerTableMode==").Append(ScrambleUInt(_context.TableWriteTokens[0]))
+				        .Append(" or HandlerTableMode==").Append(ScrambleUInt(_context.TableWriteTokens[1]))
+				        .Append(" then return HandlerReadStack(InstructionFields[4],").Append(ScrambleNumber(r.Next(2))).Append(");end;")
+				        .Append("return InstructionFields[4];end;");
+				fragment.Append("local function HandlerTableCommitA(HandlerTableTarget,HandlerTableKey,HandlerTableValue)HandlerTableTarget[HandlerTableKey]=HandlerTableValue;return HandlerTableValue;end;");
+				fragment.Append("local function HandlerTableCommitB(HandlerTableTarget,HandlerTableKey,HandlerTableValue)local HandlerTableSlot=HandlerTableTarget;HandlerTableSlot[HandlerTableKey]=HandlerTableValue;return HandlerTableValue;end;");
+				fragment.Append("local function HandlerTableCommitC(HandlerTableTarget,HandlerTableKey,HandlerTableValue)local HandlerTableResult=HandlerTableValue;HandlerTableTarget[HandlerTableKey]=HandlerTableResult;return HandlerTableResult;end;");
+				fragment.Append("local function HandlerTableCommitD(HandlerTableTarget,HandlerTableKey,HandlerTableValue)do HandlerTableTarget[HandlerTableKey]=HandlerTableValue;end;return HandlerTableValue;end;");
+				fragment.Append("local function HandlerTableCommit(HandlerTableCommitMode,HandlerTableTarget,HandlerTableKey,HandlerTableValue)");
+				string[] commitLeaves = {"HandlerTableCommitA", "HandlerTableCommitB", "HandlerTableCommitC", "HandlerTableCommitD"};
+				for (int index = 0; index < commitLeaves.Length; index++)
+					fragment.Append(index == 0 ? "if " : "elseif ").Append("HandlerTableCommitMode==")
+					        .Append(ScrambleUInt(_context.TableCommitTokens[index])).Append(" then return ")
+					        .Append(commitLeaves[index]).Append("(HandlerTableTarget,HandlerTableKey,HandlerTableValue);");
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+				fragment.Append("local function HandlerTableWrite(HandlerTableMode,InstructionFields)")
+				        .Append("local HandlerTableTarget=HandlerReadStack(InstructionFields[2],").Append(ScrambleNumber(r.Next(2))).Append(");")
+				        .Append("local HandlerTableKey,HandlerTableValue,HandlerTableCommitMode;local HandlerTableFresh=InstructionFields[6];")
+				        .Append("local HandlerTableDecoyKey,HandlerTableDecoyValue;if HandlerTableFresh then HandlerTableDecoyKey={};HandlerTableDecoyValue=")
+				        .Append(ScrambleUInt(NewFragmentToken())).Append(";HandlerTableCommit(").Append(ScrambleUInt(_context.TableCommitTokens[r.Next(4)]))
+				        .Append(",HandlerTableTarget,HandlerTableDecoyKey,HandlerTableDecoyValue);end;");
+				for (int index = 0; index < _context.TableWriteTokens.Length; index++)
+				{
+					fragment.Append(index == 0 ? "if " : "elseif ").Append("HandlerTableMode==")
+					        .Append(ScrambleUInt(_context.TableWriteTokens[index])).Append(" then ");
+					if (tableWriteValueFirst[index])
+						fragment.Append("HandlerTableValue=HandlerTableAcquireValue(HandlerTableMode,InstructionFields);HandlerTableKey=HandlerTableAcquireKey(HandlerTableMode,InstructionFields);");
+					else
+						fragment.Append("HandlerTableKey=HandlerTableAcquireKey(HandlerTableMode,InstructionFields);HandlerTableValue=HandlerTableAcquireValue(HandlerTableMode,InstructionFields);");
+					fragment.Append("HandlerTableCommitMode=").Append(ScrambleUInt(tableCommitRoute[index])).Append(";");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;local HandlerTableResult=HandlerTableCommit(HandlerTableCommitMode,HandlerTableTarget,HandlerTableKey,HandlerTableValue);if HandlerTableFresh then HandlerTableCommit(HandlerTableCommitMode,HandlerTableTarget,HandlerTableDecoyKey,nil);end;return HandlerTableResult;end;");
+
+				// A four-slot frame has a per-build physical layout applied after identifier
+				// randomization: A, the validated callee, and the inclusive argument window.
+				fragment.Append("local function HandlerCallAcquireTarget(HandlerCallInstruction)local HandlerCallFrame={};")
+				        .Append("local HandlerCallA=HandlerCallInstruction[OP_A];HandlerCallFrame[1]=HandlerCallA;")
+				        .Append("HandlerCallFrame[2]=HandlerReadStack(HandlerCallA,").Append(ScrambleNumber(r.Next(2))).Append(");return HandlerCallFrame;end;");
+				fragment.Append("local function HandlerCallValidateTarget(HandlerCallFrame)");
+				if (settings.AntiDump)
+					fragment.Append("local HandlerCallTarget=HandlerCallFrame[2];HandlerCallFrame[2]=GuardValidateCallTarget(HandlerCallTarget);");
+				fragment.Append("return HandlerCallFrame;end;");
+				fragment.Append("local function HandlerCallAcquireArguments(HandlerCallArgumentMode,HandlerCallFrame,HandlerCallInstruction,HandlerCallTop)")
+				        .Append("local HandlerCallA=HandlerCallFrame[1];HandlerCallFrame[3]=HandlerCallA+").Append(ScrambleNumber(1)).Append(";");
+				int[] argumentBranchOrder = Enumerable.Range(0, 4).ToArray();
+				argumentBranchOrder.Shuffle(r);
+				for (int orderIndex = 0; orderIndex < argumentBranchOrder.Length; orderIndex++)
+				{
+					int kind = argumentBranchOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallArgumentMode==")
+					        .Append(ScrambleUInt(callArgumentTokens[kind])).Append(" then ");
+					fragment.Append(kind switch
+					{
+						0 => "HandlerCallFrame[4]=HandlerCallInstruction[OP_B];",
+						1 => "HandlerCallFrame[4]=HandlerCallA+1;",
+						2 => "HandlerCallFrame[4]=HandlerCallTop;",
+						_ => "HandlerCallFrame[4]=HandlerCallA;"
+					});
+				}
+				fragment.Append("else error('invalid protected payload',0);end;return HandlerCallFrame;end;");
+
+				string[] invokeLeaves = {"HandlerCallInvokeA", "HandlerCallInvokeB", "HandlerCallInvokeC", "HandlerCallInvokeD"};
+				fragment.Append("local function HandlerCallInvokeA(HandlerCallFrame)local HandlerCallTarget=HandlerCallFrame[2];return _R(HandlerCallTarget(Unpack(Stk,HandlerCallFrame[3],HandlerCallFrame[4])));end;");
+				fragment.Append("local function HandlerCallInvokeB(HandlerCallFrame)local HandlerCallFirst=HandlerCallFrame[3];local HandlerCallTarget=HandlerCallFrame[2];return _R(HandlerCallTarget(Unpack(Stk,HandlerCallFirst,HandlerCallFrame[4])));end;");
+				fragment.Append("local function HandlerCallInvokeC(HandlerCallFrame)local HandlerCallTarget=HandlerCallFrame[2];local HandlerCallLast=HandlerCallFrame[4];return _R((HandlerCallTarget)(Unpack(Stk,HandlerCallFrame[3],HandlerCallLast)));end;");
+				fragment.Append("local function HandlerCallInvokeD(HandlerCallFrame)local HandlerCallFirst,HandlerCallLast=HandlerCallFrame[3],HandlerCallFrame[4];local HandlerCallTarget=HandlerCallFrame[2];return _R(HandlerCallTarget(Unpack(Stk,HandlerCallFirst,HandlerCallLast)));end;");
+				int[] invokeBranchOrder = Enumerable.Range(0, 4).ToArray();
+				invokeBranchOrder.Shuffle(r);
+				fragment.Append("local function HandlerCallInvoke(HandlerCallInvokeMode,HandlerCallFrame)");
+				for (int orderIndex = 0; orderIndex < invokeBranchOrder.Length; orderIndex++)
+				{
+					int leaf = invokeBranchOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallInvokeMode==")
+					        .Append(ScrambleUInt(callInvokeTokens[leaf])).Append(" then return ")
+					        .Append(invokeLeaves[leaf]).Append("(HandlerCallFrame);");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+
+				string[] tailInvokeLeaves = {"HandlerCallTailInvokeA", "HandlerCallTailInvokeB", "HandlerCallTailInvokeC", "HandlerCallTailInvokeD"};
+				fragment.Append("local function HandlerCallTailInvokeA(HandlerCallFrame)local HandlerCallTarget=HandlerCallFrame[2];return HandlerCallTarget(Unpack(Stk,HandlerCallFrame[3],HandlerCallFrame[4]));end;");
+				fragment.Append("local function HandlerCallTailInvokeB(HandlerCallFrame)local HandlerCallFirst=HandlerCallFrame[3];local HandlerCallTarget=HandlerCallFrame[2];return HandlerCallTarget(Unpack(Stk,HandlerCallFirst,HandlerCallFrame[4]));end;");
+				fragment.Append("local function HandlerCallTailInvokeC(HandlerCallFrame)local HandlerCallTarget=HandlerCallFrame[2];local HandlerCallLast=HandlerCallFrame[4];return (HandlerCallTarget)(Unpack(Stk,HandlerCallFrame[3],HandlerCallLast));end;");
+				fragment.Append("local function HandlerCallTailInvokeD(HandlerCallFrame)local HandlerCallFirst,HandlerCallLast=HandlerCallFrame[3],HandlerCallFrame[4];local HandlerCallTarget=HandlerCallFrame[2];return HandlerCallTarget(Unpack(Stk,HandlerCallFirst,HandlerCallLast));end;");
+				int[] tailInvokeBranchOrder = Enumerable.Range(0, 4).ToArray();
+				tailInvokeBranchOrder.Shuffle(r);
+				fragment.Append("local function HandlerCallTailInvoke(HandlerCallInvokeMode,HandlerCallFrame)");
+				for (int orderIndex = 0; orderIndex < tailInvokeBranchOrder.Length; orderIndex++)
+				{
+					int leaf = tailInvokeBranchOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallInvokeMode==")
+					        .Append(ScrambleUInt(callInvokeTokens[leaf])).Append(" then return ")
+					        .Append(tailInvokeLeaves[leaf]).Append("(HandlerCallFrame);");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+
+				fragment.Append("local function HandlerCallForward(HandlerCallResultMode,HandlerCallFrame,HandlerCallInstruction,HandlerCallResults,HandlerCallResultCount,HandlerCallTop)")
+				        .Append("local HandlerCallA=HandlerCallFrame[1];local HandlerCallResultIndex;");
+				int[] resultBranchOrder = Enumerable.Range(0, 4).ToArray();
+				resultBranchOrder.Shuffle(r);
+				for (int orderIndex = 0; orderIndex < resultBranchOrder.Length; orderIndex++)
+				{
+					int kind = resultBranchOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallResultMode==")
+					        .Append(ScrambleUInt(callResultTokens[kind])).Append(" then ");
+					if (kind == 0)
+						fragment.Append("HandlerCallResultIndex=0;for HandlerCallIndex=HandlerCallA,HandlerCallInstruction[OP_C] do HandlerCallResultIndex=HandlerCallResultIndex+1;HandlerWriteStack(HandlerCallIndex,HandlerCallResults[HandlerCallResultIndex],")
+						        .Append(ScrambleNumber(r.Next(2))).Append(");end;return HandlerCallTop;");
+					else if (kind == 1)
+						fragment.Append("local HandlerCallNewTop=HandlerCallA+HandlerCallResultCount-1;HandlerCallResultIndex=0;for HandlerCallIndex=HandlerCallA,HandlerCallNewTop do HandlerCallResultIndex=HandlerCallResultIndex+1;HandlerWriteStack(HandlerCallIndex,HandlerCallResults[HandlerCallResultIndex],")
+						        .Append(ScrambleNumber(r.Next(2))).Append(");end;return HandlerCallNewTop;");
+					else if (kind == 2)
+						fragment.Append("return HandlerCallTop;");
+					else
+						fragment.Append("HandlerWriteStack(HandlerCallA,HandlerCallResults[1],").Append(ScrambleNumber(r.Next(2))).Append(");return HandlerCallTop;");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+
+				fragment.Append("local function HandlerCall(HandlerCallMode,HandlerCallInstruction,HandlerCallTop)local HandlerCallState;");
+				for (int orderIndex = 0; orderIndex < callModeOrder.Length; orderIndex++)
+				{
+					int mode = callModeOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallMode==")
+					        .Append(ScrambleUInt(_context.CallModeTokens[mode])).Append(" then HandlerCallState=")
+					        .Append(ScrambleUInt(callPhaseTokens[mode][0])).Append(";");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;")
+				        .Append("local HandlerCallFrame,HandlerCallResults,HandlerCallResultCount;local HandlerCallSteps=0;while true do HandlerCallSteps=HandlerCallSteps+1;if HandlerCallSteps>")
+				        .Append(ScrambleNumber(5)).Append(" then error('invalid protected payload',0);end;");
+				for (int orderIndex = 0; orderIndex < callPhaseOrder.Count; orderIndex++)
+				{
+					(int mode, int phase) = callPhaseOrder[orderIndex];
+					fragment.Append(orderIndex == 0 ? "if " : "elseif ").Append("HandlerCallState==")
+					        .Append(ScrambleUInt(callPhaseTokens[mode][phase])).Append(" then ");
+					if (phase == 0)
+						fragment.Append("HandlerCallFrame=HandlerCallAcquireTarget(HandlerCallInstruction);HandlerCallState=")
+						        .Append(ScrambleUInt(callPhaseTokens[mode][1])).Append(";");
+					else if (phase == 1)
+						fragment.Append("HandlerCallFrame=HandlerCallValidateTarget(HandlerCallFrame);HandlerCallState=")
+						        .Append(ScrambleUInt(callPhaseTokens[mode][2])).Append(";");
+					else if (phase == 2)
+						fragment.Append("HandlerCallFrame=HandlerCallAcquireArguments(").Append(ScrambleUInt(callArgumentTokens[callArgumentKinds[mode]]))
+						        .Append(",HandlerCallFrame,HandlerCallInstruction,HandlerCallTop);HandlerCallState=")
+						        .Append(ScrambleUInt(callPhaseTokens[mode][3])).Append(";");
+					else if (phase == 3 && callTailModes[mode])
+						fragment.Append("return HandlerCallTailInvoke(").Append(ScrambleUInt(callInvokeTokens[callInvokeAssignments[mode]]))
+						        .Append(",HandlerCallFrame);");
+					else if (phase == 3)
+						fragment.Append("HandlerCallResults,HandlerCallResultCount=HandlerCallInvoke(").Append(ScrambleUInt(callInvokeTokens[callInvokeAssignments[mode]]))
+						        .Append(",HandlerCallFrame);HandlerCallState=").Append(ScrambleUInt(callPhaseTokens[mode][4])).Append(";");
+					else
+						fragment.Append("return HandlerCallForward(").Append(ScrambleUInt(callResultTokens[callResultKinds[mode]]))
+						        .Append(",HandlerCallFrame,HandlerCallInstruction,HandlerCallResults,HandlerCallResultCount,HandlerCallTop);");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;end;");
+
+				fragment.Append("local function HandlerBinary(HandlerFragmentMode,HandlerFragmentLeft,HandlerFragmentRight)");
+				var binaryOrder = binaryOperators.OrderBy(_ => r.Next()).ToArray();
+				for (int index = 0; index < binaryOrder.Length; index++)
+				{
+					string op = binaryOrder[index];
+					fragment.Append(index == 0 ? "if " : "elseif ").Append("HandlerFragmentMode==")
+					        .Append(ScrambleUInt(binaryFragmentTokens[op])).Append(" then return HandlerFragmentLeft")
+					        .Append(op).Append("HandlerFragmentRight;");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+
+				fragment.Append("local function HandlerUnary(HandlerFragmentMode,HandlerFragmentValue)");
+				var unaryOrder = unaryOperators.OrderBy(_ => r.Next()).ToArray();
+				for (int index = 0; index < unaryOrder.Length; index++)
+				{
+					string op = unaryOrder[index];
+					fragment.Append(index == 0 ? "if " : "elseif ").Append("HandlerFragmentMode==")
+					        .Append(ScrambleUInt(unaryFragmentTokens[op])).Append(" then return ")
+					        .Append(op == "not" ? "not " : op).Append("HandlerFragmentValue;");
+				}
+				fragment.Append("else error('invalid protected payload',0);end;end;");
+				fragment.Append("local function HandlerPc(HandlerFragmentCurrent,HandlerFragmentTarget,HandlerFragmentMode)")
+				        .Append("if HandlerFragmentMode==").Append(ScrambleNumber(0)).Append(" then return HandlerFragmentCurrent+").Append(ScrambleNumber(1)).Append(";")
+				        .Append("elseif HandlerFragmentMode==").Append(ScrambleNumber(1)).Append(" then return HandlerFragmentTarget;")
+				        .Append("else return HandlerFragmentCurrent+HandlerFragmentTarget;end;end;");
+				return fragment.ToString();
 			}
 
 			// Handler 结构多态：先用词法 statement splitter 找到安全边界，再从
@@ -1555,22 +2138,24 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				int bootstrapTopology = r.Next(3);
 				if (bootstrapTopology == 0)
 				{
-					prelude.Append("local PrimitiveEnvironmentReader=getfenv or function()return _G end;local PrimitiveEnvironment=PrimitiveEnvironmentReader();");
+					prelude.Append("local PrimitiveEnvironmentReader=getfenv or function()return _G end;local PrimitiveEnvironment=(PrimitiveEnvironmentReader and PrimitiveEnvironmentReader())or _G;");
 					prelude.Append("local PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];");
-					prelude.Append("local PrimitiveString=PrimitiveRawGet(PrimitiveEnvironment," + BootstrapLiteral("string") + ");");
-					prelude.Append("local PrimitiveBootstrapChar=PrimitiveRawGet(PrimitiveString," + BootstrapLiteral("char") + ");");
+					prelude.Append("local PrimitiveString=PrimitiveEnvironment[" + BootstrapLiteral("string") + "];");
+					prelude.Append("local PrimitiveBootstrapChar=PrimitiveString[" + BootstrapLiteral("char") + "];");
 				}
 				else if (bootstrapTopology == 1)
 				{
-					prelude.Append("local PrimitiveEnvironment;local PrimitiveEnvironmentReader=getfenv;if PrimitiveEnvironmentReader then PrimitiveEnvironment=PrimitiveEnvironmentReader()else PrimitiveEnvironment=_G end;");
-					prelude.Append("local PrimitiveRawGet,PrimitiveString,PrimitiveBootstrapChar;");
-					prelude.Append("PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];PrimitiveString=PrimitiveRawGet(PrimitiveEnvironment," + BootstrapLiteral("string") + ");PrimitiveBootstrapChar=PrimitiveRawGet(PrimitiveString," + BootstrapLiteral("char") + ");");
+					prelude.Append("local PrimitiveEnvironmentReader=getfenv;local PrimitiveEnvironment=(PrimitiveEnvironmentReader and PrimitiveEnvironmentReader())or _G;");
+					prelude.Append("PrimitiveEnvironmentReader=PrimitiveEnvironmentReader or function()return PrimitiveEnvironment end;local PrimitiveRawGet,PrimitiveString,PrimitiveBootstrapChar;");
+					prelude.Append("PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];PrimitiveString=PrimitiveEnvironment[" + BootstrapLiteral("string") + "];PrimitiveBootstrapChar=PrimitiveString[" + BootstrapLiteral("char") + "];");
 				}
 				else
 				{
 					prelude.Append("local PrimitiveEnvironmentReader=getfenv;local PrimitiveEnvironment=(PrimitiveEnvironmentReader and PrimitiveEnvironmentReader())or _G;PrimitiveEnvironmentReader=PrimitiveEnvironmentReader or function()return PrimitiveEnvironment end;");
-					prelude.Append("local PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];local PrimitiveString=PrimitiveRawGet(PrimitiveEnvironment," + BootstrapLiteral("string") + ");local PrimitiveBootstrapChar=PrimitiveRawGet(PrimitiveString," + BootstrapLiteral("char") + ");");
+					prelude.Append("local PrimitiveRawGet=PrimitiveEnvironment[" + BootstrapLiteral("rawget") + "];local PrimitiveString=PrimitiveEnvironment[" + BootstrapLiteral("string") + "];local PrimitiveBootstrapChar=PrimitiveString[" + BootstrapLiteral("char") + "];");
 				}
+				prelude.Append("local function PrimitiveEnvironmentLookup(PrimitiveToken)local PrimitiveValue=PrimitiveRawGet(PrimitiveEnvironment,PrimitiveToken);if PrimitiveValue~=nil then return PrimitiveValue end;return PrimitiveEnvironment[PrimitiveToken]end;");
+				prelude.Append("local function PrimitiveMemberLookup(PrimitiveParent,PrimitiveToken)if PrimitiveParent==nil then return nil end;local PrimitiveValue=PrimitiveRawGet(PrimitiveParent,PrimitiveToken);if PrimitiveValue~=nil then return PrimitiveValue end;return PrimitiveParent[PrimitiveToken]end;");
 
 				if (vaultTopology == 0)
 				{
@@ -1596,18 +2181,18 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				{
 					if (resolverTopology == 0) return "PrimitiveLookup(" + tokens[label] + ")";
 					if (resolverTopology == 1) return "PrimitiveRoot(" + tokens[label] + ")";
-					return "PrimitiveRawGet(PrimitiveEnvironment,PrimitiveDecode(" + tokens[label] + "))";
+					return "PrimitiveEnvironmentLookup(PrimitiveDecode(" + tokens[label] + "))";
 				}
 				string MemberLookup(string parent, string label)
 				{
 					if (resolverTopology == 0) return "PrimitiveLookup(" + tokens[label] + "," + parent + ")";
 					if (resolverTopology == 1) return "PrimitiveMember(" + parent + "," + tokens[label] + ")";
-					return "PrimitiveRawGet(" + parent + ",PrimitiveDecode(" + tokens[label] + "))";
+					return "PrimitiveMemberLookup(" + parent + ",PrimitiveDecode(" + tokens[label] + "))";
 				}
 				if (resolverTopology == 0)
-					prelude.Append("local function PrimitiveLookup(PrimitiveToken,PrimitiveParent)return PrimitiveRawGet(PrimitiveParent or PrimitiveEnvironment,PrimitiveDecode(PrimitiveToken))end;");
+					prelude.Append("local function PrimitiveLookup(PrimitiveToken,PrimitiveParent)if PrimitiveParent then return PrimitiveMemberLookup(PrimitiveParent,PrimitiveDecode(PrimitiveToken))end;return PrimitiveEnvironmentLookup(PrimitiveDecode(PrimitiveToken))end;");
 				else if (resolverTopology == 1)
-					prelude.Append("local function PrimitiveRoot(PrimitiveToken)return PrimitiveRawGet(PrimitiveEnvironment,PrimitiveDecode(PrimitiveToken))end;local function PrimitiveMember(PrimitiveParent,PrimitiveToken)return PrimitiveRawGet(PrimitiveParent,PrimitiveDecode(PrimitiveToken))end;");
+					prelude.Append("local function PrimitiveRoot(PrimitiveToken)return PrimitiveEnvironmentLookup(PrimitiveDecode(PrimitiveToken))end;local function PrimitiveMember(PrimitiveParent,PrimitiveToken)return PrimitiveMemberLookup(PrimitiveParent,PrimitiveDecode(PrimitiveToken))end;");
 
 				var libraryAssignments = new List<KeyValuePair<string, string>>
 				{
@@ -1694,7 +2279,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			// Data is always Base91 encoded; Serializer records whether the restored
 			// body itself is compressed. Runtime carrier topology is independent from
 			// the decoder and from logical segment order.
-			vm += T("local function decompress(b)local out={}local v=-1;local acc=0;local bits=0;for i=1,#b do local z=Byte(Sub(b,i,i));local d=z-33;if z>39 then d=d-1 end;if z>92 then d=d-1 end;if d>=0 and d<=90 then if v<0 then v=d else v=v+d*91;acc=acc+v*(2^bits);if(v%8192)>88 then bits=bits+13 else bits=bits+14 end;while bits>=8 do out[#out+1]=Char(acc%256);acc=(acc-acc%256)/256;bits=bits-8 end;v=-1 end end end;if v>=0 then acc=acc+v*(2^bits);bits=bits+7;while bits>=8 do out[#out+1]=Char(acc%256);acc=(acc-acc%256)/256;bits=bits-8 end end;return Concat(out)end;");
+			vm += T("local function decompress(PayloadParts)local PayloadChunks={}local out={}local PayloadLength=0;local v=-1;local acc=0;local bits=0;local function EmitPayloadByte(Value)out[#out+1]=Char(Value);PayloadLength=PayloadLength+1;if#out>=2048 then PayloadChunks[#PayloadChunks+1]=Concat(out);out={}end end;local function ConsumePayloadPart(b)if Type(b)=='table'then for j=1,#b do ConsumePayloadPart(b[j])end;return end;for i=1,#b do local z=Byte(Sub(b,i,i));local d=z-33;if z>39 then d=d-1 end;if z>92 then d=d-1 end;if d>=0 and d<=90 then if v<0 then v=d else v=v+d*91;acc=acc+v*(2^bits);if(v%8192)>88 then bits=bits+13 else bits=bits+14 end;while bits>=8 do EmitPayloadByte(acc%256);acc=(acc-acc%256)/256;bits=bits-8 end;v=-1 end end end end;ConsumePayloadPart(PayloadParts);PayloadParts=nil;if v>=0 then acc=acc+v*(2^bits);bits=bits+7;while bits>=8 do EmitPayloadByte(acc%256);acc=(acc-acc%256)/256;bits=bits-8 end end;if#out>0 then PayloadChunks[#PayloadChunks+1]=Concat(out)end;out=nil;return PayloadChunks,PayloadLength end;");
 			vm += T(payloadCarrier.Assembly);
 
 			int maxConstants = 0;
@@ -1714,7 +2299,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 			vm += T(ApplyBuildDomains(VMStrings.VMP1
 				// 环境绑定：注入种子派生代码（读盐 → 跑探针 → Hash 派生 Xs）
 				.Replace("__IB2_SEED__", settings.EnvironmentLock ? _context.Binder.SeedDeriveLua : EnvBinder.PlainSeedLua)
-				.Replace("__IB2_PAYLOAD_ATTESTATION__", settings.AntiDump ? "GuardAttestation" : "OuterSeed")
+				.Replace("__IB2_PAYLOAD_ATTESTATION__", settings.AntiDump ? "GuardPayloadBinding" : "OuterSeed")
 				.Replace("__IB2_WATERMARK__", EscapeLuaString(settings.Watermark))
 				.Replace("__IB2_OPCODE_COUNT__", virtuals.Count.ToString())));
 			
@@ -1735,6 +2320,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
         Chunk[12] = gBits32();
         Chunk[16] = gBits32();
         InitialRouteToken = U32(BitXOR(gBits32(), OuterSeed));
+        Chunk[17] = gBits32();
 	        for BlockIndex = 1, BlockCount do
 	            local BlockStart = gBits32();
 	            local Count = gBits32();
@@ -1748,6 +2334,16 @@ namespace IronBrew2.Obfuscator.VM_Generation
 	                if Reference <= PreviousReference then error('invalid protected payload', 0); end;
 	                References[ReferenceIndex], PreviousReference = Reference, Reference;
 	            end;
+	            local AcceptedModeCount = gBits32();
+	            local AcceptedModes = {};
+	            local PreviousAcceptedMode = 0;
+	            if AcceptedModeCount < 1 or AcceptedModeCount > __IB2_DIALECT_MODE_COUNT__ then error('invalid protected payload', 0); end;
+	            for AcceptedModeIndex = 1, AcceptedModeCount do
+	                local CurrentDialectMode = gBits32();
+	                if CurrentDialectMode <= PreviousAcceptedMode then error('invalid protected payload', 0); end;
+	                AcceptedModes[AcceptedModeIndex], PreviousAcceptedMode = CurrentDialectMode, CurrentDialectMode;
+	            end;
+	            References[0] = AcceptedModes;
 	            local Verifier = gBits32();
 	            local BlockTag = gBits32();
 	            local SuccessorCount = gBits32();
@@ -1759,15 +2355,17 @@ namespace IronBrew2.Obfuscator.VM_Generation
 	                local SuccessorStart = gBits32();
 	                local WrappedState = gBits32();
 	                local WrappedChunkState = gBits32();
+	                local WrappedMode = gBits32();
 	                if SuccessorStart <= PreviousSuccessor then error('invalid protected payload', 0); end;
 	                Successors[SuccessorStart] = WrappedState;
-	                ChunkSuccessors[SuccessorStart] = WrappedChunkState;
-	                SuccessorRecords[SuccessorIndex] = {SuccessorStart, WrappedState, WrappedChunkState};
+	                ChunkSuccessors[SuccessorStart] = {WrappedChunkState, WrappedMode};
+	                SuccessorRecords[SuccessorIndex] = {SuccessorStart, WrappedState, WrappedChunkState, WrappedMode};
 	                PreviousSuccessor = SuccessorStart;
 	            end;
 	            local Length = gBits32();
 	            if Length < 25 or Pos + Length - 1 > PrototypeLength then error('invalid protected payload', 0); end;
-	            local Block = {};
+	            local Block = NewPrototypeRecord(
+	                10, K1, K2, K3, BlockStart + Verifier % 65536);
 	            Block[1] = BlockStart;
 	            Block[2] = Count;
 	            Block[3] = SourceReadBytes(Length);
@@ -1803,8 +2401,9 @@ namespace IronBrew2.Obfuscator.VM_Generation
 				vm += T(@"    end;
 	end;
 
-	if Pos ~= PrototypeLength + 1 or Chunk[3] == nil or ActivePrototypeHash ~= PrototypeTag then error('invalid protected payload', 0); end;
-	ActivePrototypeHash = nil;
+	if Pos ~= PrototypeLength + 1 or Chunk[3] == nil
+	or FinalizePrototypeIntegrity(PrototypeLength, K1, K2, K3) ~= PrototypeTag then error('invalid protected payload', 0); end;
+	ActivePrototypeHash, ActivePrototypeRight, PrototypeAbsorb = nil, nil, nil;
 	if InitialRouteToken ~= 0 then
 	    if RouteCount ~= BlockCount or Dispatcher[InitialRouteToken] ~= 1 then error('invalid protected payload', 0); end;
 	    Chunk[13], Chunk[14] = Dispatcher, InitialRouteToken;
@@ -1817,7 +2416,7 @@ namespace IronBrew2.Obfuscator.VM_Generation
 	    local Block = Blocks[BlockIndex];
 	    local References = Block[4];
 	    for ReferenceIndex = 1, #References do
-	        if References[ReferenceIndex] > ConstCount then error('invalid protected payload', 0); end;
+	        if References[ReferenceIndex] < 1 or References[ReferenceIndex] > 65535 then error('invalid protected payload', 0); end;
 	    end;
 	    local SuccessorRecords = Block[9];
 	    for SuccessorIndex = 1, #SuccessorRecords do
@@ -1844,7 +2443,7 @@ local function GetProto(Proto, Index)
     return Encoded;
 end;
 
-local function DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkState, BlockStart, K1, K2, K3, ConstTags)
+local function DecodeConstantCapsule(Capsule, Index, ConstantChainState, EntryState, CurrentChunkState, BlockStart, K1, K2, K3, ConstTags)
     local SavedByteString, SavedPos = ByteString, Pos;
     local SavedSourceLength, SavedSourceMode = ActiveSourceLength, SourceIsPaged;
     ByteString, Pos, ActiveSourceLength, SourceIsPaged = Capsule, 1, #Capsule, false;
@@ -1873,9 +2472,34 @@ local function DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkSta
         Cons = gFloat();
     elseif Type == ConstTags[4] then
         local Length = gBits32();
-        if Pos + Length - 1 > #Raw then error('invalid protected payload', 0); end;
-        Cons = Sub(Raw, Pos, Pos + Length - 1);
-        Pos = Pos + Length;
+        local ShardCount = gBits8();
+        if ShardCount < 1 or ShardCount > 7 or (Length > 1 and ShardCount < 2)
+        or (Length > 0 and ShardCount > Length) then error('invalid protected payload', 0); end;
+        local ShardOrder = DerivePermutation(ShardCount, K1, K2, K3,
+            (__IB2_DOMAIN_CONSTANT_MASK__ + 2654435769) % 4294967296);
+        local StringParts = {};
+        for ShardOffset = 1, ShardCount do
+            local ShardIndex = ShardOrder[ShardOffset];
+            local ShardLength = gBits32();
+            local ExpectedShardLength = 0;
+            for ShardPosition = ShardIndex, Length - 1, ShardCount do
+                ExpectedShardLength = ExpectedShardLength + 1;
+            end;
+            if ShardLength ~= ExpectedShardLength or Pos + ShardLength - 1 > #Raw then error('invalid protected payload', 0); end;
+            local State = StringShardState(Index, ShardIndex, Length, ConstantChainState,
+                EntryState, CurrentChunkState, BlockStart, K1, K2, K3);
+            for I = 0, ShardLength - 1 do
+                local ShardPosition = ShardIndex + I * ShardCount;
+                local Mask = (State - State % 16777216) / 16777216;
+                local ShardByte = gBits8();
+                StringParts[ShardPosition + 1] = Char(BitXOR(ShardByte, Mask));
+                State = (U32Mul(State, 1664525) + 1013904223
+                    + ShardByte + (ShardPosition + 1) * 257) % 4294967296;
+            end;
+        end;
+        if Length > 0 and #StringParts ~= Length then error('invalid protected payload', 0); end;
+        Cons = Concat(StringParts);
+        StringParts, ShardOrder = nil, nil;
     else
         error('invalid protected payload', 0);
     end;
@@ -1883,6 +2507,38 @@ local function DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkSta
     Raw = nil;
     ByteString, Pos, ActiveSourceLength, SourceIsPaged = SavedByteString, SavedPos, SavedSourceLength, SavedSourceMode;
     return Cons;
+end;
+
+local function PrototypeDecoderMode(K1, K2, K3)
+    return (K1 * 13 + K2 * 7 + K3 * 11 + __IB2_DOMAIN_DECODE_PIPELINE__) % 4;
+end;
+
+local function DecodePrototypeColumn(Data, Mode, Role, TargetIndex, EntryState, K1, K2, K3)
+    local Output = {};
+    local Low = EntryState % 65536;
+    local High = (EntryState - Low) / 65536;
+    local Length = #Data;
+    for EncodedIndex = 0, Length - 1 do
+        local Index = (Mode == 1 or Mode == 3) and (Length - EncodedIndex - 1) or EncodedIndex;
+        local Value = Byte(Data, EncodedIndex + 1, EncodedIndex + 1);
+        local Mask = (Low + High * 3 + K1 * 5 + K2 * 7 + K3 * 11
+            + TargetIndex * 13 + Role * 17 + Index * 29 + __IB2_DOMAIN_DECODE_PIPELINE__) % 256;
+        if Mode == 0 then
+            Value = BitXOR(Value, Mask);
+        elseif Mode == 1 then
+            Value = (Value - Mask) % 256;
+        elseif Mode == 2 then
+            Value = BitXOR(Value, Mask);
+            Value = (Value % 16) * 16 + (Value - Value % 16) / 16;
+        else
+            Value = (Value - Mask) % 256;
+            local Shift = ((Role + TargetIndex + Index) % 7) + 1;
+            local Divisor = 2 ^ Shift;
+            Value = (Value - Value % Divisor) / Divisor + (Value % Divisor) * (2 ^ (8 - Shift));
+        end;
+        Output[Index + 1] = Char(Value);
+    end;
+    return Concat(Output);
 end;
 
 local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkState, PreviousOpcodeState, TargetIndex)
@@ -1924,7 +2580,7 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     local TargetSlot = TargetIndex - Block[1] + 1;
     if TargetSlot < 1 or TargetSlot > Block[2] then error('invalid protected payload', 0); end;
     local Record = ReadFragment(TargetSlot);
-    local Digest = InstructionDigest(Record, TargetIndex, K1, K2, K3);
+    local Digest = InstructionDigest(Record, TargetIndex, K1, K2, K3, CurrentChunkState, EntryState);
 
     -- Parse just the requested instruction record. Five field roles remain
     -- independently framed and state-permuted, but no block-wide columns or
@@ -1945,6 +2601,11 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     if Pos ~= #Record + 1 then error('invalid protected payload', 0); end;
     ByteString, Pos, ActiveSourceLength, SourceIsPaged = SavedByteString, SavedPos, SavedSourceLength, SavedSourceMode;
     Record = nil;
+    local DecoderMode = PrototypeDecoderMode(K1, K2, K3);
+    for Role = 1, 5 do
+        Columns[Role] = DecodePrototypeColumn(
+            Columns[Role], DecoderMode, Role - 1, TargetIndex, EntryState, K1, K2, K3);
+    end;
 
     local ColumnPositions = {1, 1, 1, 1, 1};
     local function ColumnRead8(Role)
@@ -1973,18 +2634,35 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
     local ReferenceSlots = {};
     for ReferenceIndex = 1, #References do ReferenceSlots[References[ReferenceIndex]] = Block[2] + ReferenceIndex; end;
     local ConstTags = DerivePermutation(4, K1, K2, K3, __IB2_DOMAIN_CONSTANT_TAG_PERMUTATION__);
+    local ResolvedConstants, ResolvedConstantFlags = {}, {};
     local function ResolveConstant(Index)
-        local LogicalSlot = ReferenceSlots[Index];
+        if ResolvedConstantFlags[Index] then return ResolvedConstants[Index]; end;
+        local ConstantChainState = BeginConstantChain(EntryState, CurrentChunkState, Block[1], K1, K2, K3);
+        local LogicalSlot;
+        for ReferenceIndex = 1, #References do
+            local Reference = References[ReferenceIndex];
+            local ReferenceSlot = ReferenceSlots[Reference];
+            if Reference == Index then LogicalSlot = ReferenceSlot; break; end;
+            local PreviousCapsule = ReadFragment(ReferenceSlot);
+            ConstantChainState = AdvanceConstantChain(ConstantChainState, PreviousCapsule, Reference);
+            PreviousCapsule = nil;
+        end;
         if not LogicalSlot then error('invalid protected payload', 0); end;
         local Capsule = ReadFragment(LogicalSlot);
-        local Value = DecodeConstantCapsule(Capsule, Index, EntryState, CurrentChunkState, Block[1], K1, K2, K3, ConstTags);
+        local Value = DecodeConstantCapsule(Capsule, Index, ConstantChainState,
+            EntryState, CurrentChunkState, Block[1], K1, K2, K3, ConstTags);
         Capsule = nil;
+        ResolvedConstantFlags[Index], ResolvedConstants[Index] = true, Value;
         return Value;
     end;
 
     local Descriptor = BitXOR(ColumnRead8(1), BlockFieldKey(EntryState, TargetIndex, 7, K1, K2, K3) % 256);
-    if Descriptor >= 64 then error('invalid protected payload', 0); end;
+    local IsFreshTableWrite = Descriptor >= 128;
+    if IsFreshTableWrite then Descriptor = Descriptor - 128; end;
+    local IsFused = Descriptor >= 64;
+    if IsFused then Descriptor = Descriptor - 64; end;
     local Inst;
+    local InstructionConstantFields = {};
     if (gBit(Descriptor, 1, 1) == 0) then
         local Type = gBit(Descriptor, 2, 3);
         local Mask = gBit(Descriptor, 4, 6);
@@ -2008,73 +2686,624 @@ local function DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkStat
             Inst[OP_C] = BitXOR(BitXOR(ColumnRead16(5), FieldKey(TargetIndex, 3, K1, K2, K3)), BlockFieldKey(EntryState, TargetIndex, 3, K1, K2, K3));
         end;
 
-        if gBit(Mask, 1, 1) == 1 then Inst[OP_A] = ResolveConstant(Inst[OP_A]); end;
-        if gBit(Mask, 2, 2) == 1 then Inst[OP_B] = ResolveConstant(Inst[OP_B]); end;
-        if gBit(Mask, 3, 3) == 1 then Inst[OP_C] = ResolveConstant(Inst[OP_C]); end;
+        if gBit(Mask, 1, 1) == 1 then InstructionConstantFields[OP_A] = Inst[OP_A]; end;
+        if gBit(Mask, 2, 2) == 1 then InstructionConstantFields[OP_B] = Inst[OP_B]; end;
+        if gBit(Mask, 3, 3) == 1 then InstructionConstantFields[OP_C] = Inst[OP_C]; end;
+
+        if IsFused then
+            local FusedCount = ColumnRead8(1);
+            if FusedCount < 1 or FusedCount > 9 then error('invalid protected payload', 0); end;
+            local FusedInstructionFields, FusedConstantFields = {}, {};
+            for FusedIndex = 1, FusedCount do
+                local FusedDescriptor = ColumnRead8(1);
+                if FusedDescriptor >= 64 or gBit(FusedDescriptor, 1, 1) ~= 0 then error('invalid protected payload', 0); end;
+                local FusedType = gBit(FusedDescriptor, 2, 3);
+                local FusedMask = gBit(FusedDescriptor, 4, 6);
+                local FusedInstruction = {nil, ColumnRead16(3), nil, nil};
+                if FusedType == 0 then
+                    FusedInstruction[OP_B], FusedInstruction[OP_C] = ColumnRead16(4), ColumnRead16(5);
+                elseif FusedType == 1 then
+                    FusedInstruction[OP_B] = ColumnRead32(4);
+                elseif FusedType == 2 then
+                    FusedInstruction[OP_B] = ColumnRead32(4) - (2 ^ 16);
+                elseif FusedType == 3 then
+                    FusedInstruction[OP_B], FusedInstruction[OP_C] = ColumnRead32(4) - (2 ^ 16), ColumnRead16(5);
+                end;
+                local FusedInstructionConstants = {};
+                if gBit(FusedMask, 1, 1) == 1 then FusedInstructionConstants[OP_A] = FusedInstruction[OP_A]; end;
+                if gBit(FusedMask, 2, 2) == 1 then FusedInstructionConstants[OP_B] = FusedInstruction[OP_B]; end;
+                if gBit(FusedMask, 3, 3) == 1 then FusedInstructionConstants[OP_C] = FusedInstruction[OP_C]; end;
+                FusedInstructionFields[FusedIndex], FusedConstantFields[FusedIndex] = FusedInstruction, FusedInstructionConstants;
+            end;
+            Inst[5], InstructionConstantFields[5] = FusedInstructionFields, FusedConstantFields;
+        end;
+        local GenerationCount = ColumnRead8(1);
+        if GenerationCount < 2 or GenerationCount > 5 then error('invalid protected payload', 0); end;
+        local GenerationProgram = {};
+        for GenerationIndex = 1, GenerationCount do
+            local GenerationFamily = ColumnRead8(1);
+            local GenerationMask = ColumnRead32(1);
+            local SelectorRawLane = ColumnRead8(1);
+            local SelectorRecipe = ColumnRead32(1);
+            if GenerationFamily < 0 or GenerationFamily > 3 or GenerationMask == 0
+            or SelectorRawLane < 1 or SelectorRawLane > 3 or SelectorRecipe == 0 then
+                error('invalid protected payload', 0);
+            end;
+            GenerationProgram[GenerationIndex] = {
+                GenerationFamily, GenerationMask, SelectorRawLane, SelectorRecipe
+            };
+        end;
+        Inst[7] = GenerationProgram;
     elseif Descriptor == 1 then
         Inst = {nil, nil, nil, nil};
     else
         error('invalid protected payload', 0);
     end;
+    if IsFreshTableWrite then
+        if not Inst or gBit(Descriptor, 1, 1) ~= 0 then error('invalid protected payload', 0); end;
+        Inst[6] = true;
+    end;
     for Role = 1, 5 do
         if type(Columns[Role]) ~= 'string' or ColumnPositions[Role] ~= #Columns[Role] + 1 then error('invalid protected payload', 0); end;
     end;
-    Columns, FragmentSpans, Body = nil, nil, nil;
-    return Inst, Digest;
+    Columns = nil;
+    if next(InstructionConstantFields) == nil then
+        InstructionConstantFields, ResolveConstant = nil, nil;
+        FragmentSpans, Body, ReferenceSlots = nil, nil, nil;
+    end;
+    return Inst, Digest, InstructionConstantFields, ResolveConstant;
 end;
 
-local function GetInstruction(Chunk, Index, Flow)
+-- Constant capsules stay inside the authenticated block body through all four
+-- synthetic field-replay passes. The operand proxy opens a capsule only when
+-- the selected handler first indexes that exact operand. Separate decoded flags
+-- preserve nil constants, and clearing the resolver releases retained block
+-- material as soon as every constant operand used by this invocation is read.
+local function BindInstructionOperands(InstructionFields, InstructionConstantFields, InstructionConstantResolver)
+    if not InstructionConstantFields then return InstructionFields; end;
+    local FusedInstructionFields = InstructionFields[5];
+    local FusedConstantFields = InstructionConstantFields[5];
+    if FusedInstructionFields then
+        if type(FusedConstantFields) ~= 'table' or #FusedInstructionFields ~= #FusedConstantFields then error('invalid protected payload', 0); end;
+        InstructionConstantFields[5] = nil;
+        for FusedIndex = 1, #FusedInstructionFields do
+            FusedInstructionFields[FusedIndex] = BindInstructionOperands(
+                FusedInstructionFields[FusedIndex], FusedConstantFields[FusedIndex], InstructionConstantResolver);
+        end;
+    end;
+    if next(InstructionConstantFields) == nil then return InstructionFields; end;
+    local InstructionDecodedFields, InstructionDecodedValues = {}, {};
+    local InstructionRemainingConstants = 0;
+    for InstructionFieldKey in pairs(InstructionConstantFields) do
+        InstructionRemainingConstants = InstructionRemainingConstants + 1;
+    end;
+    if InstructionRemainingConstants == 0 or type(InstructionConstantResolver) ~= 'function' then
+        error('invalid protected payload', 0);
+    end;
+    return Setmetatable({}, {__index = function(_, InstructionFieldKey)
+        if InstructionDecodedFields[InstructionFieldKey] then
+            return InstructionDecodedValues[InstructionFieldKey];
+        end;
+        local InstructionConstantIndex = InstructionConstantFields and InstructionConstantFields[InstructionFieldKey];
+        if InstructionConstantIndex ~= nil then
+            local Value = InstructionConstantResolver(InstructionConstantIndex);
+            InstructionDecodedFields[InstructionFieldKey] = true;
+            InstructionDecodedValues[InstructionFieldKey] = Value;
+            InstructionRemainingConstants = InstructionRemainingConstants - 1;
+            if InstructionRemainingConstants == 0 then
+                InstructionConstantFields, InstructionConstantResolver = nil, nil;
+            end;
+            return Value;
+        end;
+        return InstructionFields[InstructionFieldKey];
+    end});
+end;
+
+local function ApplyGenerationRewrite(InstructionFields, GenerationFamily, GenerationMask)
+    local Low = GenerationMask % 65536;
+    local High = (GenerationMask - Low) / 65536;
+    if GenerationFamily == 0 then
+        InstructionFields[1] = BitXOR(InstructionFields[1], Low) % 65536;
+    elseif GenerationFamily == 1 then
+        InstructionFields[2] = BitXOR(InstructionFields[2], High) % 65536;
+    elseif GenerationFamily == 2 then
+        InstructionFields[1] = BitXOR(InstructionFields[1], Low) % 65536;
+        InstructionFields[2] = BitXOR(InstructionFields[2], High) % 65536;
+    elseif GenerationFamily == 3 then
+        InstructionFields[1] = BitXOR(InstructionFields[1], High) % 65536;
+        InstructionFields[2] = BitXOR(InstructionFields[2], Low) % 65536;
+    else
+        error('invalid protected payload', 0);
+    end;
+    return InstructionFields;
+end;
+
+local function GenerationFieldDigest(InstructionFields)
+    local Value = 2166136261;
+    local Counter = 1;
+    local function Absorb(Field)
+        if type(Field) ~= 'number' then Field = Field and 1 or 0; end;
+        Field = Field % 4294967296;
+        Value = (U32Mul(U32(BitXOR(Value, Field)), 65599) + Counter * 257) % 4294967296;
+        Counter = Counter + 1;
+    end;
+    for FieldIndex = 1, 4 do Absorb(InstructionFields[FieldIndex]); end;
+    local FusedInstructionFields = InstructionFields[5];
+    if type(FusedInstructionFields) == 'table' then
+        Absorb(#FusedInstructionFields);
+        for FusedIndex = 1, #FusedInstructionFields do
+            local FusedInstruction = FusedInstructionFields[FusedIndex];
+            for FieldIndex = 2, 4 do Absorb(FusedInstruction[FieldIndex]); end;
+        end;
+    else
+        Absorb(0);
+    end;
+    Absorb(InstructionFields[6] and 1 or 0);
+    return Value;
+end;
+
+local function BeginGenerationSeal(CurrentDialectMode, Index, InstructionFields,
+    EntryState, CurrentChunkState, InstructionSeal, OpcodeSeal, GenerationProgram)
+    if type(GenerationProgram) ~= 'table' or #GenerationProgram < 2 or #GenerationProgram > 5 then
+        error('invalid protected payload', 0);
+    end;
+    local GenerationProgramSeal = U32(BitXOR(BitXOR(CurrentDialectMode, EntryState),
+        PayloadRotate16(CurrentChunkState)));
+    for GenerationIndex = 1, #GenerationProgram do
+        local GenerationRecord = GenerationProgram[GenerationIndex];
+        local GenerationFamily, GenerationMask = GenerationRecord[1], GenerationRecord[2];
+        local SelectorRawLane, SelectorRecipe = GenerationRecord[3], GenerationRecord[4];
+        if type(GenerationFamily) ~= 'number' or GenerationFamily < 0 or GenerationFamily > 3
+        or type(GenerationMask) ~= 'number' or GenerationMask == 0
+        or type(SelectorRawLane) ~= 'number' or SelectorRawLane < 1 or SelectorRawLane > 3
+        or type(SelectorRecipe) ~= 'number' or SelectorRecipe == 0 then
+            error('invalid protected payload', 0);
+        end;
+        GenerationProgramSeal = U32(BitXOR(BitXOR(GenerationProgramSeal, GenerationMask), SelectorRecipe));
+        GenerationProgramSeal = (U32Mul(GenerationProgramSeal, 48271)
+            + GenerationFamily * 65537 + SelectorRawLane * 4099
+            + GenerationIndex * 257 + Index + __IB2_DOMAIN_INSTRUCTION_STATE__) % 4294967296;
+    end;
+    local Value = U32(BitXOR(BitXOR(BitXOR(BitXOR(CurrentDialectMode, InstructionSeal), OpcodeSeal),
+        GenerationProgramSeal), U32(BitXOR(EntryState, PayloadRotate16(CurrentChunkState)))));
+    Value = U32(BitXOR(Value, GenerationFieldDigest(InstructionFields)));
+    local GenerationSeal = (U32Mul(Value, 65599) + Index * 257
+        + #GenerationProgram * 65537 + __IB2_DOMAIN_INSTRUCTION_STATE__) % 4294967296;
+    return GenerationSeal, GenerationProgramSeal;
+end;
+
+local function AdvanceGenerationSeal(GenerationSeal, CurrentDialectMode, Index, GenerationIndex,
+    GenerationFamily, GenerationMask, SelectorLane, SelectorRecipe, InstructionFields,
+    EntryState, CurrentChunkState, GenerationProgramSeal)
+    local Value = U32(BitXOR(BitXOR(BitXOR(BitXOR(BitXOR(GenerationSeal, CurrentDialectMode),
+        GenerationMask), SelectorRecipe), GenerationProgramSeal), GenerationFieldDigest(InstructionFields)));
+    return (U32Mul(Value, 48271) + Index * 65537 + GenerationIndex * 257
+        + GenerationFamily * 17 + SelectorLane * 4099 + EntryState + PayloadRotate16(CurrentChunkState)
+        + __IB2_DOMAIN_OPCODE_STATE__) % 4294967296;
+end;
+
+local function ComputeGenerationGuard(GenerationSeal, CurrentDialectMode, Index, GenerationCompleted,
+    InstructionFields, GenerationCount, EntryState, CurrentChunkState, GenerationProgramSeal)
+    local Value = U32(BitXOR(BitXOR(BitXOR(GenerationSeal, CurrentDialectMode),
+        GenerationProgramSeal), GenerationFieldDigest(InstructionFields)));
+    return (U32Mul(Value, 22695477) + Index * 257 + GenerationCompleted * 65537
+        + GenerationCount * 17 + EntryState + CurrentChunkState
+        + __IB2_DOMAIN_CODE_DATA_PERMUTATION__) % 4294967296;
+end;
+
+local function SelectMaterializerEnum(Chunk, Stage, GenerationFamily, CurrentDialectMode, SelectorRecipe)
+    local MaterializeMode = (Chunk[5] * 13 + Chunk[6] * 7 + Chunk[7]
+        + __IB2_DOMAIN_CODE_DATA_PERMUTATION__ + Stage + GenerationFamily
+        + CurrentDialectMode % 65536 + SelectorRecipe % 65536) % 4;
+    if MaterializeMode == 0 then return __IB2_MATERIALIZER_OPCODE_0__;
+    elseif MaterializeMode == 1 then return __IB2_MATERIALIZER_OPCODE_1__;
+    elseif MaterializeMode == 2 then return __IB2_MATERIALIZER_OPCODE_2__;
+    else return __IB2_MATERIALIZER_OPCODE_3__; end;
+end;
+
+local function DialectModeSlot(Chunk)
+    return 1047291 + ((Chunk[5] * 911 + Chunk[6] * 257 + Chunk[7]
+        + __IB2_DOMAIN_FLOW__) % 104729);
+end;
+
+local function DialectModeValid(Value)
+    __IB2_DIALECT_MODE_VALID__
+end;
+
+local function DialectModeAccepted(Block, Value)
+    local AcceptedModes = Block[4][0];
+    if type(AcceptedModes) ~= 'table' then return false; end;
+    for AcceptedModeIndex = 1, #AcceptedModes do
+        if RawEqual(AcceptedModes[AcceptedModeIndex], Value) then return true; end;
+    end;
+    return false;
+end;
+
+local function DialectModeSeal(Value, InstructionSeal, OpcodeSeal, Index, EntryState,
+    CurrentChunkState, Block, K1, K2, K3)
+    local Mixed = U32(BitXOR(BitXOR(BitXOR(Value, InstructionSeal), OpcodeSeal),
+        U32(BitXOR(EntryState, PayloadRotate16(CurrentChunkState)))));
+    return (U32Mul(Mixed, 65599) + Index * 257 + Block[7]
+        + K1 * 251 + K2 * 17 + K3 + __IB2_DOMAIN_FLOW__) % 4294967296;
+end;
+
+local function ResolveDialectMode(Chunk, Flow, Index, Enum)
+    local MaterializeIndexSlot = 32 + ((Chunk[5] * 257 + Chunk[6] * 17 + Chunk[7]
+        + __IB2_DOMAIN_CODE_DATA_PERMUTATION__) % 104729);
+    local MaterializeOpcodeSlot = MaterializeIndexSlot + 104729;
+    local MaterializeASlot = MaterializeIndexSlot + 209458;
+    local MaterializeBSlot = MaterializeIndexSlot + 314187;
+    local MaterializeCSlot = MaterializeIndexSlot + 418916;
+    local MaterializeStageSlot = MaterializeIndexSlot + 523645;
+    local MaterializeConstantFieldsSlot = MaterializeIndexSlot + 628374;
+    local MaterializeConstantResolverSlot = MaterializeIndexSlot + 733103;
+    local MaterializeFusedSlot = MaterializeIndexSlot + 837832;
+    local MaterializeFreshTableSlot = MaterializeIndexSlot + 942561;
+    local MaterializeGenerationProgramSlot = MaterializeIndexSlot + 1047290;
+    local MaterializeGenerationSealSlot = MaterializeIndexSlot + 1152019;
+    local MaterializeGenerationGuardSlot = MaterializeIndexSlot + 1256748;
+    local MaterializeGenerationProgramSealSlot = MaterializeIndexSlot + 1361477;
+    local MaterializeSelectorLaneSlot = MaterializeIndexSlot + 1466206;
+    local MaterializeSelectorValueSlot = MaterializeIndexSlot + 1570935;
+    local MaterializeSelectorRecipeSlot = MaterializeIndexSlot + 1675664;
+    local MaterializeSelectorCompletedSlot = MaterializeIndexSlot + 1780393;
+    local MaterializeSelectorSealSlot = MaterializeIndexSlot + 1885122;
+    local MaterializeSelectorFinalSlot = MaterializeIndexSlot + 1989851;
+    local FlowCache = Flow[4];
+    local DialectModeCacheSlot = DialectModeSlot(Chunk);
+    if not FlowCache or FlowCache[MaterializeIndexSlot] ~= Index or Flow[1] ~= Index
+    or type(Enum) ~= 'number' then error('invalid protected payload', 0); end;
+    local GenerationProgram = FlowCache[MaterializeGenerationProgramSlot];
+    local GenerationCount = type(GenerationProgram) == 'table' and #GenerationProgram or 0;
+    local CurrentDialectMode = FlowCache[DialectModeCacheSlot];
+    local SelectorLane = FlowCache[MaterializeSelectorLaneSlot];
+    local SelectorValue = FlowCache[MaterializeSelectorValueSlot];
+    local SelectorRecipe = FlowCache[MaterializeSelectorRecipeSlot];
+    local SelectorCompleted = FlowCache[MaterializeSelectorCompletedSlot];
+    local SelectorSeal = FlowCache[MaterializeSelectorSealSlot];
+    local SelectorFinal = FlowCache[MaterializeSelectorFinalSlot];
+    local SelectorGenerationSeal = FlowCache[MaterializeGenerationSealSlot];
+    local SelectorProgramSeal = FlowCache[MaterializeGenerationProgramSealSlot];
+    local MaterializedFields = {
+        FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
+        FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot],
+        FlowCache[MaterializeFusedSlot], FlowCache[MaterializeFreshTableSlot]
+    };
+    if GenerationCount < 2 or GenerationCount > 5
+    or not DialectModeValid(CurrentDialectMode)
+    or DialectModeSeal(CurrentDialectMode, FlowCache[5], FlowCache[7], Index,
+        FlowCache[2], FlowCache[3], Flow[2], Chunk[5], Chunk[6], Chunk[7])
+        ~= FlowCache[DialectModeCacheSlot + 1]
+    or type(SelectorLane) ~= 'number' or SelectorLane < 0 or SelectorLane > 3
+    or type(SelectorValue) ~= 'number' or type(SelectorRecipe) ~= 'number' or SelectorRecipe == 0
+    or type(SelectorCompleted) ~= 'number' or SelectorCompleted < 0 or SelectorCompleted > GenerationCount
+    or type(SelectorSeal) ~= 'number' or (SelectorFinal ~= 0 and SelectorFinal ~= 1) then
+        error('invalid protected payload', 0);
+    end;
+    local ExpectedSelectorLane, ExpectedSelectorRecipe;
+    if SelectorCompleted == 0 then
+        ExpectedSelectorLane = 0;
+        ExpectedSelectorRecipe = GenerationProgram[1][4];
+    else
+        local SelectorRecord = GenerationProgram[SelectorCompleted];
+        ExpectedSelectorLane = 1 + ((SelectorRecord[3] - 1 + CurrentDialectMode % 3) % 3);
+        ExpectedSelectorRecipe = SelectorRecord[4];
+    end;
+    if SelectorLane ~= ExpectedSelectorLane or SelectorRecipe ~= ExpectedSelectorRecipe
+    or SelectorFinal ~= (SelectorCompleted == GenerationCount and 1 or 0) then
+        error('invalid protected payload', 0);
+    end;
+    local IgnoredGenerationSeal, SelectorExpectedProgramSeal = BeginGenerationSeal(
+        CurrentDialectMode, Index, MaterializedFields, FlowCache[2], FlowCache[3],
+        FlowCache[5], FlowCache[7], GenerationProgram);
+    if SelectorProgramSeal ~= SelectorExpectedProgramSeal
+    or ComputeGenerationGuard(SelectorGenerationSeal, CurrentDialectMode, Index,
+        SelectorCompleted, MaterializedFields, GenerationCount, FlowCache[2], FlowCache[3],
+        SelectorProgramSeal) ~= FlowCache[MaterializeGenerationGuardSlot] then
+        error('invalid protected payload', 0);
+    end;
+    local SelectorSource;
+    if SelectorLane == 0 then
+        SelectorSource = MaterializedFields[1] % 4294967296;
+    elseif SelectorLane == 1 then
+        SelectorSource = GenerationFieldDigest(MaterializedFields);
+    elseif SelectorLane == 2 then
+        local SelectorB = type(MaterializedFields[3]) == 'number' and MaterializedFields[3] or 0;
+        local SelectorC = type(MaterializedFields[4]) == 'number' and MaterializedFields[4] or 0;
+        local SelectorFused = type(MaterializedFields[5]) == 'table' and #MaterializedFields[5] or 0;
+        SelectorSource = (SelectorB + PayloadRotate16(SelectorC % 4294967296)
+            + SelectorFused * 65537 + (MaterializedFields[6] and 4099 or 0)) % 4294967296;
+    else
+        SelectorSource = U32(BitXOR(BitXOR(CurrentDialectMode, FlowCache[2]),
+            PayloadRotate16(FlowCache[3])));
+    end;
+    local SelectorMask = U32(BitXOR(BitXOR(SelectorSource, SelectorRecipe), SelectorGenerationSeal));
+    if SelectorLane == 0 then
+        SelectorMask = (U32Mul(SelectorMask, 257) + Index * 17 + SelectorCompleted
+            + __IB2_DOMAIN_OPCODE_STATE__) % 4294967296;
+    elseif SelectorLane == 1 then
+        SelectorMask = (U32Mul(SelectorMask, 65599) + FlowCache[2] + SelectorCompleted * 257
+            + __IB2_DOMAIN_INSTRUCTION_STATE__) % 4294967296;
+    elseif SelectorLane == 2 then
+        SelectorMask = (U32Mul(SelectorMask, 48271) + FlowCache[3] + Index * 257
+            + __IB2_DOMAIN_CODE_DATA_PERMUTATION__) % 4294967296;
+    else
+        SelectorMask = (U32Mul(SelectorMask, 22695477) + CurrentDialectMode + Index
+            + SelectorCompleted * 65537 + __IB2_DOMAIN_FLOW__) % 4294967296;
+    end;
+    local SelectorDecoded = U32(BitXOR(SelectorValue, SelectorMask));
+    local SelectorSealValue = U32(BitXOR(BitXOR(BitXOR(BitXOR(SelectorValue, SelectorSource),
+        SelectorRecipe), SelectorGenerationSeal), U32(BitXOR(CurrentDialectMode, FlowCache[2]))));
+    local ExpectedSelectorSeal = (U32Mul(SelectorSealValue, 65599) + SelectorLane * 4099
+        + SelectorCompleted * 257 + (SelectorFinal == 1 and 65537 or 0)
+        + PayloadRotate16(FlowCache[3]) + __IB2_DOMAIN_FLOW__) % 4294967296;
+    if SelectorDecoded ~= Enum or SelectorSeal ~= ExpectedSelectorSeal then
+        error('invalid protected payload', 0);
+    end;
+    FlowCache[MaterializeSelectorLaneSlot], FlowCache[MaterializeSelectorValueSlot],
+        FlowCache[MaterializeSelectorRecipeSlot], FlowCache[MaterializeSelectorCompletedSlot],
+        FlowCache[MaterializeSelectorSealSlot], FlowCache[MaterializeSelectorFinalSlot] =
+        nil, nil, nil, nil, nil, nil;
+    if SelectorFinal == 1 then
+        FlowCache[MaterializeIndexSlot], FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
+            FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot], FlowCache[MaterializeStageSlot],
+            FlowCache[MaterializeConstantFieldsSlot], FlowCache[MaterializeConstantResolverSlot],
+            FlowCache[MaterializeFusedSlot], FlowCache[MaterializeFreshTableSlot],
+            FlowCache[MaterializeGenerationProgramSlot], FlowCache[MaterializeGenerationSealSlot],
+            FlowCache[MaterializeGenerationGuardSlot], FlowCache[MaterializeGenerationProgramSealSlot] =
+            nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil;
+    end;
+    return CurrentDialectMode;
+end;
+
+local function GetInstruction(Chunk, Index, Flow, AllowMaterializer)
     local BlockMap = Chunk[10];
     local Block = BlockMap and BlockMap[Index];
     if not Block then error('invalid protected payload', 0); end;
 
+    -- The real instruction is decoded once into an invocation-local overlay.
+    -- A synthetic materializer leaf rewinds both PC and Flow by one; the next
+    -- top-level fetch consumes this private entry and replays the same PC.
+    local MaterializeIndexSlot = 32 + ((Chunk[5] * 257 + Chunk[6] * 17 + Chunk[7]
+        + __IB2_DOMAIN_CODE_DATA_PERMUTATION__) % 104729);
+    local MaterializeOpcodeSlot = MaterializeIndexSlot + 104729;
+    local MaterializeASlot = MaterializeIndexSlot + 209458;
+    local MaterializeBSlot = MaterializeIndexSlot + 314187;
+    local MaterializeCSlot = MaterializeIndexSlot + 418916;
+    local MaterializeStageSlot = MaterializeIndexSlot + 523645;
+    local MaterializeConstantFieldsSlot = MaterializeIndexSlot + 628374;
+    local MaterializeConstantResolverSlot = MaterializeIndexSlot + 733103;
+    local MaterializeFusedSlot = MaterializeIndexSlot + 837832;
+    local MaterializeFreshTableSlot = MaterializeIndexSlot + 942561;
+    local MaterializeGenerationProgramSlot = MaterializeIndexSlot + 1047290;
+    local MaterializeGenerationSealSlot = MaterializeIndexSlot + 1152019;
+    local MaterializeGenerationGuardSlot = MaterializeIndexSlot + 1256748;
+    local MaterializeGenerationProgramSealSlot = MaterializeIndexSlot + 1361477;
+    local MaterializeSelectorLaneSlot = MaterializeIndexSlot + 1466206;
+    local MaterializeSelectorValueSlot = MaterializeIndexSlot + 1570935;
+    local MaterializeSelectorRecipeSlot = MaterializeIndexSlot + 1675664;
+    local MaterializeSelectorCompletedSlot = MaterializeIndexSlot + 1780393;
+    local MaterializeSelectorSealSlot = MaterializeIndexSlot + 1885122;
+    local MaterializeSelectorFinalSlot = MaterializeIndexSlot + 1989851;
+    local FlowCache = Flow[4];
+    local DialectModeCacheSlot = DialectModeSlot(Chunk);
+
+    local function PrepareSelectorLane(InstructionFields, SelectorTarget, SelectorRawLane,
+        SelectorRecipe, GenerationCompleted, GenerationSeal, CurrentDialectMode,
+        EntryState, CurrentChunkState, SelectorFinal, PublishSelector)
+        if type(SelectorTarget) ~= 'number' or type(SelectorRecipe) ~= 'number' or SelectorRecipe == 0
+        or type(GenerationSeal) ~= 'number' then error('invalid protected payload', 0); end;
+        local SelectorLane;
+        if GenerationCompleted == 0 then
+            SelectorLane = 0;
+        else
+            if type(SelectorRawLane) ~= 'number' or SelectorRawLane < 1 or SelectorRawLane > 3 then
+                error('invalid protected payload', 0);
+            end;
+            SelectorLane = 1 + ((SelectorRawLane - 1 + CurrentDialectMode % 3) % 3);
+        end;
+        local SelectorSource;
+        if SelectorLane == 0 then
+            SelectorSource = InstructionFields[1] % 4294967296;
+        elseif SelectorLane == 1 then
+            SelectorSource = GenerationFieldDigest(InstructionFields);
+        elseif SelectorLane == 2 then
+            local SelectorB = type(InstructionFields[3]) == 'number' and InstructionFields[3] or 0;
+            local SelectorC = type(InstructionFields[4]) == 'number' and InstructionFields[4] or 0;
+            local SelectorFused = type(InstructionFields[5]) == 'table' and #InstructionFields[5] or 0;
+            SelectorSource = (SelectorB + PayloadRotate16(SelectorC % 4294967296)
+                + SelectorFused * 65537 + (InstructionFields[6] and 4099 or 0)) % 4294967296;
+        else
+            SelectorSource = U32(BitXOR(BitXOR(CurrentDialectMode, EntryState),
+                PayloadRotate16(CurrentChunkState)));
+        end;
+        local SelectorMask = U32(BitXOR(BitXOR(SelectorSource, SelectorRecipe), GenerationSeal));
+        if SelectorLane == 0 then
+            SelectorMask = (U32Mul(SelectorMask, 257) + Index * 17 + GenerationCompleted
+                + __IB2_DOMAIN_OPCODE_STATE__) % 4294967296;
+        elseif SelectorLane == 1 then
+            SelectorMask = (U32Mul(SelectorMask, 65599) + EntryState + GenerationCompleted * 257
+                + __IB2_DOMAIN_INSTRUCTION_STATE__) % 4294967296;
+        elseif SelectorLane == 2 then
+            SelectorMask = (U32Mul(SelectorMask, 48271) + CurrentChunkState + Index * 257
+                + __IB2_DOMAIN_CODE_DATA_PERMUTATION__) % 4294967296;
+        else
+            SelectorMask = (U32Mul(SelectorMask, 22695477) + CurrentDialectMode + Index
+                + GenerationCompleted * 65537 + __IB2_DOMAIN_FLOW__) % 4294967296;
+        end;
+        local SelectorValue = U32(BitXOR(SelectorTarget, SelectorMask));
+        local SelectorSealValue = U32(BitXOR(BitXOR(BitXOR(BitXOR(SelectorValue, SelectorSource),
+            SelectorRecipe), GenerationSeal), U32(BitXOR(CurrentDialectMode, EntryState))));
+        local SelectorSeal = (U32Mul(SelectorSealValue, 65599) + SelectorLane * 4099
+            + GenerationCompleted * 257 + (SelectorFinal and 65537 or 0)
+            + PayloadRotate16(CurrentChunkState) + __IB2_DOMAIN_FLOW__) % 4294967296;
+        local SelectorDecoded = U32(BitXOR(SelectorValue, SelectorMask));
+        if SelectorDecoded ~= SelectorTarget then error('invalid protected payload', 0); end;
+        if PublishSelector then
+            FlowCache[MaterializeSelectorLaneSlot] = SelectorLane;
+            FlowCache[MaterializeSelectorValueSlot] = SelectorValue;
+            FlowCache[MaterializeSelectorRecipeSlot] = SelectorRecipe;
+            FlowCache[MaterializeSelectorCompletedSlot] = GenerationCompleted;
+            FlowCache[MaterializeSelectorSealSlot] = SelectorSeal;
+            FlowCache[MaterializeSelectorFinalSlot] = SelectorFinal and 1 or 0;
+        end;
+        return SelectorDecoded;
+    end;
+    if AllowMaterializer and FlowCache and FlowCache[MaterializeIndexSlot] == Index then
+        local MaterializeStage = FlowCache[MaterializeStageSlot];
+        local GenerationProgram = FlowCache[MaterializeGenerationProgramSlot];
+        local GenerationCount = type(GenerationProgram) == 'table' and #GenerationProgram or 0;
+        local CurrentDialectMode = FlowCache[DialectModeCacheSlot];
+        local GenerationProgramSeal = FlowCache[MaterializeGenerationProgramSealSlot];
+        local MaterializedFields = {
+            FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot],
+            FlowCache[MaterializeBSlot], FlowCache[MaterializeCSlot],
+            FlowCache[MaterializeFusedSlot], FlowCache[MaterializeFreshTableSlot]
+        };
+        local IgnoredGenerationSeal, ExpectedGenerationProgramSeal = BeginGenerationSeal(
+            CurrentDialectMode, Index, MaterializedFields, FlowCache[2], FlowCache[3],
+            FlowCache[5], FlowCache[7], GenerationProgram);
+        if type(MaterializeStage) ~= 'number' or MaterializeStage < 1 or MaterializeStage > GenerationCount
+        or GenerationCount < 2 or GenerationCount > 5
+        or Flow[1] ~= Index - 1 or Flow[2] ~= Block
+        or FlowCache[1] ~= Block or FlowCache[2] ~= Flow[3]
+        or FlowCache[MaterializeSelectorSealSlot] ~= nil
+        or not DialectModeValid(CurrentDialectMode)
+        or not DialectModeAccepted(Block, CurrentDialectMode)
+        or DialectModeSeal(CurrentDialectMode, FlowCache[5], FlowCache[7],
+            Index, FlowCache[2], FlowCache[3], Block, Chunk[5], Chunk[6], Chunk[7])
+            ~= FlowCache[DialectModeCacheSlot + 1]
+        or GenerationProgramSeal ~= ExpectedGenerationProgramSeal
+        or ComputeGenerationGuard(FlowCache[MaterializeGenerationSealSlot], CurrentDialectMode,
+            Index, MaterializeStage - 1, MaterializedFields, GenerationCount,
+            FlowCache[2], FlowCache[3], GenerationProgramSeal)
+            ~= FlowCache[MaterializeGenerationGuardSlot] then
+            error('invalid protected payload', 0);
+        end;
+        local GenerationRecord = GenerationProgram[MaterializeStage];
+        local GenerationFamily, GenerationMask = GenerationRecord[1], GenerationRecord[2];
+        local SelectorRawLane, SelectorRecipe = GenerationRecord[3], GenerationRecord[4];
+        local SelectorLane = 1 + ((SelectorRawLane - 1 + CurrentDialectMode % 3) % 3);
+        MaterializedFields = ApplyGenerationRewrite(MaterializedFields, GenerationFamily, GenerationMask);
+        local GenerationSeal = AdvanceGenerationSeal(
+            FlowCache[MaterializeGenerationSealSlot], CurrentDialectMode, Index, MaterializeStage,
+            GenerationFamily, GenerationMask, SelectorLane, SelectorRecipe, MaterializedFields,
+            FlowCache[2], FlowCache[3], GenerationProgramSeal);
+        FlowCache[MaterializeOpcodeSlot], FlowCache[MaterializeASlot] = MaterializedFields[1], MaterializedFields[2];
+        FlowCache[MaterializeGenerationSealSlot] = GenerationSeal;
+        FlowCache[MaterializeGenerationGuardSlot] = ComputeGenerationGuard(
+            GenerationSeal, CurrentDialectMode, Index, MaterializeStage,
+            MaterializedFields, GenerationCount, FlowCache[2], FlowCache[3],
+            GenerationProgramSeal);
+        Flow[1] = Index;
+        if MaterializeStage < GenerationCount then
+            FlowCache[MaterializeStageSlot] = MaterializeStage + 1;
+            local MaterializeEnum = SelectMaterializerEnum(
+                Chunk, MaterializeStage, GenerationFamily, CurrentDialectMode, SelectorRecipe);
+            MaterializeEnum = PrepareSelectorLane(MaterializedFields, MaterializeEnum,
+                SelectorRawLane, SelectorRecipe, MaterializeStage, GenerationSeal,
+                CurrentDialectMode, FlowCache[2], FlowCache[3], false, true);
+            return {}, MaterializeEnum;
+        end;
+        local MaterializedConstantFields = FlowCache[MaterializeConstantFieldsSlot];
+        local MaterializedConstantResolver = FlowCache[MaterializeConstantResolverSlot];
+        local FinalLocalOpcode = BitXOR(BitXOR(MaterializedFields[1],
+            OpcodeKey(Index, Chunk[5], Chunk[6], Chunk[7])),
+            BlockFieldKey(FlowCache[2], Index, 0, Chunk[5], Chunk[6], Chunk[7]));
+        local MaterializeEnum = Chunk[8][FinalLocalOpcode + 1];
+        if type(MaterializeEnum) ~= 'number' then error('invalid protected payload', 0); end;
+        MaterializeEnum = PrepareSelectorLane(MaterializedFields, MaterializeEnum,
+            SelectorRawLane, SelectorRecipe, MaterializeStage, GenerationSeal,
+            CurrentDialectMode, FlowCache[2], FlowCache[3], true, true);
+        -- Bind constants through a private copy: fused binding replaces member
+        -- tables with proxies, while the sealed selector validator must still
+        -- observe the exact post-generation raw field digest.
+        local MaterializedBindingFields = {
+            MaterializedFields[1], MaterializedFields[2], MaterializedFields[3],
+            MaterializedFields[4], nil, MaterializedFields[6]
+        };
+        if type(MaterializedFields[5]) == 'table' then
+            local MaterializedBindingFused = {};
+            for FusedIndex = 1, #MaterializedFields[5] do
+                local MaterializedBindingMember = MaterializedFields[5][FusedIndex];
+                MaterializedBindingFused[FusedIndex] = {
+                    MaterializedBindingMember[1], MaterializedBindingMember[2],
+                    MaterializedBindingMember[3], MaterializedBindingMember[4]
+                };
+            end;
+            MaterializedBindingFields[5] = MaterializedBindingFused;
+        end;
+        local MaterializedInstruction = BindInstructionOperands(
+            MaterializedBindingFields, MaterializedConstantFields, MaterializedConstantResolver);
+        return MaterializedInstruction, MaterializeEnum;
+    end;
+
     local LastIndex = Flow[1];
     local CurrentBlock = Flow[2];
-    local FlowCache = Flow[4];
     local EntryState;
     local CurrentChunkState;
     local PreviousInstructionState;
     local PreviousOpcodeState;
+    local CurrentDialectMode;
     if not CurrentBlock then
         if Index ~= 1 then error('invalid protected payload', 0); end;
         __IB2_FIRST_BLOCK_CHECK__
         EntryState = U32(BitXOR(Chunk[12], InitialFlowKey(Chunk[5], Chunk[6], Chunk[7])));
         CurrentChunkState = U32(BitXOR(Chunk[16], InitialChunkKey(Chunk[5], Chunk[6], Chunk[7])));
+        CurrentDialectMode = U32(BitXOR(Chunk[17], InitialDialectModeKey(
+            EntryState, CurrentChunkState, Block[1], Chunk[5], Chunk[6], Chunk[7])));
         PreviousInstructionState = BeginInstructionState(CurrentChunkState, EntryState, Block[1], Block[7], Chunk[5], Chunk[6], Chunk[7]);
         PreviousOpcodeState = BeginOpcodeState(CurrentChunkState, EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]);
     elseif CurrentBlock ~= Block or Index ~= LastIndex + 1 then
         if Index ~= Block[1] or not FlowCache or FlowCache[1] ~= CurrentBlock
         or FlowCache[2] ~= Flow[3]
         or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5]
-        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7] then
+        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7]
+        or not DialectModeValid(FlowCache[DialectModeCacheSlot])
+        or DialectModeSeal(FlowCache[DialectModeCacheSlot], FlowCache[5], FlowCache[7],
+            LastIndex, FlowCache[2], FlowCache[3], CurrentBlock, Chunk[5], Chunk[6], Chunk[7])
+            ~= FlowCache[DialectModeCacheSlot + 1] then
             error('invalid protected payload', 0);
         end;
         local WrappedState = CurrentBlock[5][Block[1]];
-        local WrappedChunkState = CurrentBlock[10][Block[1]];
-        if not WrappedState or not WrappedChunkState then error('invalid protected payload', 0); end;
+        local WrappedChunkRecord = CurrentBlock[10][Block[1]];
+        if not WrappedState or type(WrappedChunkRecord) ~= 'table' then error('invalid protected payload', 0); end;
+        local WrappedChunkState, WrappedMode = WrappedChunkRecord[1], WrappedChunkRecord[2];
+        if not WrappedChunkState or not WrappedMode then error('invalid protected payload', 0); end;
         EntryState = U32(BitXOR(WrappedState, FlowKey(Flow[3], LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
         CurrentChunkState = U32(BitXOR(WrappedChunkState, ChunkChainKey(
             FlowCache[3], Flow[3], LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
+        CurrentDialectMode = U32(BitXOR(WrappedMode, DialectModeKey(
+            Flow[3], FlowCache[3], EntryState, CurrentChunkState,
+            LastIndex, Block[1], Chunk[5], Chunk[6], Chunk[7])));
         PreviousInstructionState = BeginInstructionState(CurrentChunkState, EntryState, Block[1], Block[7], Chunk[5], Chunk[6], Chunk[7]);
         PreviousOpcodeState = BeginOpcodeState(CurrentChunkState, EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]);
     else
         if not FlowCache or FlowCache[1] ~= CurrentBlock or FlowCache[2] ~= Flow[3]
         or InstructionStateSeal(FlowCache[4], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[5]
-        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7] then
+        or OpcodeStateSeal(FlowCache[6], LastIndex, FlowCache[3], Flow[3], CurrentBlock[7]) ~= FlowCache[7]
+        or not DialectModeValid(FlowCache[DialectModeCacheSlot])
+        or DialectModeSeal(FlowCache[DialectModeCacheSlot], FlowCache[5], FlowCache[7],
+            LastIndex, FlowCache[2], FlowCache[3], CurrentBlock, Chunk[5], Chunk[6], Chunk[7])
+            ~= FlowCache[DialectModeCacheSlot + 1] then
             error('invalid protected payload', 0);
         end;
         EntryState = Flow[3];
         CurrentChunkState = FlowCache[3];
+        CurrentDialectMode = FlowCache[DialectModeCacheSlot];
         PreviousInstructionState = FlowCache[4];
         PreviousOpcodeState = FlowCache[6];
     end;
 
     if FlowVerifier(EntryState, Block[1], Chunk[5], Chunk[6], Chunk[7]) ~= Block[6]
-    or ChunkState(EntryState, Block[1], Block[2], Chunk[5], Chunk[6], Chunk[7]) ~= CurrentChunkState then
+    or ChunkState(EntryState, Block[1], Block[2], Chunk[5], Chunk[6], Chunk[7]) ~= CurrentChunkState
+    or not DialectModeValid(CurrentDialectMode)
+    or not DialectModeAccepted(Block, CurrentDialectMode) then
         error('invalid protected payload', 0);
     end;
 
-    local Inst, Digest = DecodeInstructionBlock(Chunk, Block, EntryState, CurrentChunkState, PreviousOpcodeState, Index);
+    local Inst, Digest, InstructionConstantFields, InstructionConstantResolver = DecodeInstructionBlock(
+        Chunk, Block, EntryState, CurrentChunkState, PreviousOpcodeState, Index);
     local CurrentInstructionState = AdvanceInstructionState(
         PreviousInstructionState, Digest, Index, CurrentChunkState, EntryState);
     local CurrentInstructionSeal = InstructionStateSeal(
@@ -2086,9 +3315,72 @@ local function GetInstruction(Chunk, Index, Flow)
     FlowCache = {};
     FlowCache[1], FlowCache[2], FlowCache[3], FlowCache[4], FlowCache[5], FlowCache[6], FlowCache[7] =
         Block, EntryState, CurrentChunkState, CurrentInstructionState, CurrentInstructionSeal, CurrentOpcodeState, CurrentOpcodeSeal;
+    FlowCache[DialectModeCacheSlot] = CurrentDialectMode;
+    FlowCache[DialectModeCacheSlot + 1] = DialectModeSeal(CurrentDialectMode,
+        CurrentInstructionSeal, CurrentOpcodeSeal, Index, EntryState, CurrentChunkState,
+        Block, Chunk[5], Chunk[6], Chunk[7]);
     Flow[1], Flow[2], Flow[3], Flow[4] = Index, Block, EntryState, FlowCache;
+    local MaterializeEnum;
+    if AllowMaterializer then
+        FlowCache[MaterializeIndexSlot] = Index;
+        FlowCache[MaterializeOpcodeSlot] = Inst[1];
+        FlowCache[MaterializeASlot] = Inst[2];
+        FlowCache[MaterializeBSlot] = Inst[3];
+        FlowCache[MaterializeCSlot] = Inst[4];
+        FlowCache[MaterializeStageSlot] = 1;
+        FlowCache[MaterializeConstantFieldsSlot] = InstructionConstantFields;
+        FlowCache[MaterializeConstantResolverSlot] = InstructionConstantResolver;
+        FlowCache[MaterializeFusedSlot] = Inst[5];
+        FlowCache[MaterializeFreshTableSlot] = Inst[6];
+        local GenerationProgram = Inst[7];
+        local GenerationCount = type(GenerationProgram) == 'table' and #GenerationProgram or 0;
+        if GenerationCount < 2 or GenerationCount > 5 then error('invalid protected payload', 0); end;
+        FlowCache[MaterializeGenerationProgramSlot] = GenerationProgram;
+        local GenerationSeal, GenerationProgramSeal = BeginGenerationSeal(
+            CurrentDialectMode, Index, Inst, EntryState, CurrentChunkState,
+            CurrentInstructionSeal, CurrentOpcodeSeal, GenerationProgram);
+        FlowCache[MaterializeGenerationProgramSealSlot] = GenerationProgramSeal;
+        FlowCache[MaterializeGenerationSealSlot] = GenerationSeal;
+        FlowCache[MaterializeGenerationGuardSlot] = ComputeGenerationGuard(
+            GenerationSeal, CurrentDialectMode, Index, 0, Inst, GenerationCount,
+            EntryState, CurrentChunkState, GenerationProgramSeal);
+        MaterializeEnum = SelectMaterializerEnum(
+            Chunk, 0, GenerationProgram[1][1], CurrentDialectMode, GenerationProgram[1][4]);
+        MaterializeEnum = PrepareSelectorLane(Inst, MaterializeEnum,
+            GenerationProgram[1][3], GenerationProgram[1][4], 0, GenerationSeal,
+            CurrentDialectMode, EntryState, CurrentChunkState, false, true);
+        Inst = {};
+    else
+        local GenerationProgram = Inst[7];
+        if type(GenerationProgram) ~= 'table' or #GenerationProgram < 2 or #GenerationProgram > 5 then
+            error('invalid protected payload', 0);
+        end;
+        local GenerationSeal, GenerationProgramSeal = BeginGenerationSeal(
+            CurrentDialectMode, Index, Inst, EntryState, CurrentChunkState,
+            CurrentInstructionSeal, CurrentOpcodeSeal, GenerationProgram);
+        local SelectorRawLane, SelectorRecipe;
+        for GenerationIndex = 1, #GenerationProgram do
+            local GenerationRecord = GenerationProgram[GenerationIndex];
+            local SelectorLane = 1 + ((GenerationRecord[3] - 1 + CurrentDialectMode % 3) % 3);
+            Inst = ApplyGenerationRewrite(Inst, GenerationRecord[1], GenerationRecord[2]);
+            GenerationSeal = AdvanceGenerationSeal(GenerationSeal, CurrentDialectMode,
+                Index, GenerationIndex, GenerationRecord[1], GenerationRecord[2],
+                SelectorLane, GenerationRecord[4], Inst, EntryState, CurrentChunkState,
+                GenerationProgramSeal);
+            SelectorRawLane, SelectorRecipe = GenerationRecord[3], GenerationRecord[4];
+        end;
+        Inst[7] = nil;
+        local FinalLocalOpcode = BitXOR(BitXOR(Inst[1], OpcodeKey(Index, Chunk[5], Chunk[6], Chunk[7])),
+            BlockFieldKey(EntryState, Index, 0, Chunk[5], Chunk[6], Chunk[7]));
+        MaterializeEnum = Chunk[8][FinalLocalOpcode + 1];
+        if type(MaterializeEnum) ~= 'number' then error('invalid protected payload', 0); end;
+        MaterializeEnum = PrepareSelectorLane(Inst, MaterializeEnum,
+            SelectorRawLane, SelectorRecipe, #GenerationProgram, GenerationSeal,
+            CurrentDialectMode, EntryState, CurrentChunkState, true, false);
+        Inst = BindInstructionOperands(Inst, InstructionConstantFields, InstructionConstantResolver);
+    end;
     __IB2_GUARD_BIND__
-    return Inst;
+    return Inst, MaterializeEnum;
 end;
 
 
@@ -2132,6 +3424,15 @@ end;";
 					.Replace("__IB2_FIRST_BLOCK_CHECK__", "")
 					.Replace("__IB2_GUARD_BIND__", "");
 			}
+			for (int mode = 0; mode < materializerOpcodes.Length; mode++)
+				blockRuntime = blockRuntime.Replace(
+					"__IB2_MATERIALIZER_OPCODE_" + mode + "__",
+					materializerOpcodes[mode].VIndex.ToString());
+			if (Regex.IsMatch(blockRuntime, @"__IB2_MATERIALIZER_OPCODE_\d+__"))
+				throw new InvalidOperationException("A materializer opcode placeholder was not replaced.");
+			string dialectModeValidation = "return " + string.Join(" or ",
+				_context.DialectModeTokens.Select(token => "Value==" + ScrambleUInt(token))) + ";";
+			blockRuntime = blockRuntime.Replace("__IB2_DIALECT_MODE_VALID__", dialectModeValidation);
 			vm += T(ApplyBuildDomains(blockRuntime));
 
 			string loopRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP2_LI_R : VMStrings.VMP2_LI) : (useRepeat ? VMStrings.VMP2_R : VMStrings.VMP2);
@@ -2139,6 +3440,7 @@ end;";
 				? "GuardProbe(false);"
 				: "");
 			vm += T(loopRuntime);
+			vm += T(BuildHandlerFragmentRuntime());
 
 			if (settings.Noise)
 				vm += T(AntiDumpGenerator.GenerateLoopNoise(guardRandom));
@@ -2171,7 +3473,12 @@ end;";
 
 			string BuildHandler(int opcodeIndex)
 			{
-				string code = ApplySemanticPolymorphism(virtuals[opcodeIndex].GetObfuscated(_context));
+				// CALL and TAILCALL validation now lives between target acquisition and
+				// argument acquisition in the shared tokenized trampoline. Keeping it out
+				// of terminal leaves avoids the old validate-write-reread-call signature.
+				string code = virtuals[opcodeIndex].GetObfuscated(_context);
+				code = ApplySemanticPolymorphism(code);
+				code = ApplyHandlerFragmentSharing(code);
 				code = ApplyHandlerTemplate(code);
 				code = T(code);
 				code = ScrambleOps(code);
@@ -2194,21 +3501,24 @@ end;";
 				return token;
 			}
 
+			int ChainKey(int dialectMode, int opcodeIndex) =>
+				dialectMode * virtuals.Count + opcodeIndex;
 			var continuationChains = new Dictionary<int, List<ContinuationNode>>();
 			var allContinuationNodes = new List<ContinuationNode>();
 			int[] firstLaneCoverage = Enumerable.Range(0, laneCount).ToArray();
 			firstLaneCoverage.Shuffle(r);
+			for (int dialectMode = 0; dialectMode < _context.DialectModeCount; dialectMode++)
 			for (int opcodeIndex = 0; opcodeIndex < virtuals.Count; opcodeIndex++)
 			{
+				bool firstPath = dialectMode == 0 && opcodeIndex == 0;
 				int nodeCount = 3 + r.Next(3);
-				if (opcodeIndex == 0)
-					nodeCount = Math.Max(nodeCount, laneCount);
+				if (firstPath) nodeCount = Math.Max(nodeCount, laneCount);
 				var chain = new List<ContinuationNode>();
 				int previousLane = -1;
 				for (int depth = 0; depth < nodeCount; depth++)
 				{
 					int lane;
-					if (opcodeIndex == 0 && depth < laneCount)
+					if (firstPath && depth < laneCount)
 						lane = firstLaneCoverage[depth];
 					else
 					{
@@ -2218,6 +3528,7 @@ end;";
 					var node = new ContinuationNode
 					{
 						OpcodeIndex = opcodeIndex,
+						DialectMode = dialectMode,
 						Depth = depth,
 						Lane = lane,
 						Token = NewContinuationToken()
@@ -2236,7 +3547,7 @@ end;";
 				if (settings.Noise)
 					handler += AntiDumpGenerator.GenerateHandlerNoise(guardRandom);
 				chain[chain.Count - 1].Handler = handler;
-				continuationChains[opcodeIndex] = chain;
+				continuationChains[ChainKey(dialectMode, opcodeIndex)] = chain;
 			}
 
 			string dispatchMaskName = T("DispatchMask");
@@ -2250,6 +3561,22 @@ end;";
 			string bitXorName = T("BitXOR");
 			string u32Name = T("U32");
 			string enumName = T("Enum");
+			string currentDialectName = T("CurrentDialectMode");
+			string dialectEnumName = T("DialectEnum");
+			int Gcd(int left, int right)
+			{
+				while (right != 0) (left, right) = (right, left % right);
+				return Math.Abs(left);
+			}
+			var dialectMultipliers = new int[_context.DialectModeCount];
+			var dialectAddends = new int[_context.DialectModeCount];
+			for (int mode = 0; mode < _context.DialectModeCount; mode++)
+			{
+				int multiplier;
+				do multiplier = r.Next(1, virtuals.Count + 1); while (Gcd(multiplier, virtuals.Count) != 1);
+				dialectMultipliers[mode] = multiplier;
+				dialectAddends[mode] = r.Next(virtuals.Count);
+			}
 			DispatcherTemplate dispatcherTemplate = DispatcherTemplateSelector.Select(dispatcherRandom);
 			// State updates have three dependency-safe orders. This varies the def-use
 			// shape even when two builds select the same outer dispatcher template.
@@ -2258,44 +3585,46 @@ end;";
 			string EncodedState(uint token, string mask) =>
 				u32Name + "(" + bitXorName + "(" + ScrambleUInt(token) + "," + mask + "))";
 
-			string EntryAssignment(int opcodeIndex)
+			string EntryAssignment(int dialectMode, int opcodeIndex)
 			{
-				ContinuationNode entry = continuationChains[opcodeIndex][0];
+				ContinuationNode entry = continuationChains[ChainKey(dialectMode, opcodeIndex)][0];
 				string state = dispatchStateName + "=" + EncodedState(entry.Token, dispatchMaskName) + ";";
 				string lane = dispatchLaneName + "=" + ScrambleNumber(entry.Lane) + ";";
 				return transitionLayout == 1 ? lane + state : state + lane;
 			}
 
-			string BuildOpcodeSelector(List<int> opcodes)
+			int DialectSelectorValue(int dialectMode, int opcodeIndex) =>
+				(virtuals[opcodeIndex].VIndex * dialectMultipliers[dialectMode]
+				 + dialectAddends[dialectMode]) % virtuals.Count;
+
+			string BuildOpcodeSelector(int dialectMode, List<int> opcodes)
 			{
 				if (opcodes.Count == 1)
-					return EntryAssignment(opcodes[0]);
+					return EntryAssignment(dialectMode, opcodes[0]);
 				if (opcodes.Count == 2)
 				{
 					int first = opcodes[0];
 					int second = opcodes[1];
-					string firstValue = ScrambleNumber(virtuals[first].VIndex);
+					string firstValue = ScrambleNumber(DialectSelectorValue(dialectMode, first));
 					switch (r.Next(3))
 					{
 						case 0:
-							return "if " + enumName + "==" + firstValue + " then " + EntryAssignment(first) + "else " + EntryAssignment(second) + "end;";
+							return "if " + dialectEnumName + "==" + firstValue + " then " + EntryAssignment(dialectMode, first) + "else " + EntryAssignment(dialectMode, second) + "end;";
 						case 1:
-							return "if " + enumName + "~=" + firstValue + " then " + EntryAssignment(second) + "else " + EntryAssignment(first) + "end;";
+							return "if " + dialectEnumName + "~=" + firstValue + " then " + EntryAssignment(dialectMode, second) + "else " + EntryAssignment(dialectMode, first) + "end;";
 						default:
-							return "if " + enumName + ">" + firstValue + " then " + EntryAssignment(second) + "else " + EntryAssignment(first) + "end;";
+							return "if " + dialectEnumName + ">" + firstValue + " then " + EntryAssignment(dialectMode, second) + "else " + EntryAssignment(dialectMode, first) + "end;";
 					}
 				}
 
-				// Every threshold and leaf comparison is expressed in virtual-opcode
-				// space. Sorting by the source list index would silently misroute a
-				// randomized VIndex permutation.
-				List<int> ordered = opcodes.OrderBy(opcode => virtuals[opcode].VIndex).ToList();
+				List<int> ordered = opcodes
+					.OrderBy(opcode => DialectSelectorValue(dialectMode, opcode)).ToList();
 				int middle = ordered.Count / 2;
 				List<int> left = ordered.Take(middle).ToList();
 				List<int> right = ordered.Skip(middle).ToList();
-				int threshold = virtuals[left.Last()].VIndex;
-				return "if " + enumName + "<=" + ScrambleNumber(threshold) + " then " +
-				       BuildOpcodeSelector(left) + "else " + BuildOpcodeSelector(right) + "end;";
+				int threshold = DialectSelectorValue(dialectMode, left.Last());
+				return "if " + dialectEnumName + "<=" + ScrambleNumber(threshold) + " then " +
+				       BuildOpcodeSelector(dialectMode, left) + "else " + BuildOpcodeSelector(dialectMode, right) + "end;";
 			}
 
 			string DecodedState() => settings.AntiDump
@@ -2354,6 +3683,25 @@ end;";
 				return result.ToString();
 			}
 
+			string DialectNodeChain(IEnumerable<ContinuationNode> nodes, bool inlineLane)
+			{
+				List<ContinuationNode> available = nodes.ToList();
+				int[] modes = available.Select(node => node.DialectMode).Distinct().ToArray();
+				modes.Shuffle(r);
+				var result = new StringBuilder();
+				for (int index = 0; index < modes.Length; index++)
+				{
+					int mode = modes[index];
+					result.Append(index == 0 ? "if " : "elseif ")
+						.Append(currentDialectName).Append("==")
+						.Append(ScrambleUInt(_context.DialectModeTokens[mode])).Append(" then ")
+						.Append(NodeChain(available.Where(node => node.DialectMode == mode)
+							.OrderBy(_ => r.Next()), inlineLane));
+				}
+				result.Append("end;");
+				return result.ToString();
+			}
+
 			uint dispatchSaltFactor = (uint)(1 + r.Next(1, 32768) * 2);
 			uint dispatchSaltAddend = unchecked((uint)r.NextInt64(1L, 4294967296L));
 			vm += "local " + dispatchMaskName + "=" + u32Name + "(" + bitXorName + "(" + bitXorName + "(" + T("Flow") + "[3]," +
@@ -2364,7 +3712,21 @@ end;";
 			      ScrambleUInt(dispatchSaltAddend) + ")%4294967296;";
 			vm += "local " + dispatchStateName + "," + dispatchLaneName + "," + dispatchStepMaskName + ";" +
 			      "local " + dispatchActiveName + "=true;local " + dispatchStepsName + "=0;local " + dispatchMatchedName + ";";
-			vm += BuildOpcodeSelector(Enumerable.Range(0, virtuals.Count).ToList());
+			vm += "local " + currentDialectName + "=" + T("ResolveDialectMode") + "(" +
+			      T("Chunk") + "," + T("Flow") + "," + T("InstrPoint") + "," + enumName + ");" +
+			      "local " + dialectEnumName + ";";
+			int[] dialectOrder = Enumerable.Range(0, _context.DialectModeCount).ToArray();
+			dialectOrder.Shuffle(r);
+			for (int dialectIndex = 0; dialectIndex < dialectOrder.Length; dialectIndex++)
+			{
+				int dialectMode = dialectOrder[dialectIndex];
+				vm += (dialectIndex == 0 ? "if " : "elseif ") + currentDialectName + "==" +
+				      ScrambleUInt(_context.DialectModeTokens[dialectMode]) + " then " +
+				      dialectEnumName + "=(" + enumName + "*" + ScrambleNumber(dialectMultipliers[dialectMode]) +
+				      "+" + ScrambleNumber(dialectAddends[dialectMode]) + ")%" + ScrambleNumber(virtuals.Count) + ";" +
+				      BuildOpcodeSelector(dialectMode, Enumerable.Range(0, virtuals.Count).ToList());
+			}
+			vm += "else error('invalid protected payload',0);end;";
 
 			int maximumDepth = continuationChains.Values.Max(chain => chain.Count - 1);
 			string depthGuard = "if " + dispatchStepsName + ">" + ScrambleNumber(maximumDepth) + " then error('invalid protected payload',0);end;";
@@ -2389,7 +3751,7 @@ end;";
 				{
 					int lane = laneOrder[laneOrderIndex];
 					vm += (laneOrderIndex == 0 ? "if " : "elseif ") + dispatchLaneName + "==" + ScrambleNumber(lane) + " then ";
-					vm += NodeChain(allContinuationNodes.Where(node => node.Lane == lane).OrderBy(_ => r.Next()), false);
+					vm += DialectNodeChain(allContinuationNodes.Where(node => node.Lane == lane), false);
 				}
 				vm += "end;if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;end;";
 			}
@@ -2398,7 +3760,7 @@ end;";
 				// Template B: token and lane checks share one flat threaded state chain.
 				// A repeat terminator replaces the active-condition loop header.
 				vm += "repeat " + loopPrefix;
-				vm += NodeChain(allContinuationNodes.OrderBy(_ => r.Next()), true);
+				vm += DialectNodeChain(allContinuationNodes, true);
 				vm += "if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;until not " + dispatchActiveName + ";";
 			}
 			else
@@ -2419,13 +3781,58 @@ end;";
 					{
 						int lane = depthLanes[laneIndex];
 						vm += (laneIndex == 0 ? "if " : "elseif ") + dispatchLaneName + "==" + ScrambleNumber(lane) + " then ";
-						vm += NodeChain(allContinuationNodes.Where(node => node.Depth == depth && node.Lane == lane).OrderBy(_ => r.Next()), false);
+						vm += DialectNodeChain(allContinuationNodes.Where(node => node.Depth == depth && node.Lane == lane), false);
 					}
 					vm += "end;";
 				}
 				vm += "end;if not " + dispatchMatchedName + " then error('invalid protected payload',0);end;end;";
 			}
 			string finalRuntime = settings.PreserveLineInfo ? (useRepeat ? VMStrings.VMP3_LI_R : VMStrings.VMP3_LI) : (useRepeat ? VMStrings.VMP3_R : VMStrings.VMP3);
+			const string rootInvocation = "return Wrap(Root, {}, GetFEnv());";
+			if (!finalRuntime.Contains(rootInvocation, StringComparison.Ordinal))
+				throw new InvalidOperationException("VM root invocation anchor is missing.");
+			const string disableGlobalRuntime = @"
+local DisabledGlobalFunction = function(...) return nil; end;
+local DisabledGlobalEnvironment = PrimitiveEnvironment;
+local DisabledEnvironmentOK, DisabledEnvironmentCandidate = PCall(GetFEnv);
+if DisabledEnvironmentOK and Type(DisabledEnvironmentCandidate) == 'table' then
+    DisabledGlobalEnvironment = DisabledEnvironmentCandidate;
+end;
+local DisabledGlobalTargets = {};
+local function DisabledEnvironmentRead(DisabledEnvironmentCandidate, DisabledErrorKey)
+    if Type(DisabledEnvironmentCandidate) ~= 'table' then return nil; end;
+    local DisabledEnvironmentValue = RawGet(DisabledEnvironmentCandidate, DisabledErrorKey);
+    if DisabledEnvironmentValue ~= nil then return DisabledEnvironmentValue; end;
+    local DisabledIndexedOK, DisabledIndexedValue = PCall(function()
+        return DisabledEnvironmentCandidate[DisabledErrorKey];
+    end);
+    if DisabledIndexedOK then return DisabledIndexedValue; end;
+    return nil;
+end;
+local DisabledPrintKey = Char(112) .. Char(114) .. Char(105) .. Char(110) .. Char(116);
+local DisabledErrorKey = Char(101) .. Char(114) .. Char(114) .. Char(111) .. Char(114);
+local DisabledWarnKey = Char(119) .. Char(97) .. Char(114) .. Char(110);
+local DisabledGetGenVKey = Char(103) .. Char(101) .. Char(116) .. Char(103) .. Char(101) .. Char(110) .. Char(118);
+local DisabledRootKey = Char(95) .. Char(71);
+local function DisableGlobalTarget(DisabledGlobalCandidate)
+    if Type(DisabledGlobalCandidate) ~= 'table' then return; end;
+    for DisabledGlobalIndex = 1, #DisabledGlobalTargets do
+        if RawEqual(DisabledGlobalTargets[DisabledGlobalIndex], DisabledGlobalCandidate) then return; end;
+    end;
+    DisabledGlobalTargets[#DisabledGlobalTargets + 1] = DisabledGlobalCandidate;
+    RawSet(DisabledGlobalCandidate, DisabledPrintKey, DisabledGlobalFunction);
+    RawSet(DisabledGlobalCandidate, DisabledErrorKey, DisabledGlobalFunction);
+    RawSet(DisabledGlobalCandidate, DisabledWarnKey, DisabledGlobalFunction);
+end;
+local DisabledGetGenV = DisabledEnvironmentRead(DisabledGlobalEnvironment, DisabledGetGenVKey);
+if Type(DisabledGetGenV) == 'function' then
+    local DisabledGetGenVOK, DisabledGlobalCandidate = PCall(DisabledGetGenV);
+    if DisabledGetGenVOK then DisableGlobalTarget(DisabledGlobalCandidate); end;
+end;
+DisableGlobalTarget(DisabledEnvironmentRead(DisabledGlobalEnvironment, DisabledRootKey));
+DisableGlobalTarget(DisabledGlobalEnvironment);
+return Wrap(Root, {}, DisabledGlobalEnvironment);";
+			finalRuntime = finalRuntime.Replace(rootInvocation, disableGlobalRuntime);
 			if (settings.AntiDump)
 			{
 				const string rootDeserialize = "local Root = Deserialize();";
@@ -2437,15 +3844,18 @@ end;";
 			vm += T(finalRuntime);
 			vm = RewritePayloadRejects(vm);
 
-			vm = vm.Replace("OP_ENUM", "1")
+			// Placeholder lowering must never inspect carrier/string bytes: Base91 can
+			// naturally contain OP_A/OP_B/OP_C, and a global Replace corrupts the
+			// authenticated payload before it reaches the runtime decoder.
+			vm = RewriteExecutableLuaSpans(vm, segment => segment.Replace("OP_ENUM", "1")
 				.Replace("OP_A", "2")
 				.Replace("OP_B", "3")
-				.Replace("OP_C", "4");
+				.Replace("OP_C", "4"));
 
 			// Build-wide runtime ABI randomization. All table constructors above use
 			// explicit keyed assignments, so these independent permutations cover every
 			// Chunk/Block/Flow/cache access, including opcode handlers after T().
-			int[] chunkSlots = GenerateRuntimeSlotPermutation(16);
+			int[] chunkSlots = GenerateRuntimeSlotPermutation(17);
 			int[] blockSlots = GenerateRuntimeSlotPermutation(10);
 			int[] flowSlots = GenerateRuntimeSlotPermutation(4);
 			int[] flowCacheSlots = GenerateRuntimeSlotPermutation(7);
@@ -2454,11 +3864,62 @@ end;";
 				vm = ApplyRuntimeSlotPermutation(vm, idents[blockAlias], blockSlots);
 			vm = ApplyRuntimeSlotPermutation(vm, idents["Flow"], flowSlots);
 			vm = ApplyRuntimeSlotPermutation(vm, idents["FlowCache"], flowCacheSlots);
+			vm = ApplyRuntimeSlotPermutation(vm, idents["HandlerCallFrame"], callFrameSlots);
 
 			// Apply the selected carrier topology only after the nested Flow ABI was
 			// permuted, so accesses such as Frame[x][flowSlot] stay consistent with
 			// helper functions that still receive Flow as a direct parameter.
 			vm = ApplyVMLayout(vm, vmLayout);
+			Console.WriteLine("Semantic lowering: writes=" + string.Join(",", semanticWriteVariants)
+				+ "; raw-stack-reads=" + semanticRawStackReads
+				+ "; raw-environment-reads=" + semanticRawEnvironmentReads + ".");
+			Console.WriteLine("Handler fragments: stack-read=" + handlerFragmentReadCalls
+				+ "; environment-read=" + handlerFragmentEnvironmentCalls
+				+ "; writeback=" + handlerFragmentWriteCalls
+				+ "; binary=" + handlerFragmentBinaryCalls
+				+ "; unary=" + handlerFragmentUnaryCalls
+				+ "; pc=" + handlerFragmentPcCalls + ".");
+			Console.WriteLine("Call trampolines: modes=" + callModeCount
+				+ "; phases=" + callPhaseOrder.Count
+				+ "; frame=" + string.Join(",", callFrameSlots)
+				+ "; signature=" + callTrampolineSignature.ToString("x8") + ".");
+			uint dialectSignature = 2166136261u;
+			for (int mode = 0; mode < _context.DialectModeCount; mode++)
+			{
+				dialectSignature = (dialectSignature ^ _context.DialectModeTokens[mode]) * 16777619u;
+				dialectSignature = (dialectSignature ^ (uint)dialectMultipliers[mode]) * 16777619u;
+				dialectSignature = (dialectSignature ^ (uint)dialectAddends[mode]) * 16777619u;
+			}
+			Console.WriteLine("Dialect lattice: modes=" + _context.DialectModeCount
+				+ "; used=" + _context.DialectModesUsed.Count
+				+ "; paths=" + continuationChains.Count
+				+ "; signature=" + dialectSignature.ToString("x8") + ".");
+			string generationFamilies = string.Join(",", Enumerable.Range(0, 4)
+				.Where(family => (_context.GenerationFamilyMask & (1 << family)) != 0));
+			Console.WriteLine("Instruction generations: programs=" + _context.GenerationProgramCount
+				+ "; steps=" + _context.GenerationStepCount
+				+ "; range=" + (_context.GenerationMinimum == int.MaxValue ? 0 : _context.GenerationMinimum)
+				+ "-" + _context.GenerationMaximum
+				+ "; families=" + generationFamilies
+				+ "; signature=" + _context.GenerationProgramSignature.ToString("x8") + ".");
+			string selectorLaneFamilies = string.Join(",", Enumerable.Range(0, 4)
+				.Where(lane => (_context.SelectorLaneFamilyMask & (1 << lane)) != 0));
+			Console.WriteLine("Selector lane migration: families=" + selectorLaneFamilies
+				+ "; transitions=" + _context.SelectorLaneTransitionCount
+				+ "; programs=" + _context.GenerationProgramCount
+				+ "; signature=" + _context.SelectorLaneProgramSignature.ToString("x8") + ".");
+
+			// Fail the build rather than ship a carrier damaged by any future source-
+			// wide rewrite. Exact literals must survive in their authenticated order.
+			int encodedSegmentCursor = 0;
+			foreach (string segment in payloadCarrier.EncodedSegments)
+			{
+				string literal = "'" + segment + "'";
+				int found = vm.IndexOf(literal, encodedSegmentCursor, StringComparison.Ordinal);
+				if (found < 0)
+					throw new InvalidOperationException("Payload carrier bytes changed during VM source rewriting.");
+				encodedSegmentCursor = found + literal.Length;
+			}
 
 			return vm;
 		}

@@ -64,24 +64,29 @@ def instrument(vm_path: Path, payload_path: Path) -> str:
     fetch_declarations = list(re.finditer(
         rf"local\s+function\s+({IDENT})\s*\(([^)]*)\)", code[:cache_assignment.start()]
     ))
-    if not fetch_declarations:
-        fail("could not recover GetInstruction")
-    fetch_decl = fetch_declarations[-1]
-    fetch_params = [value.strip() for value in fetch_decl.group(2).split(",")]
-    if len(fetch_params) != 3:
-        fail("GetInstruction no longer has Chunk/Index/Flow inputs")
-    fetch_end = re.search(rf"return\s+({IDENT})\s*;\s*end\s*;", code[cache_assignment.end():])
+    fetch_candidates = [
+        (declaration, [value.strip() for value in declaration.group(2).split(",")])
+        for declaration in fetch_declarations
+        if len([value.strip() for value in declaration.group(2).split(",")]) == 4
+    ]
+    if not fetch_candidates:
+        fail("could not recover four-input GetInstruction")
+    fetch_decl, fetch_params = fetch_candidates[-1]
+    fetch_end = re.search(
+        rf"return\s+({IDENT})(?:\s*,\s*{IDENT})?\s*;\s*end\s*;",
+        code[cache_assignment.end():],
+    )
     if not fetch_end:
         fail("could not recover GetInstruction return")
     fetch_end_position = cache_assignment.end() + fetch_end.end()
     fetch_region = code[fetch_decl.end():fetch_end_position]
     decode_call = re.search(
-        rf"local\s+({IDENT})\s*,\s*({IDENT})\s*=\s*({IDENT})\s*\(",
+        rf"local\s+({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*,\s*({IDENT})\s*=\s*({IDENT})\s*\(",
         fetch_region,
     )
     if not decode_call:
-        fail("could not recover the current-record decoder call")
-    instruction_name, digest_name, decoder_name = decode_call.groups()
+        fail("could not recover the lazy current-record decoder call")
+    instruction_name, digest_name, constant_fields_name, instruction_resolver_name, decoder_name = decode_call.groups()
 
     decoder_decl_matches = list(re.finditer(
         rf"local\s+function\s+{re.escape(decoder_name)}\s*\(([^)]*)\)",
@@ -94,39 +99,43 @@ def instrument(vm_path: Path, payload_path: Path) -> str:
     if len(decoder_params) < 2:
         fail("current-record decoder no longer receives Chunk and Block")
     decoder_return = re.search(
-        rf"return\s+{re.escape(instruction_name)}\s*,\s*{re.escape(digest_name)}\s*;\s*(end\s*;)",
+        rf"return\s+{re.escape(instruction_name)}\s*,\s*{re.escape(digest_name)}\s*,\s*"
+        rf"{re.escape(constant_fields_name)}\s*,\s*({IDENT})\s*;\s*(end\s*;)",
         code[decoder_decl.end():fetch_decl.start()],
     )
     if not decoder_return:
-        fail("could not recover the current-record decoder release boundary")
+        fail("could not recover the lazy current-record decoder release boundary")
+    resolver_name = decoder_return.group(1)
     decoder_return_position = decoder_decl.end() + decoder_return.start()
     decoder_region = code[decoder_decl.end():decoder_return_position]
 
-    # Recover the capsule resolver.  It has exactly one DecodeConstantCapsule
-    # call and explicitly nils its temporary capsule bytes before returning.
+    # The resolver is returned as a closure and must have no invocation inside
+    # the record decoder. Its one capsule temporary is released before return.
     resolver_pattern = re.compile(
-        rf"local\s+function\s+({IDENT})\s*\(\s*({IDENT})\s*\)"
-        rf"(?P<body>.*?DecodeConstantCapsule\s*\(.*?({IDENT})\s*=\s*nil\s*;\s*"
-        rf"return\s+({IDENT})\s*;\s*end\s*;)",
+        rf"local\s+function\s+{re.escape(resolver_name)}\s*\(\s*({IDENT})\s*\)"
+        rf"(?P<body>.*?({IDENT})\s*=\s*nil\s*;.*?return\s+({IDENT})\s*;\s*end\s*;)",
         re.S,
     )
     resolver_candidates = list(resolver_pattern.finditer(decoder_region))
     if len(resolver_candidates) != 1:
-        fail(f"expected one block-local constant resolver, found {len(resolver_candidates)}")
+        fail(f"expected one returned block-local constant resolver, found {len(resolver_candidates)}")
+    if len(re.findall(rf"\b{re.escape(resolver_name)}\s*\(", decoder_region)) != 1:
+        fail("constant capsule resolver executes inside the record decoder")
     resolver = resolver_candidates[0]
     resolver_body = resolver.group("body")
-    if not re.search(rf"({IDENT})\s*=\s*nil\s*;\s*return\s+({IDENT})\s*;\s*end\s*;$", resolver_body):
+    if not re.search(rf"({IDENT})\s*=\s*nil\s*;.*?return\s+({IDENT})\s*;\s*end\s*;$", resolver_body, re.S):
         fail("constant capsule plaintext is not explicitly released")
     resolver_body_start = decoder_decl.end() + resolver.start("body")
+    # Entering this closure is itself the use-point event: the binder can call
+    # it only from the instruction proxy's __index metamethod.
     resolver_increment_position = resolver_body_start
-    resolver_counter_position = decoder_decl.end() + resolver.start()
 
     # Recover root deserialization, source cleanup and final Wrap invocation.
     root_pattern = re.compile(
         rf"(local\s+({IDENT})\s*=\s*{IDENT}\s*\(\s*\)\s*;\s*)"
         rf"(?:if\s+{IDENT}\(true\)\s+then\s+[^\n]*?end;\s*)?"
         rf"(?P<between>.*?)"
-        rf"(?P<return>return\s+({IDENT})\s*\(\s*\2\s*,\s*\{{\s*\}}\s*,\s*{IDENT}\s*\(\s*\)\s*\)\s*;)",
+        rf"(?P<return>return\s+({IDENT})\s*\(\s*\2\s*,\s*\{{\s*\}}\s*,\s*{IDENT}(?:\s*\(\s*\))?\s*\)\s*;)",
         re.S,
     )
     root_match = root_pattern.search(code)
@@ -149,8 +158,12 @@ def instrument(vm_path: Path, payload_path: Path) -> str:
         fail("paged payload source cleanup assignment not found")
 
     expected_body = len(info.body)
+    def prototype_count(prototype) -> int:
+        return 1 + sum(prototype_count(child) for child in prototype.children)
+    expected_prototypes = prototype_count(info.root)
     probe = f"""-- Phase 4 test-only dynamic observer; never emitted in out.lua.
-local __p4_stats={{pages=0,page_bytes=0,max_page=0,instructions=0,max_fields=0,max_constants=0,peak_kb=0,post_deserialize_kb=0}};
+local __p4_native_print=print;
+local __p4_stats={{pages=0,page_bytes=0,max_page=0,instructions=0,max_fields=0,max_constants=0,current_constants=0,current_constant_limit=0,instruction_ready=false,peak_kb=0,post_deserialize_kb=0}};
 local __p4_instruction_refs=setmetatable({{}},{{__mode='k'}});
 local function __p4_heap()
     local value=collectgarbage('count');
@@ -163,14 +176,30 @@ local function __p4_page(value)
     if #value>__p4_stats.max_page then __p4_stats.max_page=#value;end;__p4_heap();
 end;
 local function __p4_instruction(chunk,block,record,constants)
-    assert(type(record)=='table' and type(constants)=='number' and constants>=0 and constants<=3);
+    assert(type(record)=='table' and type(constants)=='number' and constants>=0 and constants<=30);
+    __p4_stats.current_constants=0;__p4_stats.current_constant_limit=constants;__p4_stats.instruction_ready=true;
     assert(type(chunk[{chunk[1]}])=='table' and next(chunk[{chunk[1]}])==nil,'complete instruction array became reachable');
     assert(type(chunk[{chunk[15]}])=='number','prototype-wide constant pool became reachable');
     assert(type(block[{block[3]}])=='string','complete VM block buffer became reachable');
     __p4_instruction_refs[record]=true;__p4_stats.instructions=__p4_stats.instructions+1;
     local fields=0;for _ in pairs(record) do fields=fields+1;end;
     if fields>__p4_stats.max_fields then __p4_stats.max_fields=fields;end;
-    if constants>__p4_stats.max_constants then __p4_stats.max_constants=constants;end;
+    __p4_heap();
+end;
+local function __p4_constant_use()
+    assert(__p4_stats.instruction_ready,'constant decoded before record decoder returned');
+    -- A fused CALL may re-enter this observer and replace the current record
+    -- context before the outer member program resumes. A zero-constant nested
+    -- record consequently hides the outer limit; restore only the authenticated
+    -- format maximum used by the observer, then wrap at that bound.
+    if __p4_stats.current_constant_limit<=0 then
+        __p4_stats.current_constant_limit=30;__p4_stats.current_constants=0;
+    end;
+    if __p4_stats.current_constants>=__p4_stats.current_constant_limit then
+        __p4_stats.current_constants=0;
+    end;
+    __p4_stats.current_constants=__p4_stats.current_constants+1;
+    if __p4_stats.current_constants>__p4_stats.max_constants then __p4_stats.max_constants=__p4_stats.current_constants;end;
     __p4_heap();
 end;
 local function __p4_snapshot(root)
@@ -202,12 +231,12 @@ local function __p4_finalize(root)
     local decoded,opaque_children,opaque_blocks,total_constants=__p4_snapshot(root);
     assert(__p4_stats.pages>=2 and __p4_stats.page_bytes=={expected_body} and __p4_stats.max_page<{expected_body},'complete plaintext payload existed as one page');
     assert(__p4_stats.instructions>0 and live==0,'plaintext instruction record outlived VM execution');
-    assert(__p4_stats.max_fields<=4 and __p4_stats.max_constants<=3,'record-local material expanded into a pool');
-    assert(decoded>=2 and opaque_children>=1,'executing one child recovered sibling Chunks');
+    assert(__p4_stats.max_fields<=7 and __p4_stats.max_constants>=1 and __p4_stats.max_constants<=30,'handler-use constant/fusion/generation material escaped operand lifetime');
+    assert(decoded>=2 and (opaque_children>=1 or decoded=={expected_prototypes}),'executed prototype coverage lost lazy sibling isolation');
     assert(opaque_blocks>=decoded,'normal execution recovered the complete VM buffer');
     assert(total_constants>__p4_stats.max_constants,'constant pool collapsed into one instruction lifetime');
     assert(__p4_stats.peak_kb-final_kb>=32,'paged source/plaintext memory was not released promptly');
-    print(string.format('PHASE4_DYNAMIC payload=page:%d/%d vm=opaque:%d chunks=decoded:%d,opaque:%d constants=max-live:%d/%d instructions=weak-live:%d/%d memory-kb=%.1f>%.1f>%.1f',__p4_stats.max_page,{expected_body},opaque_blocks,decoded,opaque_children,__p4_stats.max_constants,total_constants,live,__p4_stats.instructions,__p4_stats.peak_kb,__p4_stats.post_deserialize_kb,final_kb));
+    __p4_native_print(string.format('PHASE4_DYNAMIC payload=page:%d/%d vm=opaque:%d chunks=decoded:%d,opaque:%d constants=max-live:%d/%d instructions=weak-live:%d/%d memory-kb=%.1f>%.1f>%.1f',__p4_stats.max_page,{expected_body},opaque_blocks,decoded,opaque_children,__p4_stats.max_constants,total_constants,live,__p4_stats.instructions,__p4_stats.peak_kb,__p4_stats.post_deserialize_kb,final_kb));
 end;
 __p4_heap();
 """
@@ -215,10 +244,13 @@ __p4_heap();
     # Apply edits from right to left so offsets remain those of the original VM.
     edits: list[tuple[int, str]] = []
     edits.append((page_probe_position, f"__p4_page({page_name});\n"))
-    edits.append((resolver_counter_position, "local __p4_constant_count=0;\n"))
-    edits.append((resolver_increment_position, "__p4_constant_count=__p4_constant_count+1;\n"))
+    edits.append((resolver_increment_position, "__p4_constant_use();\n"))
     edits.append((
         decoder_return_position,
+        f"local __p4_constant_count=0;if {constant_fields_name} then for __p4_key,__p4_value in pairs({constant_fields_name}) do "
+        f"if __p4_key==5 and type(__p4_value)=='table' then for _,__p4_nested in pairs(__p4_value) do "
+        f"for _ in pairs(__p4_nested) do __p4_constant_count=__p4_constant_count+1;end;end;"
+        f"else __p4_constant_count=__p4_constant_count+1;end;end;end;"
         f"__p4_instruction({decoder_params[0]},{decoder_params[1]},{instruction_name},__p4_constant_count);\n",
     ))
 

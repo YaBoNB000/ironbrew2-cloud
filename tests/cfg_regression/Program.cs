@@ -1,3 +1,4 @@
+using System.Reflection;
 using IronBrew2.Bytecode_Library.Bytecode;
 using IronBrew2.Bytecode_Library.IR;
 using IronBrew2.Obfuscator;
@@ -228,4 +229,30 @@ foreach (Opcode opcode in new[] { Opcode.Eq, Opcode.Lt, Opcode.Le, Opcode.Test, 
     }
 }
 
-Console.WriteLine("PASS CFG, dispatcher planner and BuildSeed regression");
+// Final opcode-placeholder lowering runs after payload carrier insertion. It
+// must rewrite executable spans without touching Base91/string/comment bytes
+// that happen to contain the same OP_A/OP_B/OP_C spellings.
+{
+    MethodInfo rewriteMethod = typeof(Generator).GetMethod(
+        "RewriteExecutableLuaSpans",
+        BindingFlags.Static | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("executable Lua span rewriter not found");
+    Func<string, string> lower = segment => segment
+        .Replace("OP_ENUM", "1")
+        .Replace("OP_A", "2")
+        .Replace("OP_B", "3")
+        .Replace("OP_C", "4");
+    string input = "local a=OP_A;local s='OP_A';local d=\"OP_B\";"
+        + "local e='x\\\'OP_C';-- OP_ENUM OP_A\n"
+        + "local l=[=[OP_B OP_C]=];--[==[OP_A OP_ENUM]==]\n"
+        + "return OP_ENUM+OP_B+OP_C;";
+    string expected = "local a=2;local s='OP_A';local d=\"OP_B\";"
+        + "local e='x\\\'OP_C';-- OP_ENUM OP_A\n"
+        + "local l=[=[OP_B OP_C]=];--[==[OP_A OP_ENUM]==]\n"
+        + "return 1+3+4;";
+    string actual = (string)(rewriteMethod.Invoke(null, new object[] { input, lower })
+        ?? throw new InvalidOperationException("executable Lua span rewriter returned null"));
+    Expect(actual == expected, "opcode placeholder lowering modified a protected Lua span");
+}
+
+Console.WriteLine("PASS CFG, dispatcher planner, executable-span and BuildSeed regression");

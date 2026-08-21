@@ -1,0 +1,19 @@
+local value = 1
+value = value + 2
+value = value * 3
+value = value - 4
+value = value + 5
+value = value * 6
+value = value - 7
+value = value + 8
+value = value * 2
+value = value - 9
+value = value + 10
+value = value * 2
+value = value - 11
+value = value + 12
+value = value * 2
+value = value - 13
+local test_output = "micro-block:" .. value
+print(test_output)
+return {__ib2_test_output = test_output}

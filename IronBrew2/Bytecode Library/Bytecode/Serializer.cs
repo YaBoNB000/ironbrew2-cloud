@@ -5,18 +5,19 @@ using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using IronBrew2.Bytecode_Library.IR;
+using IronBrew2.Extensions;
 using IronBrew2.Obfuscator;
 using IronBrew2.Obfuscator.Control_Flow;
+using IronBrew2.Obfuscator.Opcodes;
 
 namespace IronBrew2.Bytecode_Library.Bytecode
 {
 	public class Serializer
 	{
-		private const byte FormatVersion = 4;
+		private const byte FormatVersion = 5;
 		private const byte BasicBlockFeature = 2;
 		private const byte DispatcherFlatteningFeature = 4;
 		private const byte EntropyEnvelopeFeature = 8;
-		private const int MaxBlockInstructions = DispatcherFlatteningPlanner.MaxBlockInstructions;
 		private const int EntropyMinBytes = 64 * 1024;
 		private const int EntropyMaxBytes = 96 * 1024;
 		private const int PayloadPageMinBytes = 2048;
@@ -34,11 +35,16 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			public int Destination { get; init; }
 			public uint WrappedEntryState { get; init; }
 			public uint WrappedChunkState { get; init; }
+			public uint WrappedMode { get; init; }
 		}
 
 		private readonly ObfuscationContext _context;
 		private readonly ObfuscationSettings _settings;
 		private readonly BuildRandom _random;
+		private int _dialectAssignmentCounter;
+		private int _generationFamilyCounter;
+		private int _selectorLaneCounter;
+		private readonly byte[] _selectorLaneOrder;
 		private readonly Encoding _luaEncoding = Encoding.GetEncoding(28591);
 
 		public Serializer(ObfuscationContext context, ObfuscationSettings settings)
@@ -46,14 +52,21 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			_context = context;
 			_settings = settings;
 			_random = context.Seed.GetStream("payload.serializer");
+			_selectorLaneOrder = new byte[] {1, 2, 3};
+			_selectorLaneOrder.Shuffle(_random);
 		}
 
 		/// <summary>
-		/// v4 顶层格式（固定 9 字节头）：
+		/// v5 顶层格式（固定 9 字节头）：
 		///   head/salt 4B | integrity tag 4B | version+flags 1B | encrypted envelope
 		/// 压缩后的真实 body 被拆为多个 data records，并与 64–96 KiB CSPRNG entropy
 		/// records 交错。entropy digest 同时派生内层 body mask；物理 record 顺序由独立
 		/// envelope tag 认证，因此删除、修改或重排 record 都不能退化为可移除 padding。
+		/// v5 outer authenticator uses a separately derived integrity key and compresses
+		/// two coupled 32-bit lanes instead of exposing the stream seed through an
+		/// invertible polynomial accumulator. It remains a client-side keyed
+		/// corruption/tamper check, but the tag is no longer an O(n) algebraic
+		/// seed-recovery oracle.
 		/// 每个 prototype 和完整 block manifest 都有独立认证；常量以延迟恢复 capsule
 		/// 保存，只有进入引用它的 block 时才恢复到 invocation-local cache。
 		/// </summary>
@@ -78,7 +91,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			                    EntropyEnvelopeFeature | (_settings.BytecodeCompress ? 1 : 0));
 			// Bind both the format/feature byte and encrypted body. This is tamper/corruption
 			// detection, not a client-side cryptographic trust root.
-			uint integrity = ComputeIntegrity(encrypted, _context.XorSeed, flags);
+			uint integrity = ComputeIntegrity(encrypted, _context.OuterIntegrityKey, flags);
 
 			var output = new List<byte>(encrypted.Length + 9);
 			foreach (OuterHeaderField field in _context.PayloadFormat.OuterHeaderOrder)
@@ -95,12 +108,30 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return output.ToArray();
 		}
 
-		private uint ComputeIntegrity(byte[] encrypted, uint seed, byte flags)
+		private static uint Rotate16(uint value) =>
+			(value << 16) | (value >> 16);
+
+		private uint ComputeIntegrity(byte[] encrypted, uint integrityKey, byte flags)
 		{
-			uint hash = unchecked((seed ^ _context.Domains.IntegrityDomain) * 31u + flags);
-			foreach (byte value in encrypted)
-				hash = unchecked(hash * 31u + value);
-			return hash;
+			// The v4 polynomial started with (seed ^ domain) and multiplied by the
+			// invertible word 31 for every public ciphertext byte. Walking that tag
+			// backwards therefore recovered the exact stream seed in O(n). v5 keeps
+			// two coupled lanes and compresses them only after all ciphertext bytes
+			// have been absorbed. The small odd multipliers keep the mirrored Lua 5.1
+			// arithmetic exact while cross-lane XOR destroys the old direct inverse.
+			uint domain = _context.Domains.IntegrityDomain;
+			uint left = unchecked((integrityKey ^ domain) + 0xA5C3F1E7u + (uint)flags * 257u);
+			uint right = unchecked(integrityKey + Rotate16(domain) + 0x7F4A7C15u + (uint)encrypted.Length * 17u);
+			for (int index = 0; index < encrypted.Length; index++)
+			{
+				uint mixedByte = unchecked((uint)encrypted[index] + (uint)(index + 1) * 257u + (uint)flags * 17u);
+				left = unchecked((left ^ mixedByte) * 65599u + 0x9E3779B9u);
+				right = unchecked((right + mixedByte + (left >> 16)) * 48271u + 0x6D2B79F5u);
+				left ^= Rotate16(right);
+			}
+			left = unchecked((left ^ right ^ (uint)encrypted.Length) * 65599u + domain);
+			right = unchecked((right ^ Rotate16(left) ^ flags) * 48271u + 0xC4D29A6Bu);
+			return left ^ Rotate16(right);
 		}
 
 		private byte[] WrapEntropyEnvelope(byte[] body, uint seed, bool compressPages)
@@ -314,6 +345,26 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private uint FlowVerifier(uint entryState, int blockStart, ushort k1, ushort k2, ushort k3, uint binding) =>
 			FlowKey(entryState, blockStart, blockStart ^ _context.Domains.FlowVerifierMask, k1, k2, k3, binding);
 
+		private uint InitialDialectModeKey(uint entryState, uint chunkState, int blockStart,
+			ushort k1, ushort k2, ushort k3, uint binding) =>
+			unchecked(InitialFlowKey(k1, k2, k3, binding) ^ entryState ^ Rotate16(chunkState)
+			          ^ (uint)blockStart * 65537u ^ 0xD1A1EC7u);
+
+		private uint DialectModeKey(uint sourceEntryState, uint sourceChunkState, uint targetEntryState,
+			uint targetChunkState, int fromPc, int toPc, ushort k1, ushort k2, ushort k3, uint binding) =>
+			unchecked(FlowKey(sourceEntryState, fromPc, toPc, k1, k2, k3, binding)
+			          ^ ChunkChainKey(sourceChunkState, sourceEntryState, fromPc, toPc,
+				          k1, k2, k3, binding, _settings.AntiDump ? _context.Binder.PayloadBinding : _context.XorSeed)
+			          ^ Rotate16(targetEntryState) ^ targetChunkState ^ 0x91E10DA5u);
+
+		private uint NextDialectMode()
+		{
+			uint token = _context.DialectModeTokens[
+				_dialectAssignmentCounter++ % _context.DialectModeTokens.Length];
+			_context.DialectModesUsed.Add(token);
+			return token;
+		}
+
 		private uint ChunkState(uint entryState, int blockStart, int count, ushort k1, ushort k2, ushort k3,
 			uint binding, uint attestation)
 		{
@@ -364,13 +415,27 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			                 (_context.Domains.OpcodeStateDomain & 0xffffu)) & 0xffffu);
 		}
 
-		private uint ComputeInstructionDigest(byte[] record, int index, ushort k1, ushort k2, ushort k3)
+		private uint ComputeInstructionDigest(byte[] record, int index, ushort k1, ushort k2, ushort k3,
+			uint chunkState, uint entryState)
 		{
-			uint hash = unchecked((_context.Domains.InstructionStateDomain ^ (uint)index) * 31u + k1);
-			hash = HashWord(hash, k2);
-			hash = HashWord(hash, k3);
-			hash = HashWord(hash, (uint)record.Length);
-			return HashBytes(hash, record);
+			uint domain = _context.Domains.InstructionStateDomain;
+			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
+			uint left = keyed ^ domain ^ (uint)index ^ entryState;
+			uint right = chunkState ^ Rotate16(keyed) ^ unchecked((uint)index * 257u) ^ Rotate16(entryState);
+			uint counter = 1;
+			void Absorb(uint word)
+			{
+				uint mixed = unchecked(word + counter * 257u);
+				left = unchecked((left ^ mixed) * 65599u + 0x9E3779B9u);
+				right = unchecked((right + mixed + (left >> 16)) * 48271u + 0x6D2B79F5u);
+				left ^= Rotate16(right);
+				counter++;
+			}
+			Absorb((uint)index); Absorb(k1); Absorb(k2); Absorb(k3); Absorb((uint)record.Length);
+			foreach (byte value in record) Absorb(value);
+			left = unchecked((left ^ right ^ (uint)record.Length) * 65599u + domain);
+			right = unchecked((right ^ Rotate16(left) ^ (uint)index) * 48271u + 0xC4D29A6Bu);
+			return left ^ Rotate16(right);
 		}
 
 		private ushort BlockFieldMask(uint entryState, int pc, int slot, ushort k1, ushort k2, ushort k3)
@@ -400,53 +465,125 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			return unchecked(value * 1664525u + 1013904223u);
 		}
 
+		private uint BeginConstantChain(uint entryState, uint chunkState, int blockStart,
+			ushort k1, ushort k2, ushort k3)
+		{
+			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
+			uint value = unchecked((entryState ^ Rotate16(chunkState)) + (uint)blockStart * 65537u
+			                       + keyed + _context.Domains.ConstantMaskDomain + 3266489909u);
+			return unchecked(value * 1664525u + 1013904223u);
+		}
+
+		private static uint AdvanceConstantChain(uint state, IReadOnlyList<byte> capsule, int oneBasedIndex)
+		{
+			uint value = state ^ unchecked((uint)oneBasedIndex * 2654435761u);
+			for (int index = 0; index < capsule.Count; index++)
+				value = unchecked(value * 65599u + capsule[index] + (uint)(index + 1) * 257u);
+			return value ^ Rotate16(unchecked((uint)capsule.Count * 65537u + (uint)oneBasedIndex));
+		}
+
+		private uint StringShardState(int oneBasedIndex, int logicalShard, int length, uint constantChainState,
+			uint entryState, uint chunkState, int blockStart, ushort k1, ushort k2, ushort k3)
+		{
+			uint value = unchecked(ConstantMaskState(oneBasedIndex, entryState, chunkState, blockStart, k1, k2, k3)
+			                       + (uint)logicalShard * 65537u + (uint)length * 257u
+			                       + constantChainState * 257u
+			                       + _context.Domains.ConstantMaskDomain + 2654435769u);
+			return unchecked(value * 1664525u + 1013904223u);
+		}
+
 		private uint ComputeConstantIntegrity(byte[] encodedBody, int oneBasedIndex,
 			uint entryState, uint chunkState, int blockStart, ushort k1, ushort k2, ushort k3)
 		{
 			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
-			uint hash = HashWord(keyed ^ _context.Domains.ConstantIntegrityDomain ^ entryState ^ chunkState,
-				(uint)blockStart);
-			hash = HashWord(hash, (uint)oneBasedIndex);
-			hash = HashWord(hash, (uint)encodedBody.Length);
-			return HashBytes(hash, encodedBody);
+			uint domain = _context.Domains.ConstantIntegrityDomain;
+			uint left = keyed ^ domain ^ entryState ^ Rotate16(chunkState);
+			uint right = chunkState ^ Rotate16(keyed) ^ unchecked((uint)blockStart * 257u) ^ (uint)oneBasedIndex;
+			uint counter = 1;
+			void Absorb(uint word)
+			{
+				uint mixed = unchecked(word + counter * 257u);
+				left = unchecked((left ^ mixed) * 65599u + 0x9E3779B9u);
+				right = unchecked((right + mixed + (left >> 16)) * 48271u + 0x6D2B79F5u);
+				left ^= Rotate16(right);
+				counter++;
+			}
+			Absorb((uint)blockStart);
+			Absorb((uint)oneBasedIndex);
+			Absorb((uint)encodedBody.Length);
+			foreach (byte value in encodedBody) Absorb(value);
+			left = unchecked((left ^ right ^ (uint)encodedBody.Length) * 65599u + domain);
+			right = unchecked((right ^ Rotate16(left) ^ (uint)oneBasedIndex) * 48271u + 0xC4D29A6Bu);
+			return left ^ Rotate16(right);
 		}
 
 		private uint ComputeBlockIntegrity(byte[] body, uint entryState, int start, int count,
-			uint routeToken, IReadOnlyList<int> constantReferences, uint verifier,
-			IReadOnlyList<ChunkSuccessor> successors, ushort k1, ushort k2, ushort k3, uint binding)
+			uint routeToken, IReadOnlyList<int> constantReferences, IReadOnlyList<uint> acceptedModes,
+			uint verifier, IReadOnlyList<ChunkSuccessor> successors,
+			ushort k1, ushort k2, ushort k3, uint binding)
 		{
-			uint hash = HashWord(entryState ^ _context.Domains.BlockIntegrityDomain ^ binding, (uint)start);
-			hash = HashWord(hash, (uint)count);
-			hash = HashWord(hash, k1);
-			hash = HashWord(hash, k2);
-			hash = HashWord(hash, k3);
-			hash = HashWord(hash, routeToken);
-			hash = HashWord(hash, (uint)constantReferences.Count);
-			foreach (int constantIndex in constantReferences)
-				hash = HashWord(hash, (uint)constantIndex);
-			hash = HashWord(hash, verifier);
-			hash = HashWord(hash, (uint)successors.Count);
+			uint domain = _context.Domains.BlockIntegrityDomain;
+			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
+			uint left = entryState ^ domain ^ binding ^ Rotate16(keyed);
+			uint right = binding ^ Rotate16(entryState) ^ keyed ^ unchecked((uint)start * 257u);
+			uint counter = 1;
+			void Absorb(uint word)
+			{
+				uint mixed = unchecked(word + counter * 257u);
+				left = unchecked((left ^ mixed) * 65599u + 0x9E3779B9u);
+				right = unchecked((right + mixed + (left >> 16)) * 48271u + 0x6D2B79F5u);
+				left ^= Rotate16(right);
+				counter++;
+			}
+			foreach (uint word in new[]
+			         {
+				         (uint)start, (uint)count, k1, k2, k3, routeToken,
+				         (uint)constantReferences.Count
+			         })
+				Absorb(word);
+			foreach (int constantIndex in constantReferences) Absorb((uint)constantIndex);
+			Absorb((uint)acceptedModes.Count);
+			foreach (uint mode in acceptedModes) Absorb(mode);
+			Absorb(verifier);
+			Absorb((uint)successors.Count);
 			foreach (ChunkSuccessor successor in successors)
 			{
-				hash = HashWord(hash, (uint)successor.Destination);
-				hash = HashWord(hash, successor.WrappedEntryState);
-				hash = HashWord(hash, successor.WrappedChunkState);
+				Absorb((uint)successor.Destination);
+				Absorb(successor.WrappedEntryState);
+				Absorb(successor.WrappedChunkState);
+				Absorb(successor.WrappedMode);
 			}
-			hash = HashWord(hash, (uint)body.Length);
-			return HashBytes(hash, body);
+			Absorb((uint)body.Length);
+			foreach (byte value in body) Absorb(value);
+			left = unchecked((left ^ right ^ (uint)body.Length) * 65599u + domain);
+			right = unchecked((right ^ Rotate16(left) ^ (uint)start ^ (uint)count) * 48271u + 0xC4D29A6Bu);
+			return left ^ Rotate16(right);
 		}
 
 		private uint ComputePrototypeIntegrity(byte[] body, ushort k1, ushort k2, ushort k3)
 		{
 			uint keyed = unchecked((uint)k1 * 65537u + (uint)k2 * 257u + k3);
-			uint hash = HashWord(keyed ^ _context.Domains.PrototypeIntegrityDomain, (uint)body.Length);
+			uint domain = _context.Domains.PrototypeIntegrityDomain;
+			uint left = keyed ^ domain ^ (uint)body.Length;
+			uint right = Rotate16(keyed) ^ _context.XorSeed ^ unchecked((uint)body.Length * 257u);
+			uint counter = 1;
+			void Absorb(uint word)
+			{
+				uint mixed = unchecked(word + counter * 257u);
+				left = unchecked((left ^ mixed) * 65599u + 0x9E3779B9u);
+				right = unchecked((right + mixed + (left >> 16)) * 48271u + 0x6D2B79F5u);
+				left ^= Rotate16(right);
+				counter++;
+			}
+			Absorb((uint)body.Length);
 			for (int index = 0; index < body.Length; index++)
 			{
-				// Bytes 6..9 contain this prototype's own tag.
 				if (index >= 6 && index < 10) continue;
-				hash = HashWord(hash, body[index]);
+				Absorb(body[index]);
 			}
-			return hash;
+			left = unchecked((left ^ right ^ (uint)body.Length) * 65599u + domain);
+			right = unchecked((right ^ Rotate16(left) ^ keyed) * 48271u + 0xC4D29A6Bu);
+			return left ^ Rotate16(right);
 		}
 
 		private void ShuffleBlocks(List<ControlFlowBlock> blocks)
@@ -504,6 +641,48 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			if (identity && count > 1)
 				(values[0], values[1]) = (values[1], values[0]);
 			return values;
+		}
+
+		private int PrototypeDecoderMode(ushort k1, ushort k2, ushort k3) =>
+			(int)(((uint)k1 * 13u + (uint)k2 * 7u + (uint)k3 * 11u +
+			       _context.Domains.DecodePipelineDomain) % 4u);
+
+		private byte[] EncodePrototypeColumn(IReadOnlyList<byte> column, int role, int pc,
+			uint entryState, ushort k1, ushort k2, ushort k3)
+		{
+			int mode = PrototypeDecoderMode(k1, k2, k3);
+			var output = new byte[column.Count];
+			uint low = entryState & 0xFFFFu;
+			uint high = entryState >> 16;
+			for (int index = 0; index < column.Count; index++)
+			{
+				byte value = column[index];
+				int mask = (int)((low + high * 3u + (uint)k1 * 5u + (uint)k2 * 7u +
+				                      (uint)k3 * 11u + (uint)pc * 13u + (uint)role * 17u +
+				                      (uint)index * 29u + _context.Domains.DecodePipelineDomain) & 0xFFu);
+				byte encoded;
+				switch (mode)
+				{
+					case 0:
+						encoded = (byte)(value ^ mask);
+						break;
+					case 1:
+						encoded = (byte)(value + mask);
+						break;
+					case 2:
+						byte nibble = (byte)((value << 4) | (value >> 4));
+						encoded = (byte)(nibble ^ mask);
+						break;
+					default:
+						int shift = ((role + pc + index) % 7) + 1;
+						byte rotated = (byte)((value << shift) | (value >> (8 - shift)));
+						encoded = (byte)(rotated + mask);
+						break;
+				}
+				int destination = mode == 1 || mode == 3 ? column.Count - index - 1 : index;
+				output[destination] = encoded;
+			}
+			return output;
 		}
 
 		private static int[] DeriveCodeDataPermutation(int instructionCount, int constantCount,
@@ -639,6 +818,10 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			for (int localIndex = 0; localIndex < opcodeBank.Length; localIndex++)
 				opcodeToLocal[opcodeBank[localIndex]] = localIndex;
 
+			// Constant operands carry per-use random handles rather than stable
+			// prototype constant indices. Every occurrence gets its own capsule.
+			var constantsByHandle = new Dictionary<int, Constant>();
+
 			void WriteByte(byte value) => output.Add(value);
 			void WriteUInt16Local(ushort value) => WriteUInt16(output, value);
 			void WriteUInt32Local(uint value) => WriteUInt32(output, value);
@@ -672,12 +855,73 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 				int type = (int)instruction.InstructionType;
 				int constantMask = (int)instruction.ConstantMask;
-				descriptors.Add((byte)(((type << 1) | (constantMask << 3)) ^ descriptorMask));
+				int generationCount = 2 + _random.Next(4);
+				var generationProgram = new List<(byte Family, uint Mask, byte SelectorLane, uint Recipe)>(generationCount);
+				byte previousSelectorLane = 0;
+				for (int generation = 0; generation < generationCount; generation++)
+				{
+					byte family = (byte)((_generationFamilyCounter++ + generation) % 4);
+					if ((instruction.ConstantMask & InstructionConstantMask.RA) != 0 && family != 0)
+						family = 0;
+					uint mask;
+					do mask = _random.NextUInt32(); while ((mask & 0xffffu) == 0 || (mask >> 16) == 0);
+					// Generation zero always dispatches through the opcode carrier. Every
+					// authenticated rewrite migrates to a different non-zero logical lane;
+					// runtime dialect mode then permutes lanes 1..3 independently.
+					byte selectorLane = _selectorLaneOrder[_selectorLaneCounter++ % _selectorLaneOrder.Length];
+					if (selectorLane == previousSelectorLane)
+						selectorLane = (byte)(1 + (selectorLane % 3));
+					previousSelectorLane = selectorLane;
+					uint recipe;
+					do recipe = _random.NextUInt32(); while (recipe == 0);
+					generationProgram.Add((family, mask, selectorLane, recipe));
+				}
+				_context.GenerationProgramCount++;
+				_context.GenerationStepCount += generationProgram.Count;
+				_context.GenerationMinimum = Math.Min(_context.GenerationMinimum, generationProgram.Count);
+				_context.GenerationMaximum = Math.Max(_context.GenerationMaximum, generationProgram.Count);
+				_context.SelectorLaneTransitionCount += generationProgram.Count;
+				foreach ((byte family, uint mask, byte selectorLane, uint recipe) in generationProgram)
+				{
+					_context.GenerationFamilyMask |= 1 << family;
+					_context.GenerationProgramSignature =
+						(_context.GenerationProgramSignature ^ family) * 16777619u;
+					_context.GenerationProgramSignature =
+						(_context.GenerationProgramSignature ^ mask) * 16777619u;
+					_context.SelectorLaneFamilyMask |= 1 << selectorLane;
+					_context.SelectorLaneProgramSignature =
+						(_context.SelectorLaneProgramSignature ^ selectorLane) * 16777619u;
+					_context.SelectorLaneProgramSignature =
+						(_context.SelectorLaneProgramSignature ^ recipe) * 16777619u;
+				}
 
-				ushort storedOpcode = (ushort)((ushort)opcode ^ OpcodeMask(pc, k1, k2, k3) ^
+				ushort generationOpcode = unchecked((ushort)opcode);
+				ushort generationA = unchecked((ushort)instruction.A);
+				for (int generation = generationProgram.Count - 1; generation >= 0; generation--)
+				{
+					(byte family, uint mask, _, _) = generationProgram[generation];
+					ushort low = unchecked((ushort)mask);
+					ushort high = unchecked((ushort)(mask >> 16));
+					switch (family)
+					{
+						case 0: generationOpcode ^= low; break;
+						case 1: generationA ^= high; break;
+						case 2: generationOpcode ^= low; generationA ^= high; break;
+						default:
+							generationOpcode ^= high;
+							generationA ^= low;
+							break;
+					}
+				}
+				List<Instruction> fusedInstructions = instruction.CustomData?.FusedInstructions;
+				bool isFused = fusedInstructions is {Count: > 1};
+				descriptors.Add((byte)(((type << 1) | (constantMask << 3) | (isFused ? 64 : 0)
+					| (instruction.FreshTableWrite ? 128 : 0)) ^ descriptorMask));
+
+				ushort storedOpcode = (ushort)(generationOpcode ^ OpcodeMask(pc, k1, k2, k3) ^
 				                               BlockFieldMask(entryState, pc, 0, k1, k2, k3) ^
 				                               OpcodeStateMask(opcodeState, pc));
-				ushort storedA = (ushort)((ushort)instruction.A ^ OperandMask16(pc, k1, k2, k3, 1) ^
+				ushort storedA = (ushort)(generationA ^ OperandMask16(pc, k1, k2, k3, 1) ^
 				                          BlockFieldMask(entryState, pc, 1, k1, k2, k3));
 				WriteUInt16(opcodes, storedOpcode);
 				WriteUInt16(operandsA, storedA);
@@ -708,11 +952,103 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 						WriteUInt32(operandsB, unchecked((uint)b) ^ OperandMask32(pc, k1, k2, k3, 2) ^ BlockMask32(2));
 						break;
 				}
+
+				if (isFused)
+				{
+					if (fusedInstructions.Count > 10 || !ReferenceEquals(fusedInstructions[0], instruction) ||
+					    instruction.CustomData.WrittenOpcode is not OpSuperOperator superOperator ||
+					    superOperator.MemberOperandSlots == null ||
+					    superOperator.MemberOperandSlots.Length != fusedInstructions.Count)
+						throw new InvalidOperationException("Invalid IR fusion descriptor.");
+					descriptors.Add((byte)(fusedInstructions.Count - 1));
+					// Supplemental descriptor/operand pages use a build-random physical
+					// order. The member select phase maps semantic order back to these slots.
+					var physicalMembers = fusedInstructions.Skip(1)
+						.Select((member, offset) => new {Member = member, SemanticIndex = offset + 1})
+						.OrderBy(item => superOperator.MemberOperandSlots[item.SemanticIndex]);
+					foreach (var physicalMember in physicalMembers)
+					{
+						Instruction member = physicalMember.Member;
+						int memberType = (int)member.InstructionType;
+						int memberMask = (int)member.ConstantMask;
+						if (member.InstructionType == InstructionType.Data || memberType > 3 || memberMask > 7)
+							throw new InvalidOperationException("Unsafe IR fusion member.");
+						descriptors.Add((byte)((memberType << 1) | (memberMask << 3)));
+						WriteUInt16(operandsA, unchecked((ushort)member.A));
+						switch (member.InstructionType)
+						{
+							case InstructionType.ABC:
+								WriteUInt16(operandsB, unchecked((ushort)member.B));
+								WriteUInt16(operandsC, unchecked((ushort)member.C));
+								break;
+							case InstructionType.ABx:
+								WriteUInt32(operandsB, unchecked((uint)member.B));
+								break;
+							case InstructionType.AsBx:
+								WriteUInt32(operandsB, unchecked((uint)(member.B + (1 << 16))));
+								break;
+							case InstructionType.AsBxC:
+								WriteUInt32(operandsB, unchecked((uint)(member.B + (1 << 16))));
+								WriteUInt16(operandsC, unchecked((ushort)member.C));
+								break;
+						}
+					}
+				}
+
+				descriptors.Add((byte)generationProgram.Count);
+				foreach ((byte family, uint mask, byte selectorLane, uint recipe) in generationProgram)
+				{
+					descriptors.Add(family);
+					WriteUInt32(descriptors, mask);
+					descriptors.Add(selectorLane);
+					WriteUInt32(descriptors, recipe);
+				}
 			}
 
+			// Mutate supplemental IR nodes while the original instruction map is
+			// still available, then physically lower every safe sequence to its head.
 			chunk.UpdateMappings();
+			foreach (Instruction head in chunk.Instructions.Where(value => value.CustomData?.FusedInstructions is {Count: > 1}))
+				foreach (Instruction member in head.CustomData.FusedInstructions.Skip(1))
+				{
+					member.UpdateRegisters();
+					member.CustomData?.Opcode?.Mutate(member);
+				}
+			var loweredInstructions = new List<Instruction>(chunk.Instructions.Count);
+			for (int index = 0; index < chunk.Instructions.Count; index++)
+			{
+				Instruction instruction = chunk.Instructions[index];
+				if (instruction.CustomData?.FusionContinuation == true)
+					continue;
+				loweredInstructions.Add(instruction);
+			}
+			chunk.Instructions = loweredInstructions;
+			chunk.UpdateMappings();
+			foreach (Instruction instruction in chunk.Instructions) instruction.UpdateRegisters();
+			foreach (Instruction instruction in chunk.Instructions) instruction.CustomData?.Opcode?.Mutate(instruction);
+			var usedConstantHandles = new HashSet<int>();
+			int AssignConstantHandle(int oneBasedConstantIndex)
+			{
+				if (oneBasedConstantIndex < 1 || oneBasedConstantIndex > chunk.Constants.Count)
+					throw new InvalidOperationException("Invalid constant operand before handle assignment.");
+				int handle;
+				do handle = _random.Next(1, 65536); while (!usedConstantHandles.Add(handle));
+				constantsByHandle.Add(handle, chunk.Constants[oneBasedConstantIndex - 1]);
+				return handle;
+			}
+			foreach (Instruction physical in chunk.Instructions)
+			{
+				IEnumerable<Instruction> members = physical.CustomData?.FusedInstructions ?? (IEnumerable<Instruction>)new[] {physical};
+				foreach (Instruction member in members)
+				{
+					if ((member.ConstantMask & InstructionConstantMask.RA) != 0) member.A = AssignConstantHandle(member.A);
+					if ((member.ConstantMask & InstructionConstantMask.RB) != 0) member.B = AssignConstantHandle(member.B);
+					if ((member.ConstantMask & InstructionConstantMask.RC) != 0) member.C = AssignConstantHandle(member.C);
+				}
+			}
+
 			DispatcherFlatteningDecision flattening = _settings.ControlFlow
-				? DispatcherFlatteningPlanner.Apply(chunk)
+				? DispatcherFlatteningPlanner.Apply(chunk, _context.MaxBlockInstructions)
 				: null;
 			if (!_settings.ControlFlow)
 			{
@@ -721,7 +1057,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			}
 
 			ControlFlowGraph controlFlow = flattening?.Graph ??
-			                                   ControlFlowGraph.Build(chunk, MaxBlockInstructions);
+			                                   ControlFlowGraph.Build(chunk, _context.MaxBlockInstructions);
 			var instructionBlocks = controlFlow.Blocks.ToList();
 			if (controlFlow.EntryBlock == null)
 				throw new InvalidOperationException("Prototype has no entry block.");
@@ -738,11 +1074,33 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				do state = NextState32(); while (!usedBlockStates.Add(state));
 				blockStates.Add(block, state);
 			}
-			uint payloadAttestation = _settings.AntiDump ? _context.Binder.AttestationToken : _context.XorSeed;
+			uint payloadAttestation = _settings.AntiDump ? _context.Binder.PayloadBinding : _context.XorSeed;
 			var blockChunkStates = instructionBlocks.ToDictionary(
 				block => block,
 				block => ChunkState(blockStates[block], block.Start + 1, block.Count, k1, k2, k3,
 					_context.XorSeed, payloadAttestation));
+			uint initialDialectMode = NextDialectMode();
+			// Distinct predecessors cycle through the complete build-local token bank
+			// for each target. This creates edge-local modes without cloning a block.
+			var edgeDialectModes = new Dictionary<(ControlFlowBlock Source, ControlFlowBlock Target), uint>();
+			var blockAcceptedModes = instructionBlocks.ToDictionary(
+				block => block, _ => new HashSet<uint>());
+			blockAcceptedModes[controlFlow.EntryBlock].Add(initialDialectMode);
+			foreach (ControlFlowBlock target in instructionBlocks)
+			{
+				var targetModes = new HashSet<uint>();
+				ControlFlowBlock[] predecessors = target.Predecessors.OrderBy(value => value.Start).ToArray();
+				for (int predecessor = 0; predecessor < predecessors.Length; predecessor++)
+				{
+					uint token;
+					if (targetModes.Count < _context.DialectModeCount)
+						do token = NextDialectMode(); while (!targetModes.Add(token));
+					else
+						token = NextDialectMode();
+					edgeDialectModes[(predecessors[predecessor], target)] = token;
+					blockAcceptedModes[target].Add(token);
+				}
+			}
 
 			// Eligible prototypes receive unrelated route tokens. A token is never a
 			// valid linear PC, so each cross-block transfer must be resolved by the VM's
@@ -760,14 +1118,6 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 				}
 			}
 
-			// Preserve the original linear mutation order. Several comparison/test
-			// opcodes consume the following JMP's still-relative B operand while
-			// mutating, even though blocks are emitted in randomized order below.
-			foreach (Instruction instruction in chunk.Instructions)
-				instruction.UpdateRegisters();
-			foreach (Instruction instruction in chunk.Instructions)
-				instruction.CustomData?.Opcode?.Mutate(instruction);
-
 			ShuffleBlocks(instructionBlocks);
 
 			// 每 prototype 独立密钥位于外层加密正文中，不再泄露在固定头部。
@@ -783,9 +1133,10 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 			int[] schema = DerivePermutation((int)ChunkStep.StepCount, k1, k2, k3, _context.Domains.SchemaPermutationDomain);
 			int[] constantTags = DerivePermutation(4, k1, k2, k3, _context.Domains.ConstantTagPermutationDomain);
 
-			byte[] BuildConstantCapsule(Constant constant, int constantIndex, uint entryState,
+			byte[] BuildConstantCapsule(Constant constant, int constantHandle, uint constantChainState, uint entryState,
 				uint chunkState, int blockStart)
 			{
+				int oneBasedIndex = constantHandle;
 				var raw = new List<byte>();
 				raw.Add((byte)constantTags[(int)constant.Type]);
 				switch (constant.Type)
@@ -804,12 +1155,29 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 					{
 						byte[] value = _luaEncoding.GetBytes((string)constant.Data);
 						WriteUInt32(raw, (uint)value.Length);
-						raw.AddRange(value);
+						int shardCount = value.Length <= 1 ? 1 : Math.Min(value.Length, 3 + _random.Next(5));
+						raw.Add((byte)shardCount);
+						int[] shardOrder = DerivePermutation(shardCount, k1, k2, k3,
+							unchecked(_context.Domains.ConstantMaskDomain + 2654435769u));
+						foreach (int logicalShard in shardOrder)
+						{
+							var shard = new List<byte>();
+							uint shardState = StringShardState(oneBasedIndex, logicalShard, value.Length, constantChainState,
+								entryState, chunkState, blockStart, k1, k2, k3);
+							for (int position = logicalShard; position < value.Length; position += shardCount)
+							{
+								byte encoded = (byte)(value[position] ^ (byte)(shardState >> 24));
+								shard.Add(encoded);
+								shardState = unchecked(shardState * 1664525u + 1013904223u
+									+ encoded + (uint)(position + 1) * 257u);
+							}
+							WriteUInt32(raw, (uint)shard.Count);
+							raw.AddRange(shard);
+						}
 						break;
 					}
 				}
 
-				int oneBasedIndex = constantIndex + 1;
 				uint state = ConstantMaskState(oneBasedIndex, entryState, chunkState, blockStart, k1, k2, k3);
 				byte[] encodedBody = new byte[raw.Count];
 				for (int index = 0; index < raw.Count; index++)
@@ -852,6 +1220,9 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 						// Store the first route under the attestation-derived binding. In the
 						// non-dispatcher case seed^seed decodes back to the zero sentinel.
 						WriteUInt32Local((dispatcherFlattened ? blockRoutes[controlFlow.EntryBlock] : 0u) ^ _context.XorSeed);
+						WriteUInt32Local(initialDialectMode ^ InitialDialectModeKey(
+							blockStates[controlFlow.EntryBlock], blockChunkStates[controlFlow.EntryBlock],
+							controlFlow.EntryBlock.Start + 1, k1, k2, k3, _context.XorSeed));
 						foreach (ControlFlowBlock block in instructionBlocks)
 						{
 							int start = block.Start;
@@ -875,13 +1246,16 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								var instructionRecord = new List<byte>();
 								foreach (int logicalColumn in columnOrder)
 								{
-									WriteUInt32(instructionRecord, (uint)columns[logicalColumn].Count);
-									instructionRecord.AddRange(columns[logicalColumn]);
+									byte[] encodedColumn = EncodePrototypeColumn(
+										columns[logicalColumn], logicalColumn, instructionIndex,
+										entryState, k1, k2, k3);
+									WriteUInt32(instructionRecord, (uint)encodedColumn.Length);
+									instructionRecord.AddRange(encodedColumn);
 								}
 								byte[] record = instructionRecord.ToArray();
 								instructionRecords.Add(record);
 								opcodeState = AdvanceOpcodeState(opcodeState,
-									ComputeInstructionDigest(record, instructionIndex, k1, k2, k3), instructionIndex,
+									ComputeInstructionDigest(record, instructionIndex, k1, k2, k3, sourceChunkState, entryState), instructionIndex,
 									sourceChunkState, entryState, payloadAttestation);
 							}
 
@@ -889,23 +1263,32 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							for (int offset = 0; offset < count; offset++)
 							{
 								Instruction instruction = chunk.Instructions[start + offset];
-								if ((instruction.ConstantMask & InstructionConstantMask.RA) != 0) referenceSet.Add(instruction.A);
-								if ((instruction.ConstantMask & InstructionConstantMask.RB) != 0) referenceSet.Add(instruction.B);
-								if ((instruction.ConstantMask & InstructionConstantMask.RC) != 0) referenceSet.Add(instruction.C);
+								IEnumerable<Instruction> referencedInstructions = instruction.CustomData?.FusedInstructions ?? (IEnumerable<Instruction>)new[] {instruction};
+								foreach (Instruction referenced in referencedInstructions)
+								{
+									if ((referenced.ConstantMask & InstructionConstantMask.RA) != 0) referenceSet.Add(referenced.A);
+									if ((referenced.ConstantMask & InstructionConstantMask.RB) != 0) referenceSet.Add(referenced.B);
+									if ((referenced.ConstantMask & InstructionConstantMask.RC) != 0) referenceSet.Add(referenced.C);
+								}
 							}
 							List<int> constantReferences = referenceSet.OrderBy(value => value).ToList();
-							foreach (int constantIndex in constantReferences)
-								if (constantIndex < 1 || constantIndex > chunk.Constants.Count)
-									throw new InvalidOperationException("Invalid block constant reference.");
+							foreach (int constantHandle in constantReferences)
+								if (!constantsByHandle.ContainsKey(constantHandle))
+									throw new InvalidOperationException("Invalid block constant handle.");
 
 							// Logical records are instruction windows followed by this block's
 							// state-bound constant partition.  Their physical order is shuffled from
 							// EntryState + ChunkState, producing real code/data record interleaving.
 							var logicalFragments = new List<byte[]>(count + constantReferences.Count);
 							logicalFragments.AddRange(instructionRecords);
-							foreach (int constantIndex in constantReferences)
-								logicalFragments.Add(BuildConstantCapsule(chunk.Constants[constantIndex - 1],
-									constantIndex - 1, entryState, sourceChunkState, start + 1));
+							uint constantChainState = BeginConstantChain(entryState, sourceChunkState, start + 1, k1, k2, k3);
+							foreach (int constantHandle in constantReferences)
+							{
+								byte[] capsule = BuildConstantCapsule(constantsByHandle[constantHandle],
+									constantHandle, constantChainState, entryState, sourceChunkState, start + 1);
+								logicalFragments.Add(capsule);
+								constantChainState = AdvanceConstantChain(constantChainState, capsule, constantHandle);
+							}
 
 							var blockBody = new List<byte>();
 							uint fragmentState = entryState ^ sourceChunkState;
@@ -929,16 +1312,23 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								uint wrappedChunkState = blockChunkStates[successor] ^ ChunkChainKey(
 									sourceChunkState, entryState, block.EndExclusive, successorStart, k1, k2, k3,
 									_context.XorSeed, payloadAttestation);
+								uint wrappedMode = edgeDialectModes[(block, successor)] ^ DialectModeKey(
+									entryState, sourceChunkState, blockStates[successor], blockChunkStates[successor],
+									block.EndExclusive, successorStart, k1, k2, k3, _context.XorSeed);
 								successorRecords.Add(new ChunkSuccessor
 								{
 									Destination = successorStart,
 									WrappedEntryState = wrappedState,
-									WrappedChunkState = wrappedChunkState
+									WrappedChunkState = wrappedChunkState,
+									WrappedMode = wrappedMode
 								});
 							}
+							if (blockAcceptedModes[block].Count == 0)
+								blockAcceptedModes[block].Add(NextDialectMode());
+							List<uint> acceptedModes = blockAcceptedModes[block].OrderBy(value => value).ToList();
 							byte[] encodedBlockBody = blockBody.ToArray();
 							uint blockTag = ComputeBlockIntegrity(encodedBlockBody, entryState, start + 1, count,
-								routeToken, constantReferences, verifier, successorRecords, k1, k2, k3,
+								routeToken, constantReferences, acceptedModes, verifier, successorRecords, k1, k2, k3,
 								_context.XorSeed);
 
 							WriteUInt32Local((uint)(start + 1));
@@ -947,6 +1337,8 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 							WriteUInt32Local((uint)constantReferences.Count);
 							foreach (int constantIndex in constantReferences)
 								WriteUInt32Local((uint)constantIndex);
+							WriteUInt32Local((uint)acceptedModes.Count);
+							foreach (uint mode in acceptedModes) WriteUInt32Local(mode);
 							WriteUInt32Local(verifier);
 							WriteUInt32Local(blockTag);
 							WriteUInt32Local((uint)successorRecords.Count);
@@ -955,6 +1347,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								WriteUInt32Local((uint)successor.Destination);
 								WriteUInt32Local(successor.WrappedEntryState);
 								WriteUInt32Local(successor.WrappedChunkState);
+								WriteUInt32Local(successor.WrappedMode);
 							}
 
 							WriteUInt32Local((uint)encodedBlockBody.Length);

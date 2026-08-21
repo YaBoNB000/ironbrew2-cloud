@@ -11,4 +11,6 @@ local function make()
 end
 
 local closure = make()
-print("closure-boundary:" .. closure(7))
+local test_output = "closure-boundary:" .. closure(7)
+print(test_output)
+return {__ib2_test_output = test_output}

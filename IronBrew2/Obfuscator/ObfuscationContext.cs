@@ -33,6 +33,33 @@ namespace IronBrew2.Obfuscator
 		D,
 		StepCount
 	}
+
+	// CALL B/C semantics are represented by build-random tokens rather than by
+	// distinct, self-contained Lua call expressions in terminal opcode leaves.
+	// Keep this order synchronized with Generator's call trampoline plans.
+	public enum CallMode
+	{
+		FixedArgumentsFixedResults,
+		SingleArgumentFixedResults,
+		TopArgumentsFixedResults,
+		NoArgumentsFixedResults,
+		FixedArgumentsVariableResults,
+		SingleArgumentVariableResults,
+		FixedArgumentsDiscardResults,
+		SingleArgumentDiscardResults,
+		TopArgumentsVariableResults,
+		TopArgumentsDiscardResults,
+		NoArgumentsVariableResults,
+		NoArgumentsDiscardResults,
+		FixedArgumentsSingleResult,
+		SingleArgumentSingleResult,
+		TopArgumentsSingleResult,
+		NoArgumentsSingleResult,
+		TailFixedArguments,
+		TailTopArguments,
+		TailNoArguments,
+		ModeCount
+	}
 	
 	public class ObfuscationContext
 	{
@@ -47,9 +74,38 @@ namespace IronBrew2.Obfuscator
 		public int VirtualOpcodeCount;
 		public int VirtualOpcodeAliasCount;
 
+		// Build-local synthetic micro-block limit. Small randomized straight-line
+		// partitions force even branch-free payloads through route/state boundaries.
+		public int MaxBlockInstructions;
+		public uint[] TableWriteTokens;
+		public uint[] TableCommitTokens;
+		public uint[] CallModeTokens;
+		// P1 dialect lattice: all modes coexist in one generated VM. Blocks/edges
+		// carry authenticated wrapped tokens; the dispatcher emits independent
+		// continuation/handler recipes for every token.
+		public int DialectModeCount;
+		public uint[] DialectModeTokens;
+		public HashSet<uint> DialectModesUsed = new HashSet<uint>();
+		public int GenerationProgramCount;
+		public int GenerationStepCount;
+		public int GenerationMinimum = int.MaxValue;
+		public int GenerationMaximum;
+		public int GenerationFamilyMask;
+		public uint GenerationProgramSignature = 2166136261u;
+		// P3 selector migration is generation-local and mode-permuted. Lane zero is
+		// the generation-0 opcode carrier; authenticated rewrite records select one
+		// of three non-constant post-rewrite carrier families plus an independent
+		// recipe token.
+		public int SelectorLaneFamilyMask = 1;
+		public int SelectorLaneTransitionCount;
+		public uint SelectorLaneProgramSignature = 2166136261u;
+
 		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|attestation token)，
 		// 序列化头部只写盐，VM 端严格探针成功后才派生同一种子。
 		public uint XorSeed;
+		// v5 outer authentication uses an independently derived key so its public
+		// tag is not an equation over the envelope stream-decryption seed.
+		public uint OuterIntegrityKey;
 
 		// 环境绑定器：生成盐、attestation token 和 VM 端种子派生代码
 		public EnvBinder Binder;
@@ -71,6 +127,19 @@ namespace IronBrew2.Obfuscator
 			PayloadFormat = new PayloadFormatLayout(Domains);
 
 			BuildRandom schemaRandom = Seed.GetStream("bytecode.schema");
+			MaxBlockInstructions = 3 + schemaRandom.Next(4);
+
+			BuildRandom dialectRandom = Seed.GetStream("vm.dialect");
+			DialectModeCount = 3 + dialectRandom.Next(3);
+			DialectModeTokens = new uint[DialectModeCount];
+			var dialectTokens = new HashSet<uint>();
+			for (int index = 0; index < DialectModeTokens.Length; index++)
+			{
+				uint token;
+				do token = dialectRandom.NextUInt32(); while (token == 0 || !dialectTokens.Add(token));
+				DialectModeTokens[index] = token;
+			}
+
 			InstructionSteps1 = Enumerable.Range(0, (int) InstructionStep1.StepCount).Select(i => (InstructionStep1) i).ToArray();
 			InstructionSteps1.Shuffle(schemaRandom);
 			
@@ -81,8 +150,10 @@ namespace IronBrew2.Obfuscator
 
 			if (settings.EnvironmentLock)
 			{
-				// 只有严格 executor guard 成功后才恢复同一 token 与 serializer seed。
+				// 只有严格 executor guard 成功后才恢复同一 token、serializer seed
+				// 与独立 outer-authentication key。
 				XorSeed = Binder.DeriveSeed(Binder.AttestationToken);
+				OuterIntegrityKey = Binder.DeriveIntegrityKey(Binder.AttestationToken);
 			}
 			else
 			{
@@ -91,6 +162,10 @@ namespace IronBrew2.Obfuscator
 			}
 			if (XorSeed == 0)
 				XorSeed = 0x9E3779B9;
+			if (!settings.EnvironmentLock)
+				OuterIntegrityKey = XorSeed;
+			else if (OuterIntegrityKey == 0)
+				OuterIntegrityKey = 0xC4D29A6B;
 		}
 	}
 }

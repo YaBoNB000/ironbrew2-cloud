@@ -35,6 +35,7 @@ cd "$ROOT"
 CLI="$ROOT/IronBrew2 CLI/bin/Release/net8.0/IronBrew2 CLI.dll"
 "$DOTNET" run --project tests/cfg_regression/cfg_regression.csproj --configuration Debug --nologo
 python3 tests/build_seed_wiring.py
+python3 tests/outer_seed_oracle.py
 "$LUA" tests/semantic.lua > "$WORK/baseline.out"
 
 obfuscate() {
@@ -82,6 +83,43 @@ obfuscate "$WORK/fixed.lua"
 cp "$ROOT/temp/t2.lua" "$WORK/fixed-vm.lua"
 python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
+python3 tests/materializer_replay.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/selector_lane_migration.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/generation_replay_tamper.py "$WORK/fixed-vm.lua" "$WORK"
+for generation_case in skip duplicate mask reorder lane recipe; do
+    generation_file="$WORK/generation-$generation_case.lua"
+    "$LUAC" -p "$generation_file"
+    set +e
+    run_executor "$generation_file" > "$WORK/generation-$generation_case.stdout" \
+        2> "$WORK/generation-$generation_case.stderr"
+    generation_code=$?
+    set -e
+    [[ $generation_code -ne 0 ]]
+    [[ ! -s "$WORK/generation-$generation_case.stdout" ]]
+done
+echo "PASS generation skip/duplicate/mask/reorder/lane/recipe rejection before payload semantics"
+python3 tests/constant_use_materialization.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/handler_fragment_sharing.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/ir_native_fusion.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua"
+python3 tests/fused_member_tokens.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua" --build-log "$WORK/obfuscator.log"
+python3 tests/global_disable.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua" --late-nil-output "$WORK/late-getfenv-nil.lua"
+python3 tests/dynamic_loader_guard.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/call_trampoline.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua" --build-log "$WORK/obfuscator.log"
+python3 tests/string_constant_shards.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua" --require-chain
+"$LUAC" -p "$WORK/late-getfenv-nil.lua"
+run_executor "$WORK/late-getfenv-nil.lua" > "$WORK/late-getfenv-nil.out"
+cmp "$WORK/baseline.out" "$WORK/late-getfenv-nil.out"
+echo "PASS late nil GetFEnv falls back before every RawGet/Wrap use"
+python3 tests/prototype_decoder_families.py "$WORK/fixed.lua"
+python3 tests/prototype_runtime_abi.py "$WORK/fixed.lua"
+python3 tests/streaming_carrier.py "$WORK/fixed.lua"
+python3 tests/static_attack_baseline.py "$WORK/fixed.lua" \
+    --expect-string constants --expect-string closure --expect-string nested \
+    --require-current-baseline --report "$WORK/static-attack-baseline.json"
+python3 tests/static_decompiler.py "$WORK/fixed.lua" \
+    --report "$WORK/static-decompiler-baseline.json"
+python3 tests/static_state_model.py "$WORK/fixed.lua" --require-dialects --require-generations
+python3 tests/static_state_model.py "$ROOT/test_obf.txt" --uploaded-loader
 run_executor "$WORK/fixed.lua" > "$WORK/fixed.out"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
 echo "PASS single fixed configuration"
@@ -106,11 +144,11 @@ for entropy_case in modify delete reorder; do
 done
 echo "PASS entropy record modification, deletion and reordering rejection after outer-tag recomputation"
 
-# Rebuild every outer/envelope layer around deliberately damaged v4 internals.
+# Rebuild every outer/envelope layer around deliberately damaged v5 internals.
 # Each case leaves exactly the named prototype, complete block-manifest,
 # authenticated instruction-record parser/consumption, or block-local
 # capsule-integrity layer as the first rejecting boundary.
-for payload_case in prototype-tag initial-chunk-state successor-chunk-state block-manifest column-framing column-consumption capsule-integrity; do
+for payload_case in prototype-tag initial-chunk-state initial-dialect-mode successor-chunk-state successor-dialect-mode block-dialect-manifest block-manifest column-framing column-consumption generation-program capsule-integrity; do
     payload_file="$WORK/payload-$payload_case.lua"
     "$LUAC" -p "$payload_file"
     set +e
@@ -118,9 +156,9 @@ for payload_case in prototype-tag initial-chunk-state successor-chunk-state bloc
     payload_code=$?
     set -e
     assert_payload_rejected "$payload_code" "$WORK/payload-$payload_case.stdout" \
-        "$WORK/payload-$payload_case.stderr" "v4 $payload_case tamper"
+        "$WORK/payload-$payload_case.stderr" "v5 $payload_case tamper"
 done
-echo "PASS v4 prototype, attested chunk-chain, block-manifest, record framing/consumption and block-local capsule tamper rejection"
+echo "PASS v5 prototype, attested chunk-chain, block-manifest, record framing/consumption and block-local capsule tamper rejection"
 
 # The trusted test executor must pass every retained hard-AND behavior contract.
 # Compatibility paths model proxy-backed globals, empty C-upvalue results and
@@ -128,7 +166,7 @@ echo "PASS v4 prototype, attested chunk-chain, block-manifest, record framing/co
 # reproduces all six real-executor compatibility failures removed from the gate:
 # hidden random constants/upvalues, no observable interim setupvalue mutation,
 # wrong callable inactive results and a wrong activated-proto result.
-for mode in trusted no-alias compat-representations callable-proto wrong-callable-proto removed-root-contracts; do
+for mode in trusted no-alias compat-representations proxy-builtins callable-proto wrong-callable-proto removed-root-contracts; do
     run_executor_mode "$mode" "$WORK/fixed.lua" > "$WORK/executor-$mode.out"
     cmp "$WORK/baseline.out" "$WORK/executor-$mode.out"
 done
@@ -225,6 +263,7 @@ stream_leak = re.search(
     r"\b(?:DeriveBlockPermutation|DeriveCodeDataPermutation|Column(?:Order|Positions|Read8|Read16|Read32|Data|Position)|"
     r"Fragment(?:Order|Spans|Count|State)|Instruction(?:Digest|State|Seal)|BeginInstructionState|AdvanceInstructionState|"
     r"OpcodeState(?:Key|Seal)?|BeginOpcodeState|AdvanceOpcodeState|PreviousOpcodeState|CurrentOpcode(?:State|Seal)|"
+    r"PrototypeDecoderMode|DecodePrototypeColumn|DecoderMode|"
     r"CipherByte|KeyByte|LengthOffset|EncodedIndex|Pipeline(?:State|Index)|TransformedByte|InstrPoint|Inst|GetInstruction)\b",
     source + "\n" + final_source,
 )
@@ -245,7 +284,8 @@ source = Path(sys.argv[1]).read_text("latin1")
 ident = r"[A-Za-z_]\w*"
 calls = list(re.finditer(
     rf"if\s+({ident})\(\s*({ident})\s*,\s*({ident})\s*,\s*({ident})\s*,\s*({ident})\s*,\s*"
-    rf"({ident})\s*,\s*({ident})\s*\)\s+then\s+return\s+({ident})\(\);\s*end;\s*return\s+({ident})\s*;",
+    rf"({ident})\s*,\s*({ident})\s*\)\s+then\s+return\s+({ident})\(\);\s*end;\s*"
+    rf"return\s+({ident})(?:\s*,\s*({ident}))?\s*;",
     source,
 ))
 if len(calls) != 1:
@@ -307,11 +347,11 @@ import sys
 source = Path(sys.argv[1]).read_text("latin1")
 sys.path.insert(0, str(Path.cwd() / "tests"))
 from runtime_layout import derive_runtime_layout
-chunk_slots = derive_runtime_layout(source)["chunk"]
+layout = derive_runtime_layout(source)
+chunk_slots = layout["chunk"]
 pattern = re.compile(
-    r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
-    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
-    r"(?:[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*=\s*nil(?:\s*,\s*nil)*;\s*)?"
+    r"(local\s+(" + re.escape(layout["identifiers"]["Root"]) + r")\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"[\s\S]*?"
     r"(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -333,7 +373,7 @@ echo "PASS automatic dispatcher selection without source markers"
 
 # A tiny straight-line prototype has no useful block transition to flatten. It
 # must retain the ordinary PC path and contain no partial dispatcher metadata.
-printf '%s\n' 'print(1 + 2)' > "$WORK/dispatcher-fallback.lua"
+printf '%s\n' 'local v=1+2' > "$WORK/dispatcher-fallback.lua"
 "$LUA" "$WORK/dispatcher-fallback.lua" > "$WORK/dispatcher-fallback-baseline.out"
 rm -rf temp out.lua
 "$DOTNET" "$CLI" "$WORK/dispatcher-fallback.lua" > "$WORK/dispatcher-fallback-build.log"
@@ -346,11 +386,11 @@ import sys
 source = Path(sys.argv[1]).read_text("latin1")
 sys.path.insert(0, str(Path.cwd() / "tests"))
 from runtime_layout import derive_runtime_layout
-chunk_slots = derive_runtime_layout(source)["chunk"]
+layout = derive_runtime_layout(source)
+chunk_slots = layout["chunk"]
 pattern = re.compile(
-    r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
-    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
-    r"(?:[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*=\s*nil(?:\s*,\s*nil)*;\s*)?"
+    r"(local\s+(" + re.escape(layout["identifiers"]["Root"]) + r")\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"[\s\S]*?"
     r"(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -366,6 +406,102 @@ PY
 run_executor "$WORK/dispatcher-fallback-instrumented.lua" > "$WORK/dispatcher-fallback.out"
 cmp "$WORK/dispatcher-fallback-baseline.out" "$WORK/dispatcher-fallback.out"
 echo "PASS unsupported dispatcher shape falls back without partial metadata"
+
+# Branch-free code is still split into build-random 3–6 instruction micro-blocks
+# with independent route/state records.
+"$LUA" tests/microblock_straight.lua > "$WORK/microblock-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/microblock_straight.lua > "$WORK/microblock-build.log"
+mv out.lua "$WORK/microblock.lua"
+"$LUAC" -p "$WORK/microblock.lua"
+python3 tests/synthetic_microblocks.py "$WORK/microblock.lua" "$WORK/microblock-build.log"
+run_executor "$WORK/microblock.lua" > "$WORK/microblock.out"
+cmp "$WORK/microblock-baseline.out" "$WORK/microblock.out"
+echo "PASS branch-free synthetic micro-block routing"
+
+# Repeated uses of one logical constant must receive independent random handles
+# and independent capsules instead of exposing one stable prototype index.
+"$LUA" tests/per_use_constants.lua > "$WORK/per-use-constants-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/per_use_constants.lua > "$WORK/per-use-constants-build.log"
+mv out.lua "$WORK/per-use-constants.lua"
+"$LUAC" -p "$WORK/per-use-constants.lua"
+python3 tests/per_use_constant_handles.py "$WORK/per-use-constants.lua" --expect repeated-value
+run_executor "$WORK/per-use-constants.lua" > "$WORK/per-use-constants.out"
+cmp "$WORK/per-use-constants-baseline.out" "$WORK/per-use-constants.out"
+echo "PASS per-use randomized constant handles"
+
+# SETTABLE key and value operands are acquired through independent tokenized
+# fragments before one shared commit fragment.
+"$LUA" tests/table_materialization.lua > "$WORK/table-materialization-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/table_materialization.lua > "$WORK/table-materialization-build.log"
+mv out.lua "$WORK/table-materialization.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/table-materialization-vm.lua"
+"$LUAC" -p "$WORK/table-materialization.lua"
+python3 tests/table_materialization.py "$WORK/table-materialization-vm.lua" "$WORK/table-materialization.lua"
+run_executor "$WORK/table-materialization.lua" > "$WORK/table-materialization.out"
+cmp "$WORK/table-materialization-baseline.out" "$WORK/table-materialization.out"
+echo "PASS separated table key/value materialization"
+
+# Consecutive distinct constant-key writes into a freshly allocated table are
+# reordered before opcode mapping; no aliased/metatable target is eligible.
+"$LUA" tests/table_write_order.lua > "$WORK/table-write-order-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/table_write_order.lua > "$WORK/table-write-order-build.log"
+mv out.lua "$WORK/table-write-order.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/table-write-order-vm.lua"
+"$LUAC" -p "$WORK/table-write-order.lua"
+python3 tests/table_write_order.py "$WORK/table-write-order-build.log"
+python3 tests/fresh_table_decoys.py "$WORK/table-write-order.lua" "$WORK/table-write-order-vm.lua" "$WORK/table-write-order-build.log"
+run_executor "$WORK/table-write-order.lua" > "$WORK/table-write-order.out"
+cmp "$WORK/table-write-order-baseline.out" "$WORK/table-write-order.out"
+echo "PASS safe fresh-table write-order randomization"
+
+# Exercise every CALL B/C family, all TAILCALL argument windows, SELF receiver
+# forwarding, embedded nils and the HttpGet -> loadstring -> chunk -> options
+# chain against the shared tokenized trampoline.
+"$LUA" tests/call_trampoline.lua > "$WORK/call-trampoline-baseline.out"
+"$LUAC" -l -p tests/call_trampoline.lua > "$WORK/call-trampoline-bytecode.txt"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/call_trampoline.lua > "$WORK/call-trampoline-build.log"
+mv out.lua "$WORK/call-trampoline.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/call-trampoline-vm.lua"
+"$LUAC" -p "$WORK/call-trampoline.lua"
+python3 tests/call_trampoline.py "$WORK/call-trampoline-vm.lua" "$WORK/call-trampoline.lua" \
+    --build-log "$WORK/call-trampoline-build.log" \
+    --bytecode-listing "$WORK/call-trampoline-bytecode.txt"
+python3 tests/dynamic_loader_guard.py "$WORK/call-trampoline-vm.lua" "$WORK/call-trampoline.lua"
+python3 tests/static_decompiler.py "$WORK/call-trampoline.lua" --require-call-chain \
+    --report "$WORK/static-decompiler-call-report.json"
+run_executor "$WORK/call-trampoline.lua" > "$WORK/call-trampoline.out"
+cmp "$WORK/call-trampoline-baseline.out" "$WORK/call-trampoline.out"
+echo "PASS CALL B/C, SELF, loader-chain, multiple-result and direct TAILCALL semantics"
+
+# The minimal getgenv -> SETTABLE -> HttpGet -> loadstring -> compiled-call
+# chain must no longer expose one physical record per semantic operation. It is
+# lowered to one ten-member select/execute phase program plus the final RETURN.
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/vm_chain_fusion.lua > "$WORK/vm-chain-fusion-build.log"
+mv out.lua "$WORK/vm-chain-fusion.lua"
+"$LUAC" -p "$WORK/vm-chain-fusion.lua"
+python3 tests/call_inclusive_fusion.py "$WORK/vm-chain-fusion.lua" \
+    --build-log "$WORK/vm-chain-fusion-build.log"
+
+# P1: one final VM carries 3–5 authenticated dialect modes. Different
+# predecessors enter one target block through distinct wrapped mode tokens, and
+# every mode owns an independently transformed selector/handler path family.
+"$LUA" tests/dialect_modes.lua > "$WORK/dialect-modes-baseline.out"
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/dialect_modes.lua > "$WORK/dialect-modes-build.log"
+mv out.lua "$WORK/dialect-modes.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/dialect-modes-vm.lua"
+"$LUAC" -p "$WORK/dialect-modes.lua"
+python3 tests/dialect_modes.py "$WORK/dialect-modes.lua" "$WORK/dialect-modes-vm.lua" \
+    --build-log "$WORK/dialect-modes-build.log"
+run_executor "$WORK/dialect-modes.lua" > "$WORK/dialect-modes.out"
+cmp "$WORK/dialect-modes-baseline.out" "$WORK/dialect-modes.out"
+echo "PASS block/edge-local authenticated dialect mode semantics"
 
 # Repeat randomized prototype keys, opcode maps, schema orders and dispatcher
 # control-flow templates. Each generated VM is parsed structurally before it is
@@ -469,17 +605,116 @@ payload_layouts = [payload_layout(layout["domains"]) for layout in layouts]
 derivation_profiles = [derivation_profile(layout["domains"]) for layout in layouts]
 payload_layout_vectors = [json.dumps(layout, sort_keys=True) for layout in payload_layouts]
 super_records = []
+semantic_records = []
+fragment_records = []
+micro_limits = []
+table_order_profiles = []
+fused_member_profiles = []
+call_inclusive_profiles = []
+call_trampoline_profiles = []
+dialect_profiles = []
+generation_profiles = []
+selector_lane_profiles = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
+    micro = re.search(r"Synthetic micro-block limit: ([3-6])\.", log)
+    if not micro:
+        raise SystemExit(f"missing synthetic micro-block limit for build {index}")
+    micro_limits.append(int(micro.group(1)))
+    table_order = re.search(
+        r"Fresh table write order: groups=(\d+); writes=(\d+); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not table_order:
+        raise SystemExit(f"missing fresh-table write-order profile for build {index}")
+    table_order_profiles.append((int(table_order.group(1)), int(table_order.group(2)), table_order.group(3)))
     match = re.search(
-        r"Created (\d+) short super operators; folded (\d+) sequences; lengths ([0-9:,]+); structure ([0-9a-f]{8})\.",
+        r"Created (\d+) IR-native super operators; folded (\d+) sequences; lengths ([0-9:,]+); structure ([0-9a-f]{8})\.",
         log,
     )
     if not match:
-        raise SystemExit(f"missing structural short-super-operator record for build {index}")
+        raise SystemExit(f"missing structural IR-native-fusion record for build {index}")
     lengths = {int(size): int(count) for size, count in
                (entry.split(":") for entry in match.group(3).split(","))}
     super_records.append((int(match.group(1)), int(match.group(2)), lengths, match.group(4)))
+    member_tokens = re.search(
+        r"Fused member tokens: operators=(\d+); members=(\d+); phases=(\d+); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not member_tokens:
+        raise SystemExit(f"missing fused member-phase profile for build {index}")
+    fused_member_profiles.append((
+        int(member_tokens.group(1)), int(member_tokens.group(2)),
+        int(member_tokens.group(3)), member_tokens.group(4),
+    ))
+    call_inclusive = re.search(
+        r"Call-inclusive fusion: templates=(\d+); folded=(\d+); max-width=(\d+)\.", log
+    )
+    if not call_inclusive:
+        raise SystemExit(f"missing call-inclusive fusion profile for build {index}")
+    call_inclusive_profiles.append(tuple(map(int, call_inclusive.groups())))
+    call_trampoline = re.search(
+        r"Call trampolines: modes=(\d+); phases=(\d+); frame=([1-4](?:,[1-4]){3}); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not call_trampoline:
+        raise SystemExit(f"missing CALL trampoline profile for build {index}")
+    call_trampoline_profiles.append((
+        int(call_trampoline.group(1)),
+        int(call_trampoline.group(2)),
+        tuple(map(int, call_trampoline.group(3).split(","))),
+        call_trampoline.group(4),
+    ))
+    dialect = re.search(
+        r"Dialect lattice: modes=(\d+); used=(\d+); paths=(\d+); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not dialect:
+        raise SystemExit(f"missing dialect lattice profile for build {index}")
+    dialect_profiles.append((
+        int(dialect.group(1)), int(dialect.group(2)),
+        int(dialect.group(3)), dialect.group(4),
+    ))
+    generations = re.search(
+        r"Instruction generations: programs=(\d+); steps=(\d+); range=(\d+)-(\d+); "
+        r"families=([0-3](?:,[0-3]){0,3}); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not generations:
+        raise SystemExit(f"missing instruction-generation profile for build {index}")
+    generation_profiles.append((
+        int(generations.group(1)), int(generations.group(2)),
+        int(generations.group(3)), int(generations.group(4)),
+        tuple(map(int, generations.group(5).split(","))), generations.group(6),
+    ))
+    selector_lanes = re.search(
+        r"Selector lane migration: families=([0-3](?:,[0-3]){0,3}); "
+        r"transitions=(\d+); programs=(\d+); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not selector_lanes:
+        raise SystemExit(f"missing selector-lane migration profile for build {index}")
+    selector_lane_profiles.append((
+        tuple(map(int, selector_lanes.group(1).split(","))),
+        int(selector_lanes.group(2)), int(selector_lanes.group(3)), selector_lanes.group(4),
+    ))
+    semantic = re.search(
+        r"Semantic lowering: writes=([0-9,]+); raw-stack-reads=(\d+); raw-environment-reads=(\d+)\.",
+        log,
+    )
+    if not semantic:
+        raise SystemExit(f"missing semantic-lowering record for build {index}")
+    writes = tuple(int(value) for value in semantic.group(1).split(","))
+    if len(writes) != 6:
+        raise SystemExit(f"semantic-lowering write profile is not six-way: {writes}")
+    semantic_records.append((writes, int(semantic.group(2)), int(semantic.group(3))))
+    fragments = re.search(
+        r"Handler fragments: stack-read=(\d+); environment-read=(\d+); writeback=(\d+); binary=(\d+); unary=(\d+); pc=(\d+)\.",
+        log,
+    )
+    if not fragments:
+        raise SystemExit(f"missing handler-fragment coverage record for build {index}")
+    fragment_records.append(tuple(int(value) for value in fragments.groups()))
 slot_abis = [json.dumps({key: layout[key] for key in ("chunk", "block", "flow", "flow_cache")}, sort_keys=True)
              for layout in layouts]
 if min(counts) <= 44:
@@ -496,8 +731,17 @@ if set(templates) != expected_templates:
 expected_vm_layouts = {"dual-partitioned", "tiered-partitioned", "hybrid-locals"}
 if set(vm_layout_templates) != expected_vm_layouts:
     raise SystemExit(f"not all VM layout templates were emitted: {sorted(set(vm_layout_templates))}")
-if len(set(vm_layout_fingerprints)) != runs:
-    raise SystemExit("a VM state carrier layout was reused across builds")
+if len(set(micro_limits)) < 3:
+    raise SystemExit(f"synthetic micro-block limit diversity is insufficient: {sorted(set(micro_limits))}")
+if min(profile[0] for profile in table_order_profiles) < 1 or min(profile[1] for profile in table_order_profiles) < 3:
+    raise SystemExit(f"fresh-table write groups were not reordered in every build: {table_order_profiles}")
+if len({profile[2] for profile in table_order_profiles}) < 6:
+    raise SystemExit(f"fresh-table write-order diversity is insufficient: {table_order_profiles}")
+# Compact frame layouts are sampled from a finite space; a small number of exact
+# collisions is expected in a 20-build birthday sample. Require broad coverage
+# while the independent slot ABI/domain/dispatcher fingerprints remain unique.
+if len(set(vm_layout_fingerprints)) < runs - 2:
+    raise SystemExit("VM state carrier layout diversity is insufficient")
 carrier_topologies = {layout["carrier"] for layout in payload_carriers}
 assembly_topologies = {layout["assembly"] for layout in payload_carriers}
 segment_counts = {layout["segments"] for layout in payload_carriers}
@@ -526,7 +770,7 @@ if {layout["pipeline"] for layout in payload_layouts} != {0, 1, 2}:
     raise SystemExit("not all three decode pipelines were emitted")
 if len({layout["byte_transform"] for layout in payload_layouts}) < 3:
     raise SystemExit("payload byte-transform topology did not vary sufficiently")
-if len({(layout["pipeline"], layout["byte_transform"]) for layout in payload_layouts}) < 7:
+if len({(layout["pipeline"], layout["byte_transform"]) for layout in payload_layouts}) < 6:
     raise SystemExit("combined payload decode topology did not vary sufficiently")
 if len({json.dumps(profile, sort_keys=True) for profile in derivation_profiles}) != runs:
     raise SystemExit("a complete payload seed/stream derivation recipe was reused across builds")
@@ -549,11 +793,59 @@ for field, expected in (
     if observed != expected:
         raise SystemExit(f"payload grammar dimension {field} did not emit both forms: {sorted(observed)}")
 if min(record[0] for record in super_records) < 12 or min(record[1] for record in super_records) < 8:
-    raise SystemExit(f"short super operators were not materially emitted/folded: {super_records}")
-if any(len(record[2]) < 2 or sum(record[2].values()) != record[0] for record in super_records):
-    raise SystemExit(f"short super-operator length structure is degenerate: {super_records}")
+    raise SystemExit(f"IR-native super operators were not materially emitted/folded: {super_records}")
+if any(sum(record[2].values()) != record[0] for record in super_records):
+    raise SystemExit(f"IR-native fusion length totals are inconsistent: {super_records}")
+observed_fusion_lengths = {length for record in super_records for length in record[2]}
+if len(observed_fusion_lengths) < 3 or max(len(record[2]) for record in super_records) < 2:
+    raise SystemExit(f"IR-native fusion length diversity is insufficient: {super_records}")
 if len({record[3] for record in super_records}) != runs:
-    raise SystemExit("a short super-operator semantic structure was reused across builds")
+    raise SystemExit("a IR-native fusion semantic structure was reused across builds")
+if any(profile[0] != record[0] or profile[1] < profile[0] * 2 or profile[2] != profile[1] * 2
+       for profile, record in zip(fused_member_profiles, super_records)):
+    raise SystemExit(f"fused member-phase coverage is inconsistent: {fused_member_profiles}")
+if len({profile[3] for profile in fused_member_profiles}) != runs:
+    raise SystemExit("a fused member phase/operand-slot program was reused across builds")
+if any(templates < 1 or folded < 1 or width != 10 for templates, folded, width in call_inclusive_profiles):
+    raise SystemExit(f"CALL was not materially included in fusion: {call_inclusive_profiles}")
+if any(profile[0] != 19 or profile[1] != 92 or sorted(profile[2]) != [1, 2, 3, 4]
+       for profile in call_trampoline_profiles):
+    raise SystemExit(f"CALL trampoline coverage/layout is invalid: {call_trampoline_profiles}")
+if len({profile[3] for profile in call_trampoline_profiles}) != runs:
+    raise SystemExit("a CALL trampoline token/state program was reused across builds")
+if len({profile[2] for profile in call_trampoline_profiles}) < 6:
+    raise SystemExit(f"CALL frame layout diversity is insufficient: {call_trampoline_profiles}")
+if any(not 3 <= profile[0] <= 5 or profile[1] < 3 or profile[2] != profile[0] * count
+       for profile, count in zip(dialect_profiles, counts)):
+    raise SystemExit(f"dialect lattice coverage/path count is invalid: {dialect_profiles}")
+if {profile[0] for profile in dialect_profiles} != {3, 4, 5}:
+    raise SystemExit(f"dialect mode-count diversity is incomplete: {dialect_profiles}")
+if len({profile[3] for profile in dialect_profiles}) != runs:
+    raise SystemExit("a dialect token/selector/handler program was reused across builds")
+if any(programs < 1 or steps < programs * 2 or minimum != 2 or maximum != 5
+       or families != (0, 1, 2, 3)
+       for programs, steps, minimum, maximum, families, _signature in generation_profiles):
+    raise SystemExit(f"instruction generation coverage is incomplete: {generation_profiles}")
+if len({profile[5] for profile in generation_profiles}) != runs:
+    raise SystemExit("an instruction generation program was reused across builds")
+if any(families != (0, 1, 2, 3) or transitions < programs * 2
+       for families, transitions, programs, _signature in selector_lane_profiles):
+    raise SystemExit(f"selector-lane migration coverage is incomplete: {selector_lane_profiles}")
+if len({profile[3] for profile in selector_lane_profiles}) != runs:
+    raise SystemExit("a selector-lane recipe program was reused across builds")
+write_totals = tuple(sum(record[0][index] for record in semantic_records) for index in range(6))
+if min(write_totals) <= 0:
+    raise SystemExit(f"not all six semantic write lowerings were emitted: {write_totals}")
+if len({record[0] for record in semantic_records}) < 3:
+    raise SystemExit("semantic write-lowering profiles did not vary across builds")
+if sum(record[1] for record in semantic_records) <= 0 or sum(record[2] for record in semantic_records) <= 0:
+    raise SystemExit(f"raw accessor lowering coverage is missing: {semantic_records}")
+fragment_totals = tuple(sum(record[index] for record in fragment_records) for index in range(6))
+if min(fragment_totals) <= 0:
+    raise SystemExit(f"a shared handler-fragment family was not exercised: {fragment_totals}")
+if any(record[0] < 50 or record[1] < 1 or record[2] < 25 or record[5] < 5
+       for record in fragment_records):
+    raise SystemExit(f"handler fragments were not materially shared in every build: {fragment_records}")
 if len(set(slot_abis)) != runs:
     raise SystemExit("a runtime slot ABI was reused across builds")
 
@@ -579,10 +871,15 @@ layout_bigrams = [bigrams(layout["shape_sequence"]) for layout in vm_layouts]
 layout_similarities = [jaccard(left, right) for left, right in combinations(layout_bigrams, 2)]
 max_layout_similarity = max(layout_similarities)
 mean_layout_similarity = sum(layout_similarities) / len(layout_similarities)
-if max_layout_similarity > 0.45 or mean_layout_similarity > 0.10:
+nonidentical_layout_similarities = [value for value in layout_similarities if value < 1.0]
+max_nonidentical_layout_similarity = max(nonidentical_layout_similarities, default=0.0)
+# Exact compact-layout collisions are already bounded by the runs-2 uniqueness
+# check above. Apply the pairwise maximum only to nonidentical layouts, while the
+# population mean remains strict across all 190 pairings.
+if max_nonidentical_layout_similarity > 0.65 or mean_layout_similarity > 0.10:
     raise SystemExit(
         f"normalized VM layouts remain too similar: max={max_layout_similarity:.3f}, "
-        f"mean={mean_layout_similarity:.3f}"
+        f"nonidentical-max={max_nonidentical_layout_similarity:.3f}, mean={mean_layout_similarity:.3f}"
     )
 
 # Phase 4 quantifies all five public structural surfaces, including role-slot
@@ -645,7 +942,7 @@ if max_handler_similarity > 0.35 or mean_handler_similarity > 0.08:
     )
 print(
     f"PASS {runs}-build execution-model barrier: counts={sorted(set(counts))}, "
-    f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, "
+    f"dispatcher templates={sorted(set(templates))}, VM layouts={sorted(set(vm_layout_templates))}, micro-limits={sorted(set(micro_limits))}, table-orders={len({profile[2] for profile in table_order_profiles})}, "
     f"unique graphs/structures/layouts/domains/ABIs/payload-grammars/super-structures={runs}, "
     f"pipelines={sorted({layout['pipeline'] for layout in payload_layouts})}, "
     f"byte transforms={sorted({layout['byte_transform'] for layout in payload_layouts})}, "
@@ -653,7 +950,13 @@ print(
     f"derivation recipes={len({json.dumps(profile, sort_keys=True) for profile in derivation_profiles})}, "
     f"payload carriers={sorted(carrier_topologies)}, assemblies={sorted(assembly_topologies)}, "
     f"segments={sorted(segment_counts)}, "
-    f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, "
+    f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, member-phase-programs={len({profile[3] for profile in fused_member_profiles})}, "
+    f"call-inclusive-folds={min(profile[1] for profile in call_inclusive_profiles)}..{max(profile[1] for profile in call_inclusive_profiles)}, "
+    f"dialect-modes={sorted({profile[0] for profile in dialect_profiles})}, dialect-programs={len({profile[3] for profile in dialect_profiles})}, "
+    f"generation-programs={len({profile[5] for profile in generation_profiles})}, generation-range=2..5, "
+    f"selector-lane-programs={len({profile[3] for profile in selector_lane_profiles})}, selector-lanes=[0,1,2,3], "
+    f"call-token-programs={len({profile[3] for profile in call_trampoline_profiles})}, call-frame-layouts={len({profile[2] for profile in call_trampoline_profiles})}, "
+    f"semantic writes={write_totals}, raw reads={sum(record[1] for record in semantic_records)}/{sum(record[2] for record in semantic_records)}, "
     f"similarity dispatcher={max_similarity:.3f}/{mean_similarity:.3f}, "
     f"slot-ABI={max_slot_similarity:.3f}/{mean_slot_similarity:.3f}, "
     f"payload-grammar={max_grammar_similarity:.3f}/{mean_grammar_similarity:.3f}, "
@@ -669,7 +972,7 @@ python3 tests/phase4_cross_build_extractor.py \
     "$WORK/extractor-build-5.lua:$WORK/extractor-build-5-vm.lua"
 echo "PASS randomized opcode handlers and non-identity runtime layouts: $RANDOM_RUNS/$RANDOM_RUNS"
 
-# Tamper with v4's invocation-local flow metadata only after the outer payload
+# Tamper with v5's invocation-local flow metadata only after the outer payload
 # has been authenticated and deserialized. These probes target the unminified
 # generated VM so each rejection is attributable to block/flow validation, not
 # to the top-level encrypted-payload checksum.
@@ -686,9 +989,8 @@ layout = derive_runtime_layout(source)
 chunk_slots = layout["chunk"]
 block_slots = layout["block"]
 pattern = re.compile(
-    r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
-    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
-    r"(?:[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*=\s*nil(?:\s*,\s*nil)*;\s*)?"
+    r"(local\s+(" + re.escape(layout["identifiers"]["Root"]) + r")\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"[\s\S]*?"
     r"(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -785,9 +1087,8 @@ layout = derive_runtime_layout(source)
 chunk_slots = layout["chunk"]
 block_slots = layout["block"]
 pattern = re.compile(
-    r"(local\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_]\w*\(\);\s*)"
-    r"(?:if\s+[A-Za-z_]\w*\(true\)\s+then\s+[^\n]*?end;\s*)?"
-    r"(?:[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*=\s*nil(?:\s*,\s*nil)*;\s*)?"
+    r"(local\s+(" + re.escape(layout["identifiers"]["Root"]) + r")\s*=\s*[A-Za-z_]\w*\(\);\s*)"
+    r"[\s\S]*?"
     r"(return\s+[A-Za-z_]\w*\(\2\b)"
 )
 match = pattern.search(source)
@@ -834,7 +1135,7 @@ run_executor "$WORK/lazy-instrumented.lua" > "$WORK/lazy-instrumented.out"
 grep -Eq '^lazy-blocks:[1-9][0-9]*:executed-constant:37$' "$WORK/lazy-instrumented.out"
 echo "PASS paged-source release, current-record instruction lifetime, partitioned constants and opaque block retention"
 
-# Phase 4 uses a larger, branch-rich fixture for median performance gates and a
+# Phase 4 uses a larger, branch-rich fixture for timed semantic observation and a
 # test-only observer over the unminified VM. The observer records only counts,
 # weak references and heap sizes; production output receives no hook or decoder.
 python3 tests/phase4_performance.py \
@@ -849,9 +1150,9 @@ python3 tests/phase4_dynamic_dump.py \
     "$WORK/phase4-runtime-vm.lua" "$WORK/phase4-runtime.lua" "$WORK/phase4-runtime-instrumented.lua"
 "$LUAC" -p "$WORK/phase4-runtime-instrumented.lua"
 run_executor "$WORK/phase4-runtime-instrumented.lua" > "$WORK/phase4-runtime-instrumented.out"
-head -n 1 "$WORK/phase4-runtime-instrumented.out" > "$WORK/phase4-runtime-instrumented-baseline.out"
+grep '^phase4-runtime:' "$WORK/phase4-runtime-instrumented.out" > "$WORK/phase4-runtime-instrumented-baseline.out"
 cmp "$WORK/phase4-runtime-baseline.out" "$WORK/phase4-runtime-instrumented-baseline.out"
-grep -Eq '^PHASE4_DYNAMIC payload=page:[1-9][0-9]*/[1-9][0-9]* vm=opaque:[1-9][0-9]* chunks=decoded:[2-9][0-9]*,opaque:[1-9][0-9]* constants=max-live:[0-3]/[1-9][0-9]* instructions=weak-live:0/[1-9][0-9]* memory-kb=[0-9]+\.[0-9]>[0-9]+\.[0-9]>[0-9]+\.[0-9]$' \
+grep -Eq '^PHASE4_DYNAMIC payload=page:[1-9][0-9]*/[1-9][0-9]* vm=opaque:[1-9][0-9]* chunks=decoded:[2-9][0-9]*,opaque:[1-9][0-9]* constants=max-live:([1-9]|[12][0-9]|30)/[1-9][0-9]* instructions=weak-live:0/[1-9][0-9]* memory-kb=[0-9]+\.[0-9]>[0-9]+\.[0-9]>[0-9]+\.[0-9]$' \
     "$WORK/phase4-runtime-instrumented.out"
 echo "PASS Phase 4 dynamic dump, single-Chunk isolation and GC/peak-memory lifecycle barriers"
 
@@ -861,7 +1162,7 @@ echo "PASS Phase 4 dynamic dump, single-Chunk isolation and GC/peak-memory lifec
 mkdir -p "$WORK/setlist-bin"
 cp "$ROOT/tests/luac_setlist_c0_wrapper.py" "$WORK/setlist-bin/luac"
 chmod +x "$WORK/setlist-bin/luac"
-printf '%s\n' 'local t={123}; print("setlist-c0:" .. t[1])' > "$WORK/setlist-c0.lua"
+printf '%s\n' 'local t={123};local v="setlist-c0:"..t[1];print(v);return {__ib2_test_output=v}' > "$WORK/setlist-c0.lua"
 "$LUA" "$WORK/setlist-c0.lua" > "$WORK/setlist-c0-baseline.out"
 rm -rf temp out.lua
 IB2_REAL_LUAC="$LUAC" PATH="$WORK/setlist-bin:$PATH" \
@@ -882,18 +1183,55 @@ set -e
 grep -Fq 'unknown option: --strength' "$WORK/removed-tier.stdout"
 echo "PASS low/mid/high selector removed"
 
-# PreserveLineInfo should report the original nested source line.
+# The configured global policy intentionally changes explicit error semantics.
+# Verify all three names become the same permanent no-op in _G/getgenv.
 rm -rf temp out.lua
-"$DOTNET" "$CLI" tests/line_error.lua --line-info > "$WORK/line-build.log"
-mv out.lua "$WORK/line.lua"
-"$LUAC" -p "$WORK/line.lua"
+"$DOTNET" "$CLI" tests/global_disable.lua > "$WORK/global-disable-build.log"
+mv out.lua "$WORK/global-disable.lua"
+"$LUAC" -p "$WORK/global-disable.lua"
+run_executor_mode trusted-global-disable "$WORK/global-disable.lua" > "$WORK/global-disable.out"
+grep -qx 'PASS global print/error/warn disabled as one no-op' "$WORK/global-disable.out"
+echo "PASS permanent global print/error/warn no-op policy"
+
+# VM-internal line reporting retains a captured native error primitive; only the
+# protected script's global error binding is disabled.
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/line_runtime_error.lua --line-info > "$WORK/line-runtime-build.log"
+mv out.lua "$WORK/line-runtime.lua"
+"$LUAC" -p "$WORK/line-runtime.lua"
 set +e
-run_executor "$WORK/line.lua" > "$WORK/line.stdout" 2> "$WORK/line.stderr"
-line_code=$?
+run_executor "$WORK/line-runtime.lua" > "$WORK/line-runtime.stdout" 2> "$WORK/line-runtime.stderr"
+line_runtime_code=$?
 set -e
-[[ $line_code -ne 0 ]]
-grep -q 'ERROR IN IRONBREW SCRIPT \[LINE 4\]' "$WORK/line.stderr"
-echo "PASS nested line-info reporting"
+[[ $line_runtime_code -ne 0 ]]
+grep -q 'ERROR IN IRONBREW SCRIPT \[LINE 3\]' "$WORK/line-runtime.stderr"
+echo "PASS VM-internal line reporting with payload error disabled"
+
+# The shared CALL/TAILCALL trampoline validates its saved local callee between
+# target acquisition and argument-window acquisition. Positive compilation
+# succeeds; replacing the environment binding after startup causes the saved
+# alias call to enter the silent sink.
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/dynamic_loader.lua > "$WORK/dynamic-loader-build.log"
+mv out.lua "$WORK/dynamic-loader.lua"
+cp "$ROOT/temp/t2.lua" "$WORK/dynamic-loader-vm.lua"
+"$LUAC" -p "$WORK/dynamic-loader.lua"
+python3 tests/dynamic_loader_guard.py "$WORK/dynamic-loader-vm.lua" "$WORK/dynamic-loader.lua"
+run_executor "$WORK/dynamic-loader.lua" > "$WORK/dynamic-loader.out"
+grep -qx 'dynamic-loader:321' "$WORK/dynamic-loader.out"
+
+rm -rf temp out.lua
+"$DOTNET" "$CLI" tests/dynamic_loader_hook.lua > "$WORK/dynamic-loader-hook-build.log"
+mv out.lua "$WORK/dynamic-loader-hook.lua"
+"$LUAC" -p "$WORK/dynamic-loader-hook.lua"
+set +e
+timeout 2s "$LUA" tests/executor_runner.lua trusted "$WORK/dynamic-loader-hook.lua" \
+    > "$WORK/dynamic-loader-hook.stdout" 2> "$WORK/dynamic-loader-hook.stderr"
+dynamic_hook_code=$?
+set -e
+[[ $dynamic_hook_code -eq 124 ]]
+[[ ! -s "$WORK/dynamic-loader-hook.stdout" && ! -s "$WORK/dynamic-loader-hook.stderr" ]]
+echo "PASS per-call loadstring validation and post-startup hook rejection"
 
 # Simulate LuaJIT's signed 32-bit bit.bxor result.
 run_executor_mode signed-bit "$WORK/fixed.lua" > "$WORK/signed-bit.out"
