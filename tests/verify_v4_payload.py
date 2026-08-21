@@ -170,6 +170,7 @@ class Block:
     record_column_spans: list[dict[int, tuple[int, int, int]]] = field(default_factory=list)
     descriptors: list[int] = field(default_factory=list)
     fused_counts: list[int] = field(default_factory=list)
+    generation_programs: list[tuple[tuple[int, int], ...]] = field(default_factory=list)
     capsules: dict[int, Capsule] = field(default_factory=dict)
     final_instruction_state: int = 0
     final_instruction_seal: int = 0
@@ -758,10 +759,34 @@ def decode_prototype_column(
     return bytes(output)
 
 
+def apply_generation_program(
+    opcode: int, operand_a: int, program: tuple[tuple[int, int], ...]
+) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+    trace: list[tuple[int, int]] = [(opcode & 0xFFFF, operand_a & 0xFFFF)]
+    for family, mask in program:
+        low, high = mask & 0xFFFF, (mask >> 16) & 0xFFFF
+        if family == 0:
+            opcode ^= low
+        elif family == 1:
+            operand_a ^= high
+        elif family == 2:
+            opcode ^= low
+            operand_a ^= high
+        elif family == 3:
+            opcode ^= high
+            operand_a ^= low
+        else:
+            raise ValueError("unknown generation rewrite family")
+        opcode &= 0xFFFF
+        operand_a &= 0xFFFF
+        trace.append((opcode, operand_a))
+    return opcode, operand_a, tuple(trace)
+
+
 def validate_instruction_record(
     record: bytes, prototype: Prototype, block: Block, offset: int,
     record_start: int, record_end: int,
-) -> tuple[int, int, tuple[int, ...], dict[int, tuple[int, int, int]]]:
+) -> tuple[int, int, tuple[tuple[int, int], ...], tuple[int, ...], dict[int, tuple[int, int, int]]]:
     order = derive_block_permutation(
         5, block.entry_state, prototype.k1, prototype.k2, prototype.k3, BLOCK_COLUMN_DOMAIN
     )
@@ -788,6 +813,7 @@ def validate_instruction_record(
     descriptor = columns[0][0] ^ (block_field_mask(block.entry_state, pc, 7, prototype) & 0xFF)
     wire_descriptor = descriptor
     fused_count = 0
+    generation_program: tuple[tuple[int, int], ...] = ()
     if descriptor & 1:
         if descriptor != 1 or len(columns[0]) != 1:
             raise ValueError("invalid data-word instruction descriptor")
@@ -810,20 +836,41 @@ def validate_instruction_record(
             if len(columns[0]) < 3:
                 raise ValueError("IR fusion descriptor is incomplete")
             fused_count = columns[0][1]
-            if fused_count < 1 or fused_count > 9 or len(columns[0]) != fused_count + 2:
+            minimum_descriptor_length = fused_count + (3 if DIALECT_MODE_FORMAT else 2)
+            if fused_count < 1 or fused_count > 9 or len(columns[0]) < minimum_descriptor_length:
                 raise ValueError("IR fusion member count/framing mismatch")
             expected[0] += fused_count + 1
-            for member_descriptor in columns[0][2:]:
+            for member_descriptor in columns[0][2:2 + fused_count]:
                 if member_descriptor >= 64 or member_descriptor & 1:
                     raise ValueError("invalid IR fusion member descriptor")
                 member_type = (member_descriptor >> 1) & 3
                 expected[2] += 2
                 expected[3] += 2 if member_type == 0 else 4
                 expected[4] += 2 if member_type in (0, 3) else 0
+        if DIALECT_MODE_FORMAT:
+            generation_offset = 2 + fused_count if fused else 1
+            if generation_offset >= len(columns[0]):
+                raise ValueError("instruction generation program is missing")
+            generation_count = columns[0][generation_offset]
+            if generation_count < 2 or generation_count > 5:
+                raise ValueError("invalid instruction generation count")
+            generation_end = generation_offset + 1 + generation_count * 5
+            if generation_end != len(columns[0]):
+                raise ValueError("instruction generation framing mismatch")
+            generation_values: list[tuple[int, int]] = []
+            for generation in range(generation_count):
+                position = generation_offset + 1 + generation * 5
+                family = columns[0][position]
+                mask = int.from_bytes(columns[0][position + 1:position + 5], "little")
+                if family > 3 or mask == 0:
+                    raise ValueError("invalid instruction generation record")
+                generation_values.append((family, mask))
+            generation_program = tuple(generation_values)
+            expected[0] += 1 + generation_count * 5
     actual = {role: len(value) for role, value in columns.items()}
     if actual != expected:
         raise ValueError(f"instruction record field lengths mismatch: {actual} != {expected}")
-    return wire_descriptor, fused_count, tuple(order), spans
+    return wire_descriptor, fused_count, generation_program, tuple(order), spans
 
 
 def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) -> None:
@@ -858,16 +905,18 @@ def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) ->
     )
     descriptors: list[int] = []
     fused_counts: list[int] = []
+    generation_programs: list[tuple[tuple[int, int], ...]] = []
     orders: list[tuple[int, ...]] = []
     column_spans: list[dict[int, tuple[int, int, int]]] = []
     for offset in range(block.count):
         record = fragments[offset]
         _, record_start, record_end = spans[offset]
-        descriptor, fused_count, column_order, record_spans = validate_instruction_record(
+        descriptor, fused_count, generation_program, column_order, record_spans = validate_instruction_record(
             record, prototype, block, offset, record_start, record_end
         )
         descriptors.append(descriptor)
         fused_counts.append(fused_count)
+        generation_programs.append(generation_program)
         orders.append(column_order)
         column_spans.append(record_spans)
         digest = instruction_digest(
@@ -902,6 +951,7 @@ def validate_block_fragments(data: bytes, prototype: Prototype, block: Block) ->
     block.record_column_spans = column_spans
     block.descriptors = descriptors
     block.fused_counts = fused_counts
+    block.generation_programs = generation_programs
     block.capsules = capsules
     block.final_instruction_state = instruction_state
     block.final_instruction_seal = instruction_state_seal(
@@ -1973,20 +2023,17 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
     if normal_offset is None:
         raise ValueError("entry block has no normal instruction for column-consumption tamper")
     _, descriptor_offset, descriptor_end = entry_block.record_column_spans[normal_offset][0]
-    if descriptor_end != descriptor_offset + 1:
-        raise ValueError("normal instruction descriptor span is not scalar")
-    descriptor_mask = block_field_mask(
-        entry_block.entry_state, entry_block.start_pc + normal_offset, 7, info.root
-    )
+    pc = entry_block.start_pc + normal_offset
+    descriptor_mask = block_field_mask(entry_block.entry_state, pc, 7, info.root)
+    decoded_descriptor = bytearray(decode_prototype_column(
+        info.body[descriptor_offset:descriptor_end], info.root, entry_block, 0, pc
+    ))
+    decoded_descriptor[0] = (1 ^ descriptor_mask) & 0xFF
     column_consumption_variant = bytearray(info.body)
     encoded_descriptor = encode_prototype_column(
-        bytes([(1 ^ descriptor_mask) & 0xFF]),
-        info.root,
-        entry_block,
-        0,
-        entry_block.start_pc + normal_offset,
+        bytes(decoded_descriptor), info.root, entry_block, 0, pc
     )
-    column_consumption_variant[descriptor_offset] = encoded_descriptor[0]
+    column_consumption_variant[descriptor_offset:descriptor_end] = encoded_descriptor
     patch_u32(
         column_consumption_variant,
         entry_block.tag_offset,
@@ -1998,6 +2045,30 @@ def write_tampered_variants(info: PayloadInfo, output_dir: Path) -> None:
         prototype_integrity(column_consumption_variant, info.root),
     )
     write_body_variant(info, output_dir, "column-consumption", column_consumption_variant)
+
+    # Generation program: mutate an authenticated rewrite mask while repairing
+    # block/prototype/outer layers. The invocation-local generation transcript or
+    # the resulting opcode/A state must reject before source semantics complete.
+    generation_variant = bytearray(info.body)
+    decoded_generation = bytearray(decode_prototype_column(
+        info.body[descriptor_offset:descriptor_end], info.root, entry_block, 0, pc
+    ))
+    decoded_generation[-1] ^= 1
+    encoded_generation = encode_prototype_column(
+        bytes(decoded_generation), info.root, entry_block, 0, pc
+    )
+    generation_variant[descriptor_offset:descriptor_end] = encoded_generation
+    patch_u32(
+        generation_variant,
+        entry_block.tag_offset,
+        block_integrity(generation_variant, info.root, entry_block),
+    )
+    patch_u32(
+        generation_variant,
+        info.root.tag_offset,
+        prototype_integrity(generation_variant, info.root),
+    )
+    write_body_variant(info, output_dir, "generation-program", generation_variant)
 
     # Capsule integrity: alter a referenced capsule's stored tag, repair every
     # block manifest that embeds that capsule, and finally repair the prototype

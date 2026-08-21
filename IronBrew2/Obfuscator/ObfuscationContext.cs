@@ -86,6 +86,12 @@ namespace IronBrew2.Obfuscator
 		public int DialectModeCount;
 		public uint[] DialectModeTokens;
 		public HashSet<uint> DialectModesUsed = new HashSet<uint>();
+		public int GenerationProgramCount;
+		public int GenerationStepCount;
+		public int GenerationMinimum = int.MaxValue;
+		public int GenerationMaximum;
+		public int GenerationFamilyMask;
+		public uint GenerationProgramSignature = 2166136261u;
 
 		// 流式 XOR 种子(32 位)。EnvironmentLock 开启时 = Hash(盐|attestation token)，
 		// 序列化头部只写盐，VM 端严格探针成功后才派生同一种子。

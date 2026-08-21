@@ -61,9 +61,10 @@ python3 tests/static_decompiler.py /path/to/final-call-fixture.lua \
 5. **Runtime ABI** — recovers Chunk/Block/Flow slots and the partitioned invocation-state carrier directly from the final minified runtime.
 6. **Opcode selector** — parses and evaluates the randomized comparison tree for every canonical ID.
 7. **Continuation graph** — follows each entry token through its 3–5 node lane/state path to the terminal handler.
-8. **CALL trampoline** — expands the 19 mode-token paths and 92 phase tokens, then classifies argument and result tokens from the shared fragments.
-9. **Fusion program** — finds each member-token state machine, follows token successors rather than physical branch order, and associates each recovered member with its supplemental descriptor/operands.
-10. **Data-flow rendering** — tracks GETGLOBAL/LOADK/MOVE/CLOSURE, SELF, NEWTABLE/SETTABLE and CALL results sufficiently to render the loader chain and options table. CALL-discard and RETURN are counted separately.
+8. **Dialect and generation state** — recovers authenticated block/edge modes, mode-specific affine selector families, 2–5 generation records, and replays opcode/A rewrites from generation 0 to the handler-visible state.
+9. **CALL trampoline** — expands the 19 mode-token paths and 92 phase tokens, then classifies argument and result tokens from the shared fragments.
+10. **Fusion program** — finds each member-token state machine, follows token successors rather than physical branch order, and associates each recovered member with its supplemental descriptor/operands.
+11. **Data-flow rendering** — tracks GETGLOBAL/LOADK/MOVE/CLOSURE, SELF, NEWTABLE/SETTABLE and CALL results sufficiently to render the loader chain and options table. CALL-discard and RETURN are counted separately.
 
 The classifier intentionally reports unknown operations rather than inventing semantics. It currently focuses on the operations needed to measure loader/table/call-chain recovery; it is not a complete general-purpose Lua source regenerator.
 

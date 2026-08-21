@@ -84,6 +84,19 @@ cp "$ROOT/temp/t2.lua" "$WORK/fixed-vm.lua"
 python3 tests/verify_v4_payload.py "$WORK/fixed.lua"
 python3 tests/runtime_layout.py "$WORK/fixed-vm.lua"
 python3 tests/materializer_replay.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
+python3 tests/generation_replay_tamper.py "$WORK/fixed-vm.lua" "$WORK"
+for generation_case in skip duplicate; do
+    generation_file="$WORK/generation-$generation_case.lua"
+    "$LUAC" -p "$generation_file"
+    set +e
+    run_executor "$generation_file" > "$WORK/generation-$generation_case.stdout" \
+        2> "$WORK/generation-$generation_case.stderr"
+    generation_code=$?
+    set -e
+    [[ $generation_code -ne 0 ]]
+    [[ ! -s "$WORK/generation-$generation_case.stdout" ]]
+done
+echo "PASS generation skip/duplicate rejection before payload semantics"
 python3 tests/constant_use_materialization.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/handler_fragment_sharing.py "$WORK/fixed-vm.lua" "$WORK/fixed.lua"
 python3 tests/ir_native_fusion.py "$WORK/fixed.lua" "$WORK/fixed-vm.lua"
@@ -104,7 +117,7 @@ python3 tests/static_attack_baseline.py "$WORK/fixed.lua" \
     --require-current-baseline --report "$WORK/static-attack-baseline.json"
 python3 tests/static_decompiler.py "$WORK/fixed.lua" \
     --report "$WORK/static-decompiler-baseline.json"
-python3 tests/static_state_model.py "$WORK/fixed.lua" --require-dialects
+python3 tests/static_state_model.py "$WORK/fixed.lua" --require-dialects --require-generations
 python3 tests/static_state_model.py "$ROOT/test_obf.txt" --uploaded-loader
 run_executor "$WORK/fixed.lua" > "$WORK/fixed.out"
 cmp "$WORK/baseline.out" "$WORK/fixed.out"
@@ -134,7 +147,7 @@ echo "PASS entropy record modification, deletion and reordering rejection after 
 # Each case leaves exactly the named prototype, complete block-manifest,
 # authenticated instruction-record parser/consumption, or block-local
 # capsule-integrity layer as the first rejecting boundary.
-for payload_case in prototype-tag initial-chunk-state initial-dialect-mode successor-chunk-state successor-dialect-mode block-dialect-manifest block-manifest column-framing column-consumption capsule-integrity; do
+for payload_case in prototype-tag initial-chunk-state initial-dialect-mode successor-chunk-state successor-dialect-mode block-dialect-manifest block-manifest column-framing column-consumption generation-program capsule-integrity; do
     payload_file="$WORK/payload-$payload_case.lua"
     "$LUAC" -p "$payload_file"
     set +e
@@ -599,6 +612,7 @@ fused_member_profiles = []
 call_inclusive_profiles = []
 call_trampoline_profiles = []
 dialect_profiles = []
+generation_profiles = []
 for index in range(1, runs + 1):
     log = (work / f"obfuscator-{index}.log").read_text()
     micro = re.search(r"Synthetic micro-block limit: ([3-6])\.", log)
@@ -658,6 +672,18 @@ for index in range(1, runs + 1):
     dialect_profiles.append((
         int(dialect.group(1)), int(dialect.group(2)),
         int(dialect.group(3)), dialect.group(4),
+    ))
+    generations = re.search(
+        r"Instruction generations: programs=(\d+); steps=(\d+); range=(\d+)-(\d+); "
+        r"families=([0-3](?:,[0-3]){0,3}); signature=([0-9a-f]{8})\.",
+        log,
+    )
+    if not generations:
+        raise SystemExit(f"missing instruction-generation profile for build {index}")
+    generation_profiles.append((
+        int(generations.group(1)), int(generations.group(2)),
+        int(generations.group(3)), int(generations.group(4)),
+        tuple(map(int, generations.group(5).split(","))), generations.group(6),
     ))
     semantic = re.search(
         r"Semantic lowering: writes=([0-9,]+); raw-stack-reads=(\d+); raw-environment-reads=(\d+)\.",
@@ -783,6 +809,12 @@ if {profile[0] for profile in dialect_profiles} != {3, 4, 5}:
     raise SystemExit(f"dialect mode-count diversity is incomplete: {dialect_profiles}")
 if len({profile[3] for profile in dialect_profiles}) != runs:
     raise SystemExit("a dialect token/selector/handler program was reused across builds")
+if any(programs < 1 or steps < programs * 2 or minimum != 2 or maximum != 5
+       or families != (0, 1, 2, 3)
+       for programs, steps, minimum, maximum, families, _signature in generation_profiles):
+    raise SystemExit(f"instruction generation coverage is incomplete: {generation_profiles}")
+if len({profile[5] for profile in generation_profiles}) != runs:
+    raise SystemExit("an instruction generation program was reused across builds")
 write_totals = tuple(sum(record[0][index] for record in semantic_records) for index in range(6))
 if min(write_totals) <= 0:
     raise SystemExit(f"not all six semantic write lowerings were emitted: {write_totals}")
@@ -903,6 +935,7 @@ print(
     f"super folded={min(record[1] for record in super_records)}..{max(record[1] for record in super_records)}, member-phase-programs={len({profile[3] for profile in fused_member_profiles})}, "
     f"call-inclusive-folds={min(profile[1] for profile in call_inclusive_profiles)}..{max(profile[1] for profile in call_inclusive_profiles)}, "
     f"dialect-modes={sorted({profile[0] for profile in dialect_profiles})}, dialect-programs={len({profile[3] for profile in dialect_profiles})}, "
+    f"generation-programs={len({profile[5] for profile in generation_profiles})}, generation-range=2..5, "
     f"call-token-programs={len({profile[3] for profile in call_trampoline_profiles})}, call-frame-layouts={len({profile[2] for profile in call_trampoline_profiles})}, "
     f"semantic writes={write_totals}, raw reads={sum(record[1] for record in semantic_records)}/{sum(record[2] for record in semantic_records)}, "
     f"similarity dispatcher={max_similarity:.3f}/{mean_similarity:.3f}, "

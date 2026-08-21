@@ -48,6 +48,7 @@ class AttackExecutionState:
     physical_pc: int
     generation: int
     replay_depth: int
+    generation_trace: tuple[str, ...]
     selector_lane: str
     column_state: str
 
@@ -282,6 +283,7 @@ def decode_instruction_members(
     prototype: payload.Prototype,
     block: payload.Block,
     offset: int,
+    final_a: int | None = None,
 ) -> list[tuple[int, int, int, int, int]]:
     """Return `(descriptor, A, B, C, member_index)` for one physical record."""
     columns = _decoded_columns(info, prototype, block, offset)
@@ -297,7 +299,8 @@ def decode_instruction_members(
     head_descriptor = plain_descriptor - (64 if fused else 0)
     descriptors = [head_descriptor]
     if fused:
-        descriptors.extend(columns[0][2:])
+        fused_count = columns[0][1]
+        descriptors.extend(columns[0][2:2 + fused_count])
 
     a_cursor = b_cursor = c_cursor = 0
     members: list[tuple[int, int, int, int, int]] = []
@@ -311,6 +314,8 @@ def decode_instruction_members(
             ) ^ payload.block_field_mask(block.entry_state, pc, 1, prototype)
         else:
             a = int.from_bytes(a_raw, "little")
+        if member_index == 0 and final_a is not None:
+            a = final_a
         b = c = 0
         if instruction_type == 0:
             b_raw = columns[3][b_cursor:b_cursor + 2]
@@ -908,9 +913,18 @@ def recover_logical_instructions(
                 pc = block.start_pc + offset
                 if block.descriptors[offset] & 1:
                     continue
-                canonical = int(opcode_rows[pc]["canonical_id"])
-                members = decode_instruction_members(info, prototype, block, offset)
+                opcode_row = opcode_rows[pc]
+                canonical = int(opcode_row["canonical_id"])
+                generation_trace = opcode_row.get("generation_trace") or []
+                final_a = int(generation_trace[-1][1]) if generation_trace else None
                 column_state = _column_state_fingerprint(info, prototype, block, offset)
+                generation_fingerprints = tuple(
+                    hashlib.sha256(
+                        f"{column_state}:{values[0]}:{values[1]}".encode("ascii")
+                    ).hexdigest()[:16]
+                    for values in generation_trace
+                )
+                members = decode_instruction_members(info, prototype, block, offset, final_a)
                 reachable_modes, predecessor_modes = block_modes[block.start_pc]
                 available_modes = tuple(
                     mode for mode in reachable_modes if mode in dialect_classifications
@@ -962,8 +976,9 @@ def recover_logical_instructions(
                             mode=available_modes[0],
                             reachable_modes=available_modes,
                             physical_pc=pc,
-                            generation=0,
-                            replay_depth=0,
+                            generation=int(opcode_row.get("generation_count", 0)),
+                            replay_depth=int(opcode_row.get("generation_count", 0)),
+                            generation_trace=generation_fingerprints or (column_state,),
                             selector_lane=(
                                 "canonical-opcode" if available_modes == (0,)
                                 else f"dialect-affine:{available_modes[0]}"
@@ -1113,6 +1128,9 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
     unique_states: dict[tuple[Any, ...], AttackExecutionState] = {}
     recovered_modes: set[int] = set()
     recovered_selector_lanes: set[str] = set()
+    recovered_generations: set[int] = set()
+    replay_transitions = 0
+    replay_bases: set[tuple[tuple[int, ...], int, int]] = set()
     mode_edges: set[tuple[tuple[int, ...], int, int, int]] = set()
     for instruction in instructions:
         state = instruction.state
@@ -1124,19 +1142,19 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
             recovered_selector_lanes.add(
                 "canonical-opcode" if mode == 0 else f"dialect-affine:{mode}"
             )
-            key = (
-                state.prototype, state.block_start, mode, state.physical_pc,
-                state.generation, state.selector_lane, state.column_state,
-            )
-            unique_states.setdefault(key, state)
+            for generation, generation_state in enumerate(state.generation_trace):
+                recovered_generations.add(generation)
+                key = (
+                    state.prototype, state.block_start, mode, state.physical_pc,
+                    generation, state.selector_lane, generation_state,
+                )
+                unique_states.setdefault(key, state)
+            replay_base = (state.prototype, state.physical_pc, mode)
+            if replay_base not in replay_bases:
+                replay_bases.add(replay_base)
+                replay_transitions += max(0, len(state.generation_trace) - 1)
     ordered_states = list(unique_states.values())
     mode_transitions = len(mode_edges)
-    replay_transitions = sum(
-        left.prototype == right.prototype
-        and left.physical_pc == right.physical_pc
-        and right.generation > left.generation
-        for left, right in zip(ordered_states, ordered_states[1:])
-    )
     predecessor_edges = {
         (state.prototype, predecessor, state.block_start)
         for state in ordered_states
@@ -1161,8 +1179,8 @@ def analyze_decompiler(path: Path) -> DecompilerReport:
         block_predecessor_edges=len(predecessor_edges),
         dialect_modes=sorted(recovered_modes),
         mode_transitions=mode_transitions,
-        generations=sorted({state.generation for state in ordered_states}),
-        max_generation=max((state.generation for state in ordered_states), default=0),
+        generations=sorted(recovered_generations),
+        max_generation=max(recovered_generations, default=0),
         replay_transitions=replay_transitions,
         selector_lanes=sorted(recovered_selector_lanes),
         fused_programs=fused_programs,
@@ -1209,7 +1227,9 @@ def main() -> int:
                             print(f"{proto_path}:{pc} DATA")
                             continue
                         row = opcode_rows[pc]
-                        members = decode_instruction_members(info, prototype, block, offset)
+                        generation_trace = row.get("generation_trace") or []
+                        final_a = int(generation_trace[-1][1]) if generation_trace else None
+                        members = decode_instruction_members(info, prototype, block, offset, final_a)
                         rendered_members = []
                         for descriptor, a, b, c, member in members:
                             operands = (

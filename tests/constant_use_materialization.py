@@ -117,7 +117,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     if not re.search(rf"return\s+{re.escape(raw_fields)}\s*\[", binder_region):
         raise ValueError("non-constant operands do not retain raw-field fallback")
 
-    # Both lazy objects must cross the four replay stages in derived slots.
+    # Both lazy objects must cross the complete variable generation program in derived slots.
     for offset, name in ((628374, constant_fields), (733103, instruction_resolver)):
         slot = re.search(rf"local\s+({IDENT})\s*=\s*{IDENT}\s*\+\s*{offset}\s*;", code)
         if not slot:
@@ -133,7 +133,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
     if leaked:
         raise ValueError(f"stable constant-use identifier leaked: {leaked.group(0)}")
 
-    print("PASS handler-use constant materialization: eager-decodes=0, replay-stages=4, nil-cache=explicit, capsule-release=bounded")
+    print("PASS handler-use constant materialization: eager-decodes=0, replay-generations=2..5, nil-cache=explicit, capsule-release=bounded")
 
 
 def main() -> int:

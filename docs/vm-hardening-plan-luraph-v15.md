@@ -240,6 +240,38 @@ P1 未引入共享 mutable instruction array、固定四模式、连续 opcode �
 - 修改 rewrite token/字段、跳过一代、重复一代或跨 invocation 复用 overlay 全部拒绝；
 - Phase 4 动态 observer 验证 overlay、常量和 record 均不逃逸生命周期。
 
+#### P2 完成记录与重读审查（2026-08-21）
+
+状态：**已完成**。
+
+每个普通 physical instruction record 现在在 authenticated descriptor column 中携带 2–5 代 generation program。wire 中保存的是 generation-0 opcode/A，而不是 handler 最终消费值；四种可逆 rewrite families 分别改变 opcode、A、opcode+A 和交叉 mask 组合。每个 mode 都通过 mode-bound materializer selector 使用这些 families，family/mask/program framing 同时受 instruction digest、block manifest 和 prototype/outer layers 保护。
+
+运行时只在当前 invocation 的 FlowCache 派生槽保存：
+
+```text
+generation program / stage / seal / guard /
+opcode / A / B / C / lazy constant resolver / fused view
+```
+
+每代执行前验证上一代 guard，执行后把前代 seal、mode、PC、generation index、family、mask、改写后的全部字段、entry/chunk state 吸收到新 seal，并 same-PC replay。最终一代完成后才绑定 lazy constant proxy 和进入真实 handler，随后清除 generation program/seal/guard。Closure inline binding 等非顶层 fetch 在 invocation 内同步重放完整 program，不暴露 generation-0 字段给 closure ABI。
+
+攻击器已同步解析 generation framing、重放四种 rewrite、恢复最终 opcode/A，并将每代 column-state fingerprint 写入 `AttackExecutionState.generation_trace`。当前 material fixture 报告 generation range `[0..5]`，不再把 parser stale 当收益。
+
+新增或升级验证：
+
+```text
+tests/materializer_replay.py
+tests/generation_replay_tamper.py
+tests/static_state_model.py
+generation-program payload tamper
+```
+
+覆盖随机 2–5 generations、四 families、generation-0 wire fields、same-PC replay、mode/state-bound seal、跳过一代、重复一代和改写 mask 后重封装。Phase 4 与递归语义测试确认 overlay 仍为 invocation-local，没有共享 mutable instruction array 或扩大 plaintext lifetime。
+
+重读本 MD 后确认：P2 没有弱化 block/prototype/capsule authentication，没有把 payload 改成共享可写状态，没有恢复固定四阶段 replay，也没有提前实施 selector lane migration或 capability graph。为避免 Lua 5.1 signed/AsBx、RK handle 和 NaN 精度倒退，本阶段只改写共同安全的 16-bit opcode/A carrier；B/C、descriptor-role 与 fused-view rewrite 保留为后续可选 family，只有建立对应宽度/类型证明后才能加入。四种 family 都进入真实 generation seal/data dependency，不是纯 MBA decoy。
+
+完整 `IB2_RANDOM_RUNS=20` 已通过；20 个 generation programs 全部唯一，所有 build 覆盖 2–5 generations 和 families 0/1/2/3。下一步是 P3；完成后再次重读本 MD。
+
 ### P3：mode-dependent selector lane migration（批准，与 P2 同一里程碑交付）
 
 不再保证一个稳定 `Enum` 字段贯穿 record 生命周期。

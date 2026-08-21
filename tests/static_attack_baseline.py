@@ -173,6 +173,19 @@ def decode_opcodes(
                     ^ payload.block_field_mask(block.entry_state, pc, 0, proto)
                     ^ opcode_state_mask(state, pc)
                 ) & 0xFFFF
+                a_span = block.record_column_spans[offset][2]
+                decoded_a = payload.decode_prototype_column(
+                    info.body[a_span[1]:a_span[2]], proto, block, 2, pc
+                )
+                initial_a = (
+                    int.from_bytes(decoded_a[:2], "little")
+                    ^ opcode_mask(pc + 257, proto.k2, proto.k3, proto.k1)
+                    ^ payload.block_field_mask(block.entry_state, pc, 1, proto)
+                ) & 0xFFFF
+                generation_program = block.generation_programs[offset]
+                local_opcode, _final_a, generation_trace = payload.apply_generation_program(
+                    local_opcode, initial_a, generation_program
+                )
                 if local_opcode >= len(bank):
                     raise ValueError("decoded local opcode is outside the prototype bank")
                 result.append(
@@ -184,6 +197,9 @@ def decode_opcodes(
                         "canonical_id": bank[local_opcode],
                         "fused_members": block.fused_counts[offset],
                         "logical_width": 1 + block.fused_counts[offset],
+                        "generation_count": len(generation_program),
+                        "generation_families": [family for family, _mask in generation_program],
+                        "generation_trace": [list(values) for values in generation_trace],
                     }
                 )
             fragment = block.fragment_spans[offset]

@@ -41,6 +41,7 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 		private readonly ObfuscationSettings _settings;
 		private readonly BuildRandom _random;
 		private int _dialectAssignmentCounter;
+		private int _generationFamilyCounter;
 		private readonly Encoding _luaEncoding = Encoding.GetEncoding(28591);
 
 		public Serializer(ObfuscationContext context, ObfuscationSettings settings)
@@ -849,15 +850,57 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 
 				int type = (int)instruction.InstructionType;
 				int constantMask = (int)instruction.ConstantMask;
+				int generationCount = 2 + _random.Next(4);
+				var generationProgram = new List<(byte Family, uint Mask)>(generationCount);
+				for (int generation = 0; generation < generationCount; generation++)
+				{
+					byte family = (byte)((_generationFamilyCounter++ + generation) % 4);
+					if ((instruction.ConstantMask & InstructionConstantMask.RA) != 0 && family != 0)
+						family = 0;
+					uint mask;
+					do mask = _random.NextUInt32(); while ((mask & 0xffffu) == 0 || (mask >> 16) == 0);
+					generationProgram.Add((family, mask));
+				}
+				_context.GenerationProgramCount++;
+				_context.GenerationStepCount += generationProgram.Count;
+				_context.GenerationMinimum = Math.Min(_context.GenerationMinimum, generationProgram.Count);
+				_context.GenerationMaximum = Math.Max(_context.GenerationMaximum, generationProgram.Count);
+				foreach ((byte family, uint mask) in generationProgram)
+				{
+					_context.GenerationFamilyMask |= 1 << family;
+					_context.GenerationProgramSignature =
+						(_context.GenerationProgramSignature ^ family) * 16777619u;
+					_context.GenerationProgramSignature =
+						(_context.GenerationProgramSignature ^ mask) * 16777619u;
+				}
+
+				ushort generationOpcode = unchecked((ushort)opcode);
+				ushort generationA = unchecked((ushort)instruction.A);
+				for (int generation = generationProgram.Count - 1; generation >= 0; generation--)
+				{
+					(byte family, uint mask) = generationProgram[generation];
+					ushort low = unchecked((ushort)mask);
+					ushort high = unchecked((ushort)(mask >> 16));
+					switch (family)
+					{
+						case 0: generationOpcode ^= low; break;
+						case 1: generationA ^= high; break;
+						case 2: generationOpcode ^= low; generationA ^= high; break;
+						default:
+							generationOpcode ^= high;
+							generationA ^= low;
+							break;
+					}
+				}
 				List<Instruction> fusedInstructions = instruction.CustomData?.FusedInstructions;
 				bool isFused = fusedInstructions is {Count: > 1};
 				descriptors.Add((byte)(((type << 1) | (constantMask << 3) | (isFused ? 64 : 0)
 					| (instruction.FreshTableWrite ? 128 : 0)) ^ descriptorMask));
 
-				ushort storedOpcode = (ushort)((ushort)opcode ^ OpcodeMask(pc, k1, k2, k3) ^
+				ushort storedOpcode = (ushort)(generationOpcode ^ OpcodeMask(pc, k1, k2, k3) ^
 				                               BlockFieldMask(entryState, pc, 0, k1, k2, k3) ^
 				                               OpcodeStateMask(opcodeState, pc));
-				ushort storedA = (ushort)((ushort)instruction.A ^ OperandMask16(pc, k1, k2, k3, 1) ^
+				ushort storedA = (ushort)(generationA ^ OperandMask16(pc, k1, k2, k3, 1) ^
 				                          BlockFieldMask(entryState, pc, 1, k1, k2, k3));
 				WriteUInt16(opcodes, storedOpcode);
 				WriteUInt16(operandsA, storedA);
@@ -929,6 +972,13 @@ namespace IronBrew2.Bytecode_Library.Bytecode
 								break;
 						}
 					}
+				}
+
+				descriptors.Add((byte)generationProgram.Count);
+				foreach ((byte family, uint mask) in generationProgram)
+				{
+					descriptors.Add(family);
+					WriteUInt32(descriptors, mask);
 				}
 			}
 

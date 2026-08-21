@@ -13,11 +13,13 @@ from static_decompiler import analyze_decompiler
 STATE_FIELDS = {
     "prototype", "block_start", "predecessors", "predecessor_modes", "mode",
     "reachable_modes", "physical_pc", "generation", "replay_depth",
-    "selector_lane", "column_state",
+    "generation_trace", "selector_lane", "column_state",
 }
 
 
-def verify(path: Path, uploaded_loader: bool, require_dialects: bool) -> None:
+def verify(
+    path: Path, uploaded_loader: bool, require_dialects: bool, require_generations: bool
+) -> None:
     report = analyze_decompiler(path)
     if report.state_model_version != 1:
         raise ValueError(f"unexpected attacker state-model version: {report.state_model_version}")
@@ -34,8 +36,13 @@ def verify(path: Path, uploaded_loader: bool, require_dialects: bool) -> None:
             raise ValueError(f"P1 mode-specific selector families are incomplete: {report.selector_lanes}")
     elif report.dialect_modes != [0] or report.mode_transitions != 0:
         raise ValueError(f"legacy baseline unexpectedly reports dialect dynamics: {report.dialect_modes}")
-    if report.generations != [0] or report.max_generation != 0 or report.replay_transitions != 0:
-        raise ValueError("pre-P2 VM unexpectedly reports mutable instruction generations")
+    if require_generations:
+        if report.generations[0] != 0 or not 2 <= report.max_generation <= 5:
+            raise ValueError(f"P2 generation range is incomplete: {report.generations}")
+        if report.replay_transitions < report.physical_instructions:
+            raise ValueError("P2 same-PC replay transitions were not represented")
+    elif report.generations != [0] or report.max_generation != 0 or report.replay_transitions != 0:
+        raise ValueError("legacy baseline unexpectedly reports mutable instruction generations")
     if not require_dialects and report.selector_lanes != ["canonical-opcode"]:
         raise ValueError(f"legacy selector-lane baseline changed: {report.selector_lanes}")
     if report.unknown_instructions != report.logical_instructions - report.classified_instructions:
@@ -48,6 +55,10 @@ def verify(path: Path, uploaded_loader: bool, require_dialects: bool) -> None:
             raise ValueError(f"instruction is missing a complete attacker state key: {state}")
         if len(state["column_state"]) != 16:
             raise ValueError("column-state fingerprint is absent")
+        if len(state["generation_trace"]) != state["replay_depth"] + 1:
+            raise ValueError("generation trace does not cover every same-PC replay")
+        if any(len(item) != 16 for item in state["generation_trace"]):
+            raise ValueError("generation-state fingerprint is absent")
         if state["mode"] not in state["reachable_modes"]:
             raise ValueError("primary mode is absent from the reachable mode set")
         if any(mode not in report.dialect_modes for mode in state["reachable_modes"]):
@@ -91,9 +102,13 @@ def main() -> int:
     parser.add_argument("generated", type=Path)
     parser.add_argument("--uploaded-loader", action="store_true")
     parser.add_argument("--require-dialects", action="store_true")
+    parser.add_argument("--require-generations", action="store_true")
     args = parser.parse_args()
     try:
-        verify(args.generated, args.uploaded_loader, args.require_dialects)
+        verify(
+            args.generated, args.uploaded_loader,
+            args.require_dialects, args.require_generations,
+        )
     except (OSError, ValueError, IndexError, KeyError) as error:
         raise SystemExit(str(error)) from error
     return 0

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify invocation-local instruction materialization and PC replay wiring."""
+"""Verify invocation-local authenticated writable instruction generations."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from runtime_layout import _code_only
+from static_attack_baseline import prototypes
+from verify_v4_payload import parse_and_verify
 
 IDENT = r"[A-Za-z_]\w*"
 
@@ -17,97 +19,91 @@ IDENT = r"[A-Za-z_]\w*"
 def verify(vm_path: Path, final_path: Path | None) -> None:
     source = vm_path.read_text("latin1")
     code = _code_only(source)
+    if final_path is None:
+        raise ValueError("generation verifier requires the final payload")
+    info = parse_and_verify(final_path)
+    programs = [
+        program
+        for _path, prototype in prototypes(info.root)
+        for block in prototype.blocks
+        for descriptor, program in zip(block.descriptors, block.generation_programs)
+        if descriptor & 1 == 0
+    ]
+    if not programs or min(map(len, programs)) < 2 or max(map(len, programs)) > 5:
+        raise ValueError("instruction generation programs are outside 2–5 rewrites")
+    families = {family for program in programs for family, _mask in program}
+    if len(families) < 3 or not families.issubset({0, 1, 2, 3}):
+        raise ValueError(f"generation rewrite-family coverage is insufficient: {families}")
+    if any(mask == 0 for program in programs for _family, mask in program):
+        raise ValueError("generation program contains a zero rewrite mask")
 
-    # Recover ten private overlay slots: PC, opcode/A/B/C, replay stage, the
-    # lazy constant-field map/resolver, IR-fusion operands and fresh-table flag. Neither lazy
-    # constant object may be dropped before all four replay passes complete.
-    slots = re.search(
-        rf"local\s+({IDENT})\s*=\s*32\s*\+\s*\(\(.*?\)\s*%\s*104729\s*\)\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*104729\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*209458\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*314187\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*418916\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*523645\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*628374\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*733103\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*837832\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*\1\s*\+\s*942561\s*;",
+    offsets = [
+        104729, 209458, 314187, 418916, 523645, 628374, 733103,
+        837832, 942561, 1047290, 1152019, 1256748,
+    ]
+    slot_match = re.search(
+        rf"local\s+({IDENT})\s*=\s*32\s*\+\s*\(\(.*?\)\s*%\s*104729\s*\)\s*;",
         code,
         re.S,
     )
-    if not slots:
-        raise ValueError("prototype-derived field/lazy-constant materializer slots were not found")
-    index_slot, opcode_slot, a_slot, b_slot, c_slot, stage_slot, constant_slot, resolver_slot, fused_slot, fresh_slot = slots.groups()
+    if not slot_match:
+        raise ValueError("prototype-derived generation overlay base slot was not found")
+    base = slot_match.group(1)
+    for offset in offsets:
+        if not re.search(rf"local\s+{IDENT}\s*=\s*{re.escape(base)}\s*\+\s*{offset}\s*;", code):
+            raise ValueError(f"generation overlay slot +{offset} is missing")
 
-    pending = re.search(
-        rf"if\s+({IDENT})\s+and\s+({IDENT})\s+and\s+\2\[{re.escape(index_slot)}\]\s*==\s*({IDENT})\s+then"
-        rf".*?if\s+({IDENT})\s*<\s*4\s+then\s*\2\[{re.escape(stage_slot)}\]\s*=\s*\4\s*\+\s*1\s*;"
-        rf".*?\2\[{re.escape(index_slot)}\]\s*,\s*\2\[{re.escape(opcode_slot)}\]\s*,\s*\2\[{re.escape(a_slot)}\]\s*,\s*"
-        rf"\2\[{re.escape(b_slot)}\]\s*,\s*\2\[{re.escape(c_slot)}\]\s*,\s*\2\[{re.escape(stage_slot)}\]\s*,\s*"
-        rf"\2\[{re.escape(constant_slot)}\]\s*,\s*\2\[{re.escape(resolver_slot)}\]\s*,\s*"
-        rf"\2\[{re.escape(fused_slot)}\]\s*,\s*\2\[{re.escape(fresh_slot)}\]\s*=\s*"
-        rf"nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*,\s*nil\s*;"
-        rf".*?return\s+({IDENT})\s*;",
-        code,
-        re.S,
+    required_shapes = (
+        r"if\s+[^;]*<\s*2\s+or\s+[^;]*>\s*5\s+then",
+        r"while\s+true\s+do|if\s+[^;]*<\s*[^;]*then",
     )
-    if not pending:
-        raise ValueError("four-stage field/lazy-constant materialization path was not found")
+    if not all(re.search(pattern, code, re.S) for pattern in required_shapes):
+        raise ValueError("variable generation bounds/replay branch were not found")
 
-    # The final replay must wrap the four raw fields in a lazy operand proxy
-    # before clearing both resolver slots from FlowCache.
-    flow_cache = pending.group(2)
-    binder_call = re.search(
-        rf"local\s+({IDENT})\s*=\s*{re.escape(flow_cache)}\[{re.escape(constant_slot)}\]\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*{re.escape(flow_cache)}\[{re.escape(resolver_slot)}\]\s*;\s*"
-        rf"local\s+({IDENT})\s*=\s*({IDENT})\s*\(\s*{IDENT}\s*,\s*\1\s*,\s*\2\s*\)\s*;",
-        pending.group(0),
-        re.S,
-    )
-    if not binder_call:
-        raise ValueError("lazy operand proxy was not bound at the final replay")
+    root = Path(__file__).resolve().parents[1]
+    generator = (root / "IronBrew2/Obfuscator/VM Generation/Generator.cs").read_text()
+    serializer = (root / "IronBrew2/Bytecode Library/Bytecode/Serializer.cs").read_text()
+    for anchor in (
+        "ApplyGenerationRewrite", "BeginGenerationSeal", "AdvanceGenerationSeal",
+        "ComputeGenerationGuard", "MaterializeGenerationProgramSlot",
+        "MaterializeGenerationSealSlot", "MaterializeGenerationGuardSlot",
+    ):
+        if anchor not in generator:
+            raise ValueError(f"generation runtime architecture is missing: {anchor}")
+    if "generationCount = 2 + _random.Next(4)" not in serializer:
+        raise ValueError("serializer does not generate 2–5 rewrite programs")
+    if "generationOpcode" not in serializer or "generationA" not in serializer:
+        raise ValueError("wire opcode/A fields are not stored as generation-0 values")
+    if "MaterializeStage < 4" in generator:
+        raise ValueError("legacy fixed four-stage materializer remains")
 
-    # Every selected VM loop must request a top-level materializer and accept a
-    # canonical Enum override before falling back to the prototype opcode bank.
+    # Top-level VM execution still requests the invocation-local overlay and may
+    # accept a synthetic materializer Enum before the final generated instruction.
     access = rf"{IDENT}(?:\[\d+\])?"
-    top_level_fetches = re.findall(
+    fetches = re.findall(
         rf"({access})\s*,\s*({access})\s*=\s*({IDENT})\([^;]*,\s*true\s*\)\s*;\s*"
         rf"if\s+\2\s*==\s*nil\s+then",
         code,
         re.S,
     )
-    if len(top_level_fetches) != 1:
-        raise ValueError(f"expected one selected top-level materializer fetch, found {len(top_level_fetches)}")
+    if len(fetches) != 1:
+        raise ValueError(f"expected one top-level generation fetch, found {len(fetches)}")
 
-    mode = re.search(
-        rf"local\s+function\s+({IDENT})\s*\([^)]*,\s*({IDENT})\s*\)\s*"
-        rf"local\s+({IDENT})\s*=\s*\(.*?\+\s*\2\s*\)\s*%\s*4\s*;\s*"
-        rf"if\s+\3\s*==\s*0\s+then\s+return\s+(\d+)\s*;\s*"
-        rf"elseif\s+\3\s*==\s*1\s+then\s+return\s+(\d+)\s*;\s*"
-        rf"elseif\s+\3\s*==\s*2\s+then\s+return\s+(\d+)\s*;\s*"
-        rf"else\s+return\s+(\d+)\s*;\s*end\s*;\s*end\s*;",
-        code,
-        re.S,
-    )
-    if not mode:
-        raise ValueError("four-mode staged materializer selector was not found")
-    opcode_ids = tuple(map(int, mode.groups()[3:]))
-    if len(set(opcode_ids)) != 4:
-        raise ValueError(f"materializer modes do not use four distinct opcode leaves: {opcode_ids}")
-
-    # Name randomization must cover the new runtime roles in both unminified and
-    # production output. Comments are removed before this identifier check.
-    final_code = _code_only(final_path.read_text("latin1")) if final_path else ""
+    final_code = _code_only(final_path.read_text("latin1"))
     leaked = re.search(
-        r"\b(?:AllowMaterializer|SelectMaterializerEnum|BindInstructionOperands|Instruction(?:Fields|ConstantFields|ConstantResolver|DecodedFields|DecodedValues|RemainingConstants|FieldKey|ConstantIndex)|Materialize(?:IndexSlot|OpcodeSlot|ASlot|BSlot|CSlot|StageSlot|ConstantFieldsSlot|ConstantResolverSlot|FusedSlot|FreshTableSlot|Stage|Mode|Enum|Target|Delta)|Materialized(?:Instruction|Fields|ConstantFields|ConstantResolver))\b",
+        r"\b(?:Generation(?:Count|Program|Record|Index|Family|Mask|Seal|Guard|Completed)|"
+        r"ApplyGenerationRewrite|BeginGenerationSeal|AdvanceGenerationSeal|ComputeGenerationGuard|"
+        r"MaterializeGeneration(?:Program|Seal|Guard)Slot)\b",
         code + "\n" + final_code,
     )
     if leaked:
-        raise ValueError(f"stable materializer identifier leaked: {leaked.group(0)}")
+        raise ValueError(f"stable instruction-generation identifier leaked: {leaked.group(0)}")
 
+    counts = sorted({len(program) for program in programs})
     print(
-        "PASS invocation-local materializer replay: "
-        f"overlay-slots=derived, stages=4, fields=opcode/A/B/C+lazy-constants+fused-operands+fresh-table, modes=4, opcode-leaves={opcode_ids}"
+        "PASS authenticated writable instruction generations: "
+        f"records={len(programs)}, generations={counts}, families={sorted(families)}, "
+        "overlay=invocation-local, same-PC=replay, guard=state-bound"
     )
 
 
@@ -118,7 +114,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         verify(args.generated_vm, args.generated_output)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, IndexError, KeyError) as error:
         raise SystemExit(str(error)) from error
     return 0
 

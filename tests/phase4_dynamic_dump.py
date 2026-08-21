@@ -226,7 +226,7 @@ local function __p4_finalize(root)
     local decoded,opaque_children,opaque_blocks,total_constants=__p4_snapshot(root);
     assert(__p4_stats.pages>=2 and __p4_stats.page_bytes=={expected_body} and __p4_stats.max_page<{expected_body},'complete plaintext payload existed as one page');
     assert(__p4_stats.instructions>0 and live==0,'plaintext instruction record outlived VM execution');
-    assert(__p4_stats.max_fields<=5 and __p4_stats.max_constants>=1 and __p4_stats.max_constants<=30,'handler-use constant/fusion material escaped operand lifetime');
+    assert(__p4_stats.max_fields<=7 and __p4_stats.max_constants>=1 and __p4_stats.max_constants<=30,'handler-use constant/fusion/generation material escaped operand lifetime');
     assert(decoded>=2 and opaque_children>=1,'executing one child recovered sibling Chunks');
     assert(opaque_blocks>=decoded,'normal execution recovered the complete VM buffer');
     assert(total_constants>__p4_stats.max_constants,'constant pool collapsed into one instruction lifetime');
