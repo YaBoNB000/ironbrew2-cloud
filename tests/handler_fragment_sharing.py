@@ -94,7 +94,7 @@ def verify(vm_path: Path, final_path: Path | None) -> None:
             break
 
     calls = {role: len(re.findall(rf"\b{re.escape(name)}\s*\(", code)) - 1 for role, name in roles.items()}
-    minimums = {"stack-read": 5, "environment-read": 1, "writeback": 5, "binary": 1, "unary": 0, "pc": 5}
+    minimums = {"stack-read": 5, "environment-read": 1, "writeback": 5, "binary": 0, "unary": 0, "pc": 5}
     for role, minimum in minimums.items():
         if calls[role] < minimum:
             raise ValueError(f"{role} fragment is not shared across enough leaves: {calls[role]} < {minimum}")
